@@ -112,7 +112,9 @@ mod tests {
                 "test_mixed.py".to_string(),
                 "test_mock_only.py".to_string(),
                 "test_no_asserts.py".to_string(),
+                "test_overmocked.py".to_string(),
                 "test_real.py".to_string(),
+                "test_uses_repo.py".to_string(),
             ],
             "discovery must be sorted and exclude helpers.py"
         );

@@ -24,6 +24,7 @@ pub mod mock_api;
 pub mod parser;
 pub mod pyproject;
 pub mod pytest;
+pub mod smells;
 pub mod sut_calls;
 pub mod walker;
 
@@ -211,6 +212,30 @@ pub fn run_static(path: &Path) -> Result<Inventory> {
     run_static_with_tests_dir(path, None)
 }
 
+/// Same as [`run_static_with_tests_dir`] but accepts an explicit project
+/// package override. When `Some(name)`, the override replaces the
+/// pyproject-detected package list for sut-call resolution.
+pub fn run_static_with_options(
+    path: &Path,
+    tests_dir_override: Option<&Path>,
+    project_package_override: Option<&str>,
+) -> Result<Inventory> {
+    if !path.exists() {
+        anyhow::bail!("path does not exist: {}", path.display());
+    }
+    if path.is_dir() {
+        run_static_dir_with_options(path, tests_dir_override, project_package_override)
+    } else {
+        if tests_dir_override.is_some() {
+            anyhow::bail!(
+                "--tests-dir is only meaningful with a project-directory input (got file: {})",
+                path.display()
+            );
+        }
+        run_static_file_with_options(path, project_package_override)
+    }
+}
+
 /// Full-fat entry point.
 ///
 /// Runs the static pass, then invokes pytest for collection, durations,
@@ -240,7 +265,7 @@ pub fn run_with_pytest(
     no_coverage: bool,
     project_package_override: Option<&str>,
 ) -> Result<Inventory> {
-    let mut inv = run_static_with_tests_dir(project, tests_dir_override)?;
+    let mut inv = run_static_with_options(project, tests_dir_override, project_package_override)?;
 
     // Single-file input has no project-level pytest semantics; leave
     // `suite` and `tool` at their static defaults.
@@ -312,26 +337,16 @@ pub fn run_static_with_tests_dir(
     path: &Path,
     tests_dir_override: Option<&Path>,
 ) -> Result<Inventory> {
-    if !path.exists() {
-        anyhow::bail!("path does not exist: {}", path.display());
-    }
-    if path.is_dir() {
-        run_static_dir(path, tests_dir_override)
-    } else {
-        if tests_dir_override.is_some() {
-            anyhow::bail!(
-                "--tests-dir is only meaningful with a project-directory input (got file: {})",
-                path.display()
-            );
-        }
-        run_static_file(path)
-    }
+    run_static_with_options(path, tests_dir_override, None)
 }
 
 /// Single-file path: parse one .py file. Retained from Phase 1 so the
 /// existing integration tests stay green and so callers can drive the
 /// parser on synthetic inputs.
-fn run_static_file(path: &Path) -> Result<Inventory> {
+fn run_static_file_with_options(
+    path: &Path,
+    project_package_override: Option<&str>,
+) -> Result<Inventory> {
     let project = project_from_file(path);
     let source = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
@@ -346,17 +361,36 @@ fn run_static_file(path: &Path) -> Result<Inventory> {
     file_record.fixture_count = parsed.fixture_count;
 
     let mut inv = empty_inventory(project);
-    if !parsed.test_functions.is_empty() {
+    let has_tests = !parsed.test_functions.is_empty();
+    let mut test_functions = parsed.test_functions;
+
+    // Build the single-file imports map keyed by the same path the parser
+    // used to construct nodeids (so resolution finds it).
+    let mut imports_per_file: std::collections::BTreeMap<PathBuf, sut_calls::ImportMap> =
+        std::collections::BTreeMap::new();
+    imports_per_file.insert(path.to_path_buf(), parsed.import_map);
+
+    let project_packages = resolve_project_packages(&inv.project.path, project_package_override)?;
+    let sut = sut_calls::aggregate(&mut test_functions, &imports_per_file, &project_packages);
+    inv.sut_calls = sut;
+
+    apply_smells(&mut file_record, &mut test_functions);
+
+    if has_tests {
         inv.files.push(file_record);
     }
-    inv.test_functions = parsed.test_functions;
+    inv.test_functions = test_functions;
     Ok(inv)
 }
 
 /// Directory path: discover tests, parse each, aggregate. Per-file parse
 /// failures are logged and the file is skipped — the run as a whole must
 /// not abort just because one fixture is malformed.
-fn run_static_dir(project_root: &Path, tests_dir_override: Option<&Path>) -> Result<Inventory> {
+fn run_static_dir_with_options(
+    project_root: &Path,
+    tests_dir_override: Option<&Path>,
+    project_package_override: Option<&str>,
+) -> Result<Inventory> {
     let project = project_from_root(project_root);
     let mut inv = empty_inventory(project);
 
@@ -374,11 +408,17 @@ fn run_static_dir(project_root: &Path, tests_dir_override: Option<&Path>) -> Res
     let files = walker::discover_test_files(&tests_dir)
         .with_context(|| format!("failed to walk {}", tests_dir.display()))?;
 
+    // Map from the (relativised) parser file path to the file's import map,
+    // matching the key used when resolving `TestRecord.file` later.
+    let mut imports_per_file: std::collections::BTreeMap<PathBuf, sut_calls::ImportMap> =
+        std::collections::BTreeMap::new();
+
     for file_path in &files {
         match parse_single_file(file_path, &inv.project.path) {
-            Ok((file_record, mut tfs)) => {
+            Ok((file_record, tfs, import_map)) => {
+                imports_per_file.insert(file_record.path.clone(), import_map);
                 inv.files.push(file_record);
-                inv.test_functions.append(&mut tfs);
+                inv.test_functions.extend(tfs);
             }
             Err(err) => {
                 tracing::warn!(
@@ -389,16 +429,62 @@ fn run_static_dir(project_root: &Path, tests_dir_override: Option<&Path>) -> Res
             }
         }
     }
+
+    // Resolve called_names + aggregate into sut_calls.
+    let project_packages = resolve_project_packages(&inv.project.path, project_package_override)?;
+    inv.sut_calls =
+        sut_calls::aggregate(&mut inv.test_functions, &imports_per_file, &project_packages);
+
+    // Smells: derive per-test, then per-file (file pass uses already-
+    // populated TestRecord references).
+    let config = smells::MockSmellConfig::default();
+    for t in &mut inv.test_functions {
+        t.smell_hits.extend(smells::derive_test_smells(t, &config));
+    }
+    // Re-borrow tests by file path for file-level pass.
+    for file in &mut inv.files {
+        let tests_in_file: Vec<&TestRecord> =
+            inv.test_functions.iter().filter(|t| t.file == file.path).collect();
+        file.smell_hits.extend(smells::derive_file_smells(file, &tests_in_file, &config));
+    }
+
     Ok(inv)
 }
 
+/// Determine the active project-package list. CLI override wins and skips
+/// `pyproject.toml` reading entirely; otherwise we ask
+/// [`pyproject::read_project_packages`].
+fn resolve_project_packages(
+    project_root: &Path,
+    override_name: Option<&str>,
+) -> Result<std::collections::BTreeSet<String>> {
+    if let Some(name) = override_name {
+        return Ok(std::iter::once(name.to_string()).collect());
+    }
+    let pkgs = pyproject::read_project_packages(project_root)?;
+    Ok(pkgs.into_iter().collect())
+}
+
+/// Apply mock-smell derivation to a single file's records (used by the
+/// single-file static entry point, which never has cross-file aggregation).
+fn apply_smells(file: &mut FileRecord, tests: &mut [TestRecord]) {
+    let config = smells::MockSmellConfig::default();
+    for t in tests.iter_mut() {
+        t.smell_hits.extend(smells::derive_test_smells(t, &config));
+    }
+    let tests_refs: Vec<&TestRecord> = tests.iter().collect();
+    file.smell_hits.extend(smells::derive_file_smells(file, &tests_refs, &config));
+}
+
 /// Parse a single discovered file and produce its `FileRecord` plus
-/// per-test records, with nodeids made relative to `project_root` so the
-/// output is portable across machines.
+/// per-test records and the per-file [`sut_calls::ImportMap`] used by
+/// Phase 2's sut-call resolver. Nodeids and `TestRecord.file` are
+/// relativised against `project_root` so the output (and downstream map
+/// keys) are portable across machines.
 fn parse_single_file(
     file_path: &Path,
     project_root: &Path,
-) -> Result<(FileRecord, Vec<TestRecord>)> {
+) -> Result<(FileRecord, Vec<TestRecord>, sut_calls::ImportMap)> {
     let source = std::fs::read_to_string(file_path)
         .with_context(|| format!("failed to read {}", file_path.display()))?;
     let rel = relativize(file_path, project_root);
@@ -423,7 +509,7 @@ fn parse_single_file(
     record.patch_decorator_count = parsed.patch_decorator_count;
     record.fixture_count = parsed.fixture_count;
 
-    Ok((record, test_functions))
+    Ok((record, test_functions, parsed.import_map))
 }
 
 /// Make `path` relative to `base` for output. Falls back to `path` unchanged

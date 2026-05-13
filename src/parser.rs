@@ -561,6 +561,14 @@ fn record_import_statement(stmt: Node<'_>, source: &[u8], map: &mut ImportMap) {
 
 /// Record one `import_from_statement` (e.g. `from foo import bar`,
 /// `from foo import bar as b`, `from foo import *`, `from foo import a, b`).
+///
+/// The alias-map value is the **canonical full dotted name** of the local
+/// binding — i.e. `source_module + . + imported_name`. This lets Phase 2
+/// produce the canonical form `myproj.repository.Repository.save` from the
+/// raw call chain `Repository.save`. For aliased imports
+/// (`from foo import bar as b`), the alias-map key is the alias and the
+/// value is `foo.bar`; the originally imported name (`bar`) is the suffix
+/// of the canonical, not the alias.
 fn record_import_from(stmt: Node<'_>, source: &[u8], map: &mut ImportMap) {
     // The `module_name` field carries the source module's dotted name.
     let Some(module_node) = stmt.child_by_field_name("module_name") else {
@@ -570,12 +578,8 @@ fn record_import_from(stmt: Node<'_>, source: &[u8], map: &mut ImportMap) {
         return;
     };
 
-    // Single pass over named children:
-    // * `wildcard_import` short-circuits to recording only the source module
-    //   (no alias entries; star imports bind an unknown set of names).
-    // * `dotted_name` and `aliased_import` produce alias-map entries.
-    // tree-sitter-python represents `from m import *` as a `wildcard_import`
-    // sibling, and `from m import a, b` as repeated named children.
+    // Single pass over named children. Two-phase to avoid holding the cursor
+    // across mutations on `map`.
     let mut buffered: Vec<(String, String)> = Vec::new();
     let mut cursor = stmt.walk();
     for child in stmt.named_children(&mut cursor) {
@@ -588,23 +592,30 @@ fn record_import_from(stmt: Node<'_>, source: &[u8], map: &mut ImportMap) {
                 return;
             }
             "dotted_name" => {
-                if let Some(local) = attribute_or_dotted_text(child, source) {
-                    let local_head = local.split('.').next().unwrap_or(&local).to_string();
-                    buffered.push((local_head, source_module.clone()));
+                if let Some(imported) = attribute_or_dotted_text(child, source) {
+                    let imported_head = imported.split('.').next().unwrap_or(&imported).to_string();
+                    let canonical = format!("{source_module}.{imported_head}");
+                    buffered.push((imported_head, canonical));
                 }
             }
             "aliased_import" => {
-                if let Some(alias_node) = child.child_by_field_name("alias") {
-                    if let Ok(alias) = alias_node.utf8_text(source) {
-                        buffered.push((alias.to_string(), source_module.clone()));
+                // (aliased_import name: (dotted_name) alias: (identifier))
+                if let (Some(name_node), Some(alias_node)) =
+                    (child.child_by_field_name("name"), child.child_by_field_name("alias"))
+                {
+                    if let (Some(imported), Ok(alias)) =
+                        (attribute_or_dotted_text(name_node, source), alias_node.utf8_text(source))
+                    {
+                        let canonical = format!("{source_module}.{imported}");
+                        buffered.push((alias.to_string(), canonical));
                     }
                 }
             }
             _ => {}
         }
     }
-    for (local, src) in buffered {
-        map.aliases.insert(local, src);
+    for (local, canonical) in buffered {
+        map.aliases.insert(local, canonical);
     }
 }
 
@@ -1261,13 +1272,17 @@ import quux as q
 
     #[test]
     fn import_map_handles_from_imports() {
+        // The alias-map value is the canonical full dotted name of the
+        // local binding: `source_module + . + imported_name`. For an
+        // aliased from-import, the alias is the KEY and the imported name
+        // (`baz`) is the suffix of the canonical value.
         let src = "\
 from foo import bar
 from foo import baz as b
 ";
         let parsed = parse_full(src);
-        assert_eq!(parsed.import_map.aliases.get("bar"), Some(&"foo".to_string()));
-        assert_eq!(parsed.import_map.aliases.get("b"), Some(&"foo".to_string()));
+        assert_eq!(parsed.import_map.aliases.get("bar"), Some(&"foo.bar".to_string()));
+        assert_eq!(parsed.import_map.aliases.get("b"), Some(&"foo.baz".to_string()));
     }
 
     #[test]

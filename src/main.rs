@@ -93,7 +93,11 @@ fn run(cli: &Cli) -> Result<()> {
     let _ = cli.top_suspicious;
 
     let inventory = if cli.static_only {
-        coati::run_static_with_tests_dir(&cli.path, cli.tests_dir.as_deref())?
+        coati::run_static_with_options(
+            &cli.path,
+            cli.tests_dir.as_deref(),
+            cli.project_package.as_deref(),
+        )?
     } else {
         let python_cmd: Vec<String> = cli.python.split_whitespace().map(str::to_string).collect();
         let pytest_args: Vec<String> =

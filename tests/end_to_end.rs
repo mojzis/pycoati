@@ -67,7 +67,7 @@ fn inventory_reports_project_name_from_pyproject() {
 }
 
 #[test]
-fn walker_discovers_five_test_files_and_ignores_helpers() {
+fn walker_discovers_test_files_and_ignores_helpers() {
     let v = run_coati();
     let files = v["files"].as_array().expect("files must be array");
     let names: Vec<String> = files
@@ -82,7 +82,7 @@ fn walker_discovers_five_test_files_and_ignores_helpers() {
                 .to_string()
         })
         .collect();
-    assert_eq!(files.len(), 5, "expected 5 discovered test files, got {names:?}");
+    assert_eq!(files.len(), 7, "expected 7 discovered test files, got {names:?}");
     assert!(
         !names.iter().any(|n| n == "helpers.py"),
         "helpers.py must not be discovered: {names:?}"
@@ -93,6 +93,8 @@ fn walker_discovers_five_test_files_and_ignores_helpers() {
         "test_mixed.py",
         "test_no_asserts.py",
         "other_test.py",
+        "test_uses_repo.py",
+        "test_overmocked.py",
     ] {
         assert!(
             names.iter().any(|n| n == expected),
@@ -152,10 +154,11 @@ fn only_asserts_on_mock_predicate_matches_annotations() {
         })
         .collect();
 
-    // From the fixture annotations: test_repo_save_called is the only one
-    // with only_asserts_on_mock = true.
+    // From the fixture annotations + Phase 2 additions:
+    // - test_repo_save_called (existing fixture)
+    // - test_three_mocks_one_assert (Phase 2 fixture: `assert a.called`)
     let true_names: std::collections::BTreeSet<&str> =
-        std::iter::once("test_repo_save_called").collect();
+        ["test_repo_save_called", "test_three_mocks_one_assert"].into_iter().collect();
 
     for (name, rec) in &by_test_name {
         let actual = rec["only_asserts_on_mock"].as_bool().expect("bool predicate");
@@ -188,7 +191,9 @@ fn schema_invariants_preserved_under_walker_mode() {
     assert_eq!(v["tool"]["ran_pytest"], Value::Bool(false));
     assert_eq!(v["tool"]["ran_coverage"], Value::Bool(false));
     assert_eq!(v["suite"]["test_count"], Value::Null);
-    assert!(v["sut_calls"]["by_name"].as_array().expect("array").is_empty());
+    // sut_calls.by_name is now populated by Phase 2; just confirm the key
+    // exists and is an array.
+    assert!(v["sut_calls"]["by_name"].is_array());
 }
 
 #[test]
@@ -203,7 +208,7 @@ fn tests_dir_override_flag_accepts_path() {
         .success();
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf-8");
     let v: Value = serde_json::from_str(&stdout).expect("valid json");
-    assert_eq!(v["files"].as_array().expect("files array").len(), 5);
+    assert_eq!(v["files"].as_array().expect("files array").len(), 7);
 }
 
 #[test]
@@ -263,5 +268,126 @@ fn malformed_python_file_is_skipped_with_warning_not_aborted() {
     assert!(
         stderr.contains("test_bad.py") && stderr.to_lowercase().contains("warn"),
         "expected a warning mentioning test_bad.py on stderr, got: {stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2 — sut_calls + mock smells
+// ---------------------------------------------------------------------------
+
+/// `tests/test_uses_repo.py::test_repo_save_and_load` imports `Repository`
+/// via `from myproj.repository import Repository` and constructs it with
+/// `Repository()`. The parser emits `Repository` as a raw called name; the
+/// resolver looks it up in the import map and canonicalises to
+/// `myproj.repository.Repository`. (`repo.save` / `repo.load` go via the
+/// local variable `repo`, which is not in the import map and is therefore
+/// not project-internally resolvable from static analysis alone.)
+#[test]
+fn sut_calls_resolves_repository_save_in_test_uses_repo() {
+    let v = run_coati();
+    let by_name = v["sut_calls"]["by_name"].as_array().expect("by_name array");
+    let names: Vec<&str> = by_name.iter().filter_map(|e| e["name"].as_str()).collect();
+    assert!(
+        names.contains(&"myproj.repository.Repository"),
+        "expected myproj.repository.Repository in sut_calls.by_name, got {names:?}"
+    );
+}
+
+#[test]
+fn sut_calls_top_called_non_empty_for_fixture_project() {
+    let v = run_coati();
+    let top = v["sut_calls"]["top_called"].as_array().expect("top_called array");
+    assert!(!top.is_empty(), "expected at least one entry in top_called");
+}
+
+#[test]
+fn test_overmocked_fires_mock_overuse_smell() {
+    let v = run_coati();
+    let test_functions = v["test_functions"].as_array().expect("test_functions array");
+    let nodeid = "tests/test_overmocked.py::test_three_mocks_one_assert";
+    let rec = test_functions
+        .iter()
+        .find(|t| t["nodeid"].as_str() == Some(nodeid))
+        .unwrap_or_else(|| panic!("no test record for {nodeid}"));
+    let hits = rec["smell_hits"].as_array().expect("smell_hits array");
+    let categories: Vec<&str> = hits.iter().filter_map(|h| h["category"].as_str()).collect();
+    // mock_overuse fires at file level (3 Mock() constructions, 1 assert);
+    // at test level the only mock-construction proxy is patch decorators,
+    // which this test has none of — so we assert the FILE-level smell here.
+    let file = v["files"]
+        .as_array()
+        .expect("files array")
+        .iter()
+        .find(|f| f["path"].as_str() == Some("tests/test_overmocked.py"))
+        .unwrap_or_else(|| panic!("no FileRecord for tests/test_overmocked.py"));
+    let file_hits = file["smell_hits"].as_array().expect("file smell_hits array");
+    let file_categories: Vec<&str> =
+        file_hits.iter().filter_map(|h| h["category"].as_str()).collect();
+    assert!(
+        file_categories.contains(&"mock_overuse"),
+        "expected mock_overuse on file tests/test_overmocked.py, got test-level={categories:?} file-level={file_categories:?}"
+    );
+}
+
+#[test]
+fn test_mock_only_fires_mock_only_assertions_smell() {
+    let v = run_coati();
+    let test_functions = v["test_functions"].as_array().expect("test_functions array");
+    let nodeid = "tests/test_mock_only.py::test_repo_save_called";
+    let rec = test_functions
+        .iter()
+        .find(|t| t["nodeid"].as_str() == Some(nodeid))
+        .unwrap_or_else(|| panic!("no test record for {nodeid}"));
+    let hits = rec["smell_hits"].as_array().expect("smell_hits array");
+    let categories: Vec<&str> = hits.iter().filter_map(|h| h["category"].as_str()).collect();
+    assert!(
+        categories.contains(&"mock_only_assertions"),
+        "expected mock_only_assertions on {nodeid}, got {categories:?}"
+    );
+}
+
+#[test]
+fn file_overmocked_has_file_level_mock_overuse_smell() {
+    let v = run_coati();
+    let files = v["files"].as_array().expect("files array");
+    let file = files
+        .iter()
+        .find(|f| f["path"].as_str() == Some("tests/test_overmocked.py"))
+        .unwrap_or_else(|| panic!("no FileRecord for tests/test_overmocked.py"));
+    let hits = file["smell_hits"].as_array().expect("smell_hits array");
+    let categories: Vec<&str> = hits.iter().filter_map(|h| h["category"].as_str()).collect();
+    assert!(
+        categories.contains(&"mock_overuse"),
+        "expected file-level mock_overuse on tests/test_overmocked.py, got {categories:?}"
+    );
+}
+
+#[test]
+fn pyproject_project_package_detected_from_fixture() {
+    let pkgs = coati::pyproject::read_project_packages(&fixture_root()).expect("read packages");
+    assert!(pkgs.contains(&"myproj".to_string()), "expected myproj in {pkgs:?}");
+}
+
+#[test]
+fn cli_project_package_override_replaces_detection() {
+    // Pointing at a project whose pyproject says `myproj` but overriding
+    // with `--project-package foo` should drop the myproj-resolved entries
+    // from sut_calls. Since the fixture project's only resolved entries
+    // come from myproj, the resulting by_name list should be empty.
+    let assert = Command::cargo_bin("coati")
+        .expect("binary built")
+        .arg(fixture_root())
+        .arg("--static-only")
+        .arg("--project-package")
+        .arg("foo")
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf-8");
+    let v: Value = serde_json::from_str(&stdout).expect("valid json");
+    let by_name = v["sut_calls"]["by_name"].as_array().expect("by_name array");
+    let names: Vec<&str> = by_name.iter().filter_map(|e| e["name"].as_str()).collect();
+    assert!(
+        !names.iter().any(|n| n.starts_with("myproj")),
+        "override should have dropped myproj.* entries, got {names:?}"
     );
 }
