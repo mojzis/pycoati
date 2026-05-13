@@ -1,0 +1,9 @@
+# cargo-release configuration
+# Usage: cargo release patch|minor|major
+
+tag = true
+tag-message = "Release {{version}}"
+pre-release-commit-message = "Release v{{version}}"
+push = true
+publish = false
+verify = true
