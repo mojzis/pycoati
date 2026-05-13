@@ -1,12 +1,23 @@
 //! Tree-sitter based parsing of Python source files.
 //!
 //! Walks the syntax tree iteratively using a [`tree_sitter::TreeCursor`] and
-//! emits one [`crate::TestRecord`] per top-level `def test_*` function. The
-//! `assertion_count` reflects the number of `assert_statement` nodes inside
-//! each test function's body.
+//! emits one [`crate::TestRecord`] per pytest-collectable test function:
 //!
-//! Phase 2 adds the [`only_asserts_on_mock`](crate::TestRecord) predicate —
-//! `true` when every assert in the test targets a Mock-API attribute.
+//! * Top-level `def test_*` and `async def test_*`, with or without
+//!   decorators (`@pytest.mark.parametrize`, `@pytest.mark.anyio`, etc.).
+//!   Decorated defs live under a `decorated_definition` node which the
+//!   walker unwraps.
+//! * Methods named `test_*` inside classes whose name starts with `Test`,
+//!   matching pytest's default collection rule. Nodeid is
+//!   `<file>::<ClassName>::<method>` to align with pytest's output.
+//!
+//! Functions nested inside other functions are deliberately not collected —
+//! pytest does not collect them either.
+//!
+//! `assertion_count` reflects the number of `assert_statement` nodes inside
+//! each test function's body. The [`only_asserts_on_mock`](crate::TestRecord)
+//! predicate is `true` when every assert in the test targets a Mock-API
+//! attribute.
 
 use std::path::Path;
 
@@ -27,23 +38,24 @@ fn python_parser() -> Result<Parser> {
 
 /// Parse one Python source file and return one record per `test_*` function.
 ///
-/// The supplied `file_path` is used to build a pytest-style `nodeid` (i.e.
-/// `<path>::<test_name>`); it is otherwise opaque to the parser. Non-test
-/// functions and any nested test-named functions are ignored.
+/// The supplied `file_path` is used to build pytest-style nodeids
+/// (`<path>::<test_name>` for module-level tests, `<path>::<Class>::<test>`
+/// for class-nested tests); it is otherwise opaque to the parser.
 pub fn parse_python_file(source: &str, file_path: &Path) -> Result<Vec<TestRecord>> {
     let mut parser = python_parser()?;
     let tree = parser.parse(source, None).context("tree-sitter returned no tree")?;
     let root = tree.root_node();
 
     let mut records = Vec::new();
-    collect_top_level_test_functions(root, source.as_bytes(), file_path, &mut records);
+    collect_module_tests(root, source.as_bytes(), file_path, &mut records);
     Ok(records)
 }
 
-/// Iterate the immediate children of the module looking for top-level
-/// `def test_*` definitions. Nested defs are deliberately not collected —
-/// they aren't pytest tests.
-fn collect_top_level_test_functions(
+/// Iterate the immediate children of the module and dispatch on node kind:
+/// bare `function_definition`s (top-level tests), `decorated_definition`s
+/// (wrapping a function or a class), and `class_definition`s (pytest test
+/// containers when named `Test*`).
+fn collect_module_tests(
     module: Node<'_>,
     source: &[u8],
     file_path: &Path,
@@ -51,25 +63,102 @@ fn collect_top_level_test_functions(
 ) {
     let mut cursor = module.walk();
     for child in module.children(&mut cursor) {
-        if child.kind() == "function_definition" {
-            if let Some(name) = function_name(child, source) {
-                if name.starts_with("test_") {
-                    out.push(build_record(child, name, source, file_path));
+        match child.kind() {
+            "function_definition" => {
+                try_collect_test_function(child, source, file_path, None, out);
+            }
+            "decorated_definition" => {
+                if let Some(inner) = child.child_by_field_name("definition") {
+                    match inner.kind() {
+                        "function_definition" => {
+                            try_collect_test_function(inner, source, file_path, None, out);
+                        }
+                        "class_definition" => {
+                            collect_class_tests(inner, source, file_path, out);
+                        }
+                        _ => {}
+                    }
                 }
             }
+            "class_definition" => {
+                collect_class_tests(child, source, file_path, out);
+            }
+            _ => {}
         }
     }
 }
 
-/// Extract the identifier text of a `function_definition` node, if present.
-fn function_name<'a>(func: Node<'_>, source: &'a [u8]) -> Option<&'a str> {
-    let name_node = func.child_by_field_name("name")?;
+/// Walk a `class_definition`'s body collecting `test_*` methods. Skips
+/// classes whose name does not start with `Test` (pytest's default rule).
+/// Nested classes inside the body are intentionally not recursed into —
+/// pytest does not collect them, and joining their names would diverge
+/// from pytest's nodeid shape.
+fn collect_class_tests(
+    class_node: Node<'_>,
+    source: &[u8],
+    file_path: &Path,
+    out: &mut Vec<TestRecord>,
+) {
+    let Some(class_name) = node_name(class_node, source) else {
+        return;
+    };
+    if !class_name.starts_with("Test") {
+        return;
+    }
+    let Some(body) = class_node.child_by_field_name("body") else {
+        return;
+    };
+    let mut cursor = body.walk();
+    for child in body.children(&mut cursor) {
+        match child.kind() {
+            "function_definition" => {
+                try_collect_test_function(child, source, file_path, Some(class_name), out);
+            }
+            "decorated_definition" => {
+                if let Some(inner) = child.child_by_field_name("definition") {
+                    if inner.kind() == "function_definition" {
+                        try_collect_test_function(inner, source, file_path, Some(class_name), out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Push one record if the `function_definition` is a `test_*`.
+fn try_collect_test_function(
+    func: Node<'_>,
+    source: &[u8],
+    file_path: &Path,
+    class_prefix: Option<&str>,
+    out: &mut Vec<TestRecord>,
+) {
+    if let Some(name) = node_name(func, source) {
+        if name.starts_with("test_") {
+            out.push(build_record(func, name, source, file_path, class_prefix));
+        }
+    }
+}
+
+/// Extract the identifier text from a node's `name` field — works for
+/// both `function_definition` and `class_definition`.
+fn node_name<'a>(node: Node<'_>, source: &'a [u8]) -> Option<&'a str> {
+    let name_node = node.child_by_field_name("name")?;
     name_node.utf8_text(source).ok()
 }
 
 /// Build a [`TestRecord`] from a `function_definition` node, counting
-/// `assert_statement` descendants in its body.
-fn build_record(func: Node<'_>, name: &str, source: &[u8], file_path: &Path) -> TestRecord {
+/// `assert_statement` descendants in its body. When `class_prefix` is
+/// `Some`, the nodeid is formatted as `<file>::<Class>::<method>` to match
+/// pytest's collected/durations output.
+fn build_record(
+    func: Node<'_>,
+    name: &str,
+    source: &[u8],
+    file_path: &Path,
+    class_prefix: Option<&str>,
+) -> TestRecord {
     // tree-sitter rows are zero-indexed `usize`. On every supported target
     // `usize` is at most 64 bits, so the cast is exact; `saturating_add`
     // converts to a 1-indexed line number without surfacing a bogus
@@ -86,8 +175,13 @@ fn build_record(func: Node<'_>, name: &str, source: &[u8], file_path: &Path) -> 
     let only_asserts_on_mock =
         assertion_count > 0 && asserts.iter().all(|a| assert_targets_mock_api(*a, source));
 
+    let nodeid = match class_prefix {
+        Some(cls) => format!("{}::{}::{}", file_path.display(), cls, name),
+        None => format!("{}::{}", file_path.display(), name),
+    };
+
     TestRecord {
-        nodeid: format!("{}::{}", file_path.display(), name),
+        nodeid,
         file: file_path.to_path_buf(),
         line,
         assertion_count,
@@ -330,5 +424,153 @@ def test_j():
         let recs = parse(src);
         assert_eq!(recs[0].assertion_count, 2);
         assert!(recs[0].only_asserts_on_mock);
+    }
+
+    #[test]
+    fn decorated_top_level_test_is_detected() {
+        // Decorators wrap the def in a `decorated_definition` node — the
+        // walker must unwrap them, otherwise every `@pytest.mark.parametrize`
+        // test in real-world suites is invisible.
+        let src = "\
+@pytest.mark.parametrize('x', [1, 2])
+def test_decorated(x):
+    assert x > 0
+";
+        let recs = parse(src);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].nodeid, "synthetic.py::test_decorated");
+        assert_eq!(recs[0].assertion_count, 1);
+    }
+
+    #[test]
+    fn multi_decorator_test_is_detected() {
+        let src = "\
+@pytest.mark.slow
+@pytest.mark.parametrize('x', [1])
+def test_stacked(x):
+    assert x
+";
+        let recs = parse(src);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].nodeid, "synthetic.py::test_stacked");
+    }
+
+    #[test]
+    fn async_def_test_is_detected() {
+        let src = "\
+async def test_async_thing():
+    assert True
+";
+        let recs = parse(src);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].nodeid, "synthetic.py::test_async_thing");
+        assert_eq!(recs[0].assertion_count, 1);
+    }
+
+    #[test]
+    fn decorated_async_def_test_is_detected() {
+        let src = "\
+@pytest.mark.anyio
+async def test_decorated_async():
+    assert mock.called
+";
+        let recs = parse(src);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].nodeid, "synthetic.py::test_decorated_async");
+        assert!(recs[0].only_asserts_on_mock);
+    }
+
+    #[test]
+    fn class_nested_test_method_uses_pytest_nodeid_format() {
+        // pytest's nodeid for class-nested tests is `<file>::<Class>::<method>`.
+        // Coati must emit the same shape so its records align with pytest's
+        // collected / durations output.
+        let src = "\
+class TestFoo:
+    def test_bar(self):
+        assert 1 == 1
+";
+        let recs = parse(src);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].nodeid, "synthetic.py::TestFoo::test_bar");
+        assert_eq!(recs[0].assertion_count, 1);
+    }
+
+    #[test]
+    fn decorated_class_method_is_detected() {
+        let src = "\
+class TestFoo:
+    @pytest.mark.skip
+    def test_bar(self):
+        assert mock.called
+";
+        let recs = parse(src);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].nodeid, "synthetic.py::TestFoo::test_bar");
+        assert!(recs[0].only_asserts_on_mock);
+    }
+
+    #[test]
+    fn multiple_methods_in_test_class_all_collected() {
+        let src = "\
+class TestThing:
+    def test_one(self):
+        assert 1
+    @pytest.mark.parametrize('x', [1])
+    def test_two(self, x):
+        assert x
+    async def test_three(self):
+        assert True
+";
+        let recs = parse(src);
+        assert_eq!(recs.len(), 3);
+        let ids: Vec<&str> = recs.iter().map(|r| r.nodeid.as_str()).collect();
+        assert!(ids.contains(&"synthetic.py::TestThing::test_one"));
+        assert!(ids.contains(&"synthetic.py::TestThing::test_two"));
+        assert!(ids.contains(&"synthetic.py::TestThing::test_three"));
+    }
+
+    #[test]
+    fn non_test_class_is_ignored() {
+        // pytest only collects test methods from classes named `Test*`. A
+        // helper class with a `test_*` method is plumbing, not a test.
+        let src = "\
+class Helper:
+    def test_bar(self):
+        assert True
+";
+        let recs = parse(src);
+        assert!(recs.is_empty());
+    }
+
+    #[test]
+    fn decorated_test_class_methods_are_detected() {
+        // Decorated `class TestFoo` — rare but valid (e.g. @dataclass on a
+        // test container, though unusual). Methods inside still count.
+        let src = "\
+@some_decorator
+class TestFoo:
+    def test_bar(self):
+        assert 1
+";
+        let recs = parse(src);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].nodeid, "synthetic.py::TestFoo::test_bar");
+    }
+
+    #[test]
+    fn non_test_function_named_test_is_skipped() {
+        // The `test_` prefix filter still applies — helper functions and
+        // fixtures that don't start with `test_` are not collected.
+        let src = "\
+@pytest.fixture
+def some_fixture():
+    return 1
+
+def helper():
+    assert False
+";
+        let recs = parse(src);
+        assert!(recs.is_empty());
     }
 }
