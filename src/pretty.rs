@@ -37,14 +37,14 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use crate::{FileRecord, Inventory, TestRecord};
+use crate::{FileRecord, Inventory, Project, TestRecord};
 
 /// Render the inventory as plain text using `top_n` for both the test and
 /// file suspicious sections. Returns the formatted string; the caller writes
 /// it to stdout or a file.
 pub fn render(inv: &Inventory, top_n: usize) -> String {
     let mut out = String::new();
-    render_title(&mut out, &inv.project.name);
+    render_title(&mut out, &inv.project);
     out.push('\n');
     render_suite(&mut out, inv);
     out.push('\n');
@@ -56,8 +56,19 @@ pub fn render(inv: &Inventory, top_n: usize) -> String {
     out
 }
 
-fn render_title(out: &mut String, project_name: &str) {
-    let title = format!("coati audit — {project_name}");
+fn render_title(out: &mut String, project: &Project) {
+    // Prefer the directory basename as the primary identifier — that's what
+    // users typed on the command line and recognise — and surface the
+    // pyproject `[project].name` as a secondary token only when it differs
+    // (the two routinely disagree: `zazzy-thunder` checkout, `thunder_pkg`
+    // package). When `project.path` has no `file_name()` (e.g. it's the
+    // filesystem root), fall back to the project name as the primary.
+    let basename = project.path.file_name().and_then(|n| n.to_str()).unwrap_or(&project.name);
+    let title = if basename == project.name {
+        format!("coati audit — {basename}")
+    } else {
+        format!("coati audit — {basename} ({})", project.name)
+    };
     // The em-dash is a single Unicode char counted via `chars().count()` so
     // multi-byte chars do not over-extend the underline.
     let underline_len = title.chars().count();
@@ -365,7 +376,11 @@ mod tests {
     fn empty_inv() -> Inventory {
         Inventory {
             schema_version: "2".to_string(),
-            project: Project { path: PathBuf::from("/x"), name: "demo".to_string() },
+            // Pick a path whose basename matches the project name so the
+            // title-rendering helper produces the single-token form
+            // `coati audit — demo`. Tests that exercise the
+            // basename-differs branch construct their own `Project`.
+            project: Project { path: PathBuf::from("/demo"), name: "demo".to_string() },
             suite: Suite {
                 test_count: None,
                 runtime_seconds: None,
@@ -601,6 +616,43 @@ mod tests {
             .find(|l| l.contains("tests/a.py") && !l.contains("::test_x") && !l.contains("score"))
             .expect("file-table data row for tests/a.py rendered");
         assert!(row.contains(" 7 "), "expected stubs value 7 in row, got: {row:?}");
+    }
+
+    #[test]
+    fn render_title_uses_basename_alone_when_matches_project_name() {
+        // basename(path) == project.name → single-token title.
+        let project =
+            Project { path: PathBuf::from("/home/u/widgets"), name: "widgets".to_string() };
+        let mut out = String::new();
+        render_title(&mut out, &project);
+        let first_line = out.lines().next().expect("title line present");
+        assert_eq!(first_line, "coati audit — widgets");
+    }
+
+    #[test]
+    fn render_title_appends_project_name_when_basename_differs() {
+        // basename(path) != project.name → "<basename> (<project.name>)".
+        let project = Project {
+            path: PathBuf::from("/home/u/zazzy-thunder"),
+            name: "thunder_pkg".to_string(),
+        };
+        let mut out = String::new();
+        render_title(&mut out, &project);
+        let first_line = out.lines().next().expect("title line present");
+        assert_eq!(first_line, "coati audit — zazzy-thunder (thunder_pkg)");
+        // Underline matches the title's char-count.
+        let underline = out.lines().nth(1).expect("underline line present");
+        assert_eq!(underline.chars().count(), first_line.chars().count());
+    }
+
+    #[test]
+    fn render_title_falls_back_to_project_name_when_path_has_no_basename() {
+        // A root-like path with no file_name() falls back to the project name.
+        let project = Project { path: PathBuf::from("/"), name: "demo".to_string() };
+        let mut out = String::new();
+        render_title(&mut out, &project);
+        let first_line = out.lines().next().expect("title line present");
+        assert_eq!(first_line, "coati audit — demo");
     }
 
     #[test]

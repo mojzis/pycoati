@@ -57,23 +57,31 @@ pub fn run_coverage(
 
     let output = Command::new(program).args(&args).current_dir(project_root).output();
 
-    match output {
+    // Hoist exit code + stderr tail out of the debug-only branch so the
+    // post-parse WARNs can name *why* coverage failed. Without this, the
+    // user sees only `serde_json: EOF while parsing` and has no thread to
+    // pull on; the pytest stderr is where the actionable error lives
+    // (`coverage.py warning: No data was collected`, `ModuleNotFoundError`,
+    // `pytest: error: argument --cov ...`, etc).
+    let (exit_code, stderr_tail) = match output {
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
+            let code = o.status.code().unwrap_or(-1);
             if !stderr.is_empty() {
                 tracing::debug!(
                     label = "coverage",
-                    exit_code = o.status.code().unwrap_or(-1),
+                    exit_code = code,
                     stderr = %stderr,
                     "pytest coverage subprocess stderr"
                 );
             }
+            (code, tail_of_stderr(&stderr))
         }
         Err(err) => {
             tracing::warn!(error = %err, "failed to launch pytest for coverage");
             return None;
         }
-    }
+    };
 
     let raw = match std::fs::read_to_string(report_file.path()) {
         Ok(s) => s,
@@ -82,10 +90,34 @@ pub fn run_coverage(
             return None;
         }
     };
+    if raw.trim().is_empty() {
+        // pytest didn't write anything to the report path (the most common
+        // shape: coverage.py refused to write because no data was
+        // collected, or pytest blew up before the cov plugin's session-
+        // finish hook ran). Surface the exit code + stderr tail directly;
+        // do **not** let serde_json speak first with "EOF while parsing".
+        tracing::warn!(
+            pytest_exit_code = exit_code,
+            stderr_tail = %stderr_tail,
+            "no coverage data produced (pytest exit={exit_code}, stderr: {stderr_tail})"
+        );
+        return None;
+    }
     let value: Value = match serde_json::from_str(&raw) {
         Ok(v) => v,
         Err(err) => {
-            tracing::warn!(error = %err, "coverage JSON report was malformed");
+            // The report file existed and had bytes, but those bytes were
+            // not valid JSON — same root cause for the user (pytest /
+            // coverage misconfiguration) but a different proximate cause.
+            // Surface the exit code + stderr tail as the headline; ship
+            // the serde error as a `caused_by` field so we don't lose it,
+            // but never as the primary message.
+            tracing::warn!(
+                pytest_exit_code = exit_code,
+                stderr_tail = %stderr_tail,
+                caused_by = %err,
+                "no coverage data produced (pytest exit={exit_code}, stderr: {stderr_tail})"
+            );
             return None;
         }
     };
@@ -96,6 +128,32 @@ pub fn run_coverage(
         );
         None
     })
+}
+
+/// Truncate `stderr` to the trailing 8 lines or 800 chars (whichever bound
+/// trims more aggressively), preserving the **most recent** output — that's
+/// where pytest/coverage.py print the actionable error. Returns an empty
+/// string for empty input. Bytes-vs-chars: this works on UTF-8 chars,
+/// not raw bytes, so the result is never split mid-codepoint.
+fn tail_of_stderr(stderr: &str) -> String {
+    let trimmed = stderr.trim_end();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    // Last-8-lines bound.
+    let by_lines: String = {
+        let lines: Vec<&str> = trimmed.lines().collect();
+        let start = lines.len().saturating_sub(8);
+        lines[start..].join("\n")
+    };
+    // Last-800-chars bound, applied to the line-trimmed text so we never
+    // re-expand past the line budget.
+    let by_chars: String = if by_lines.chars().count() <= 800 {
+        by_lines
+    } else {
+        by_lines.chars().rev().take(800).collect::<Vec<_>>().into_iter().rev().collect()
+    };
+    by_chars
 }
 
 /// Defensively pull the top-level coverage % out of a coverage.py JSON
@@ -151,5 +209,30 @@ mod tests {
     fn returns_none_when_neither_key_present() {
         let v = json!({"totals": {"covered_lines": 10}});
         assert_eq!(extract_percent_covered(&v), None);
+    }
+
+    #[test]
+    fn tail_of_stderr_returns_empty_for_empty_input() {
+        assert_eq!(tail_of_stderr(""), "");
+        assert_eq!(tail_of_stderr("\n\n  \n"), "");
+    }
+
+    #[test]
+    fn tail_of_stderr_keeps_last_eight_lines() {
+        let stderr = (1..=20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let tail = tail_of_stderr(&stderr);
+        let kept: Vec<&str> = tail.lines().collect();
+        assert_eq!(kept.len(), 8, "expected last 8 lines, got {kept:?}");
+        assert_eq!(kept[0], "line 13");
+        assert_eq!(kept[7], "line 20");
+    }
+
+    #[test]
+    fn tail_of_stderr_caps_at_800_chars_even_within_eight_lines() {
+        // One enormous line; the char-budget must clip it.
+        let line: String = "x".repeat(2_000);
+        let tail = tail_of_stderr(&line);
+        assert!(tail.chars().count() <= 800, "tail must not exceed 800 chars");
+        assert!(tail.ends_with('x'));
     }
 }

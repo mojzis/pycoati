@@ -338,6 +338,20 @@ pub fn run_with_pytest(
         tests_dir_override.map_or_else(|| inv.project.path.join("tests"), Path::to_path_buf);
     let project_root = inv.project.path.clone();
 
+    // Preflight: probe `import pytest` against the resolved interpreter
+    // before firing the three pytest subprocesses. When the import fails
+    // we emit a single WARN naming the interpreter + a recovery hint and
+    // proceed: static analysis still runs, and the dynamic fields stay
+    // null in the emitted JSON. This is purely advisory — we do **not**
+    // abort, because the static portion of the inventory is still useful.
+    if !pytest::pytest_available(&program, &extra_python_args, &project_root) {
+        let extras = extra_python_args.join(" ");
+        let separator = if extras.is_empty() { "" } else { " " };
+        tracing::warn!(
+            "pytest unavailable in resolved python; try --python \"uv run python\" or .venv/bin/python (resolved: {program}{separator}{extras})"
+        );
+    }
+
     let collection = pytest::run_collection(
         &program,
         &extra_python_args,

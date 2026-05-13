@@ -41,6 +41,33 @@ pub struct DurationsOutcome {
     pub slowest_tests: Vec<SlowTest>,
 }
 
+/// Probe whether `pytest` is importable from the resolved Python.
+///
+/// Runs `<program> <extra_python_args> -c "import pytest"` in
+/// `project_root` and returns `true` iff the subprocess exits 0.
+///
+/// Used as a preflight check in `lib::run_with_pytest` so we can emit a
+/// single actionable WARN naming the resolved interpreter **before**
+/// pytest's three subprocess invocations all fail one by one with the
+/// same root cause. This is purely advisory: callers do not abort on
+/// `false` — static analysis still runs.
+///
+/// Failure modes (`Command::output` errored, non-UTF-8 stdout, etc.)
+/// collapse to `false`. The WARN itself is owned by the caller; this
+/// function stays silent so it can be unit-tested cleanly.
+pub(crate) fn pytest_available(
+    program: &str,
+    extra_python_args: &[String],
+    project_root: &Path,
+) -> bool {
+    let mut cmd = Command::new(program);
+    cmd.args(extra_python_args).args(["-c", "import pytest"]).current_dir(project_root);
+    match cmd.output() {
+        Ok(o) => o.status.success(),
+        Err(_) => false,
+    }
+}
+
 /// Invoke `pytest --collect-only -q <tests_dir>` and parse the test count.
 ///
 /// Returns an outcome with `test_count = None` (rather than an `Err`) when

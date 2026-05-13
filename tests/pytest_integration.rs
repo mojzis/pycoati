@@ -280,6 +280,162 @@ fn collection_survives_repo_addopts_with_quiet_flag() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Phase 3 — preflight + coverage WARN messages
+// ---------------------------------------------------------------------------
+
+/// Pick a python interpreter that exists on PATH but does **not** have
+/// `pytest` importable. Used by the preflight-WARN test to deliberately
+/// trip the missing-pytest path. Returns `None` if every candidate either
+/// is absent or *does* have pytest (we don't want the test to falsely
+/// pass when the env is fully provisioned).
+fn python_without_pytest() -> Option<String> {
+    let candidates = ["/usr/bin/python3", "/usr/bin/python", "python3", "python"];
+    for c in candidates {
+        // Probe existence + lack-of-pytest in one go. Two non-matching
+        // outcomes ("pytest importable" and "interpreter not on PATH")
+        // both mean "keep looking" — the only hit is `Ok(non-zero)`.
+        let status = StdCommand::new(c).args(["-c", "import pytest"]).status();
+        if let Ok(s) = status {
+            if !s.success() {
+                return Some(c.to_string());
+            }
+        }
+    }
+    None
+}
+
+#[test]
+fn preflight_warns_when_pytest_unavailable_but_static_still_runs() {
+    // The new preflight check must emit a structured WARN naming the
+    // resolved python — and crucially must *not* abort: static analysis
+    // (files, test_functions) must still populate.
+    let Some(python) = python_without_pytest() else {
+        eprintln!("SKIPPED: every probed interpreter has pytest importable");
+        return;
+    };
+
+    let assert = Command::cargo_bin("coati")
+        .expect("binary built")
+        .arg(fixture_root())
+        .arg("--python")
+        .arg(&python)
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf-8 stdout");
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).expect("utf-8 stderr");
+    let v: Value = serde_json::from_str(&stdout).expect("stdout is valid JSON");
+
+    // Static analysis still ran.
+    let files = v["files"].as_array().expect("files must remain populated");
+    assert!(!files.is_empty(), "static inventory must run even when pytest is unavailable");
+    let test_functions = v["test_functions"].as_array().expect("test_functions array");
+    assert!(
+        !test_functions.is_empty(),
+        "test_functions must populate from static parse even when pytest is missing"
+    );
+
+    // pytest-derived fields are null because the subprocess produced no
+    // parseable output.
+    assert_eq!(
+        v["suite"]["test_count"],
+        Value::Null,
+        "test_count must be null when pytest is unavailable in the resolved Python"
+    );
+    assert_eq!(v["tool"]["ran_pytest"], Value::Bool(false));
+
+    // The new preflight WARN fires and names both the interpreter and the
+    // recovery hint. Match on the structured substrings, not the whole line.
+    let stderr_lc = stderr.to_lowercase();
+    assert!(
+        stderr_lc.contains("warn"),
+        "expected a warn-level log on stderr from the preflight, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("pytest unavailable in resolved python"),
+        "expected preflight WARN to mention 'pytest unavailable in resolved python', got: {stderr}"
+    );
+    assert!(
+        stderr.contains(&python),
+        "expected preflight WARN to mention the resolved interpreter `{python}`, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("--python")
+            && (stderr.contains("uv run python") || stderr.contains(".venv/bin/python")),
+        "expected preflight WARN to include an actionable recovery hint, got: {stderr}"
+    );
+}
+
+#[test]
+fn coverage_warn_names_pytest_exit_code_when_report_missing() {
+    // When the coverage subprocess produces no JSON report (empty file or
+    // file written but empty), coati must surface a structured WARN
+    // containing the pytest exit code + a stderr tail — *not* the raw
+    // serde "EOF while parsing" string. We trigger the empty-report path
+    // by scaffolding a project whose package name doesn't match a real
+    // module, then running coverage against it: pytest exits non-zero,
+    // writes nothing useful to the report path, and coati must degrade.
+    let python = integration_python();
+    if !pytest_available(&python) {
+        eprintln!("SKIPPED: pytest not available via `{python}`");
+        return;
+    }
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // Scaffold a project with a `mini` package, but lie in pyproject.toml
+    // and claim the package name is `does_not_exist`. coati will pass
+    // `--cov=does_not_exist`, pytest will be unable to find anything to
+    // measure, and the JSON report path will end up empty / malformed.
+    std::fs::write(tmp.path().join("pyproject.toml"), "[project]\nname = \"does_not_exist\"\n")
+        .expect("write pyproject.toml");
+    let pkg = tmp.path().join("mini");
+    std::fs::create_dir(&pkg).expect("mkdir mini");
+    std::fs::write(pkg.join("__init__.py"), "").expect("write __init__.py");
+    std::fs::write(pkg.join("core.py"), "def greet():\n    return 'hi'\n").expect("write core.py");
+    let tests = tmp.path().join("tests");
+    std::fs::create_dir(&tests).expect("mkdir tests");
+    std::fs::write(
+        tests.join("test_greet.py"),
+        "from mini.core import greet\n\n\
+         def test_greet():\n    assert greet() == 'hi'\n",
+    )
+    .expect("write test_greet.py");
+
+    let assert = Command::cargo_bin("coati")
+        .expect("binary built")
+        .arg(tmp.path())
+        .arg("--python")
+        .arg(&python)
+        .assert()
+        .success();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).expect("utf-8 stderr");
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf-8 stdout");
+    let v: Value = serde_json::from_str(&stdout).expect("stdout is valid JSON");
+
+    // line_coverage_pct stays null because coverage failed.
+    assert_eq!(v["suite"]["line_coverage_pct"], Value::Null);
+    assert_eq!(v["tool"]["ran_coverage"], Value::Bool(false));
+
+    // The new WARN must mention a pytest exit code and must NOT surface
+    // the raw serde "EOF while parsing" string as the primary error.
+    let stderr_lc = stderr.to_lowercase();
+    assert!(
+        stderr_lc.contains("warn"),
+        "expected a warn-level log on stderr for the coverage failure, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("no coverage data produced") || stderr.contains("pytest exit"),
+        "expected coverage WARN to surface `no coverage data produced` or `pytest exit`, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("coverage JSON report was malformed"),
+        "old serde-fronted WARN should be replaced by the new structured form, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("EOF while parsing"),
+        "raw serde 'EOF while parsing' must never appear as the primary coverage error, got: {stderr}"
+    );
+}
+
 #[test]
 fn collection_survives_repo_addopts_with_cov_flag() {
     // A `pytest.ini` with `addopts = --cov=foo` is the adversarial case
