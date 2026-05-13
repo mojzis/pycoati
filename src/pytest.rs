@@ -178,8 +178,14 @@ fn parse_collection_count(stdout: &str) -> Option<u64> {
         let line = line.trim();
         // Accept "<N> test collected" or "<N> tests collected", with optional trailing time.
         if let Some(rest) = line.strip_suffix(" collected") {
-            if let Ok(n) = rest.split_whitespace().next()?.parse::<u64>() {
-                return Some(n);
+            // Defensive: `next()` could in principle yield `None` on a
+            // malformed line; we must fall through to the second branch and
+            // the nodeid-line fallback rather than short-circuit the whole
+            // function out of the surrounding loop.
+            if let Some(tok) = rest.split_whitespace().next() {
+                if let Ok(n) = tok.parse::<u64>() {
+                    return Some(n);
+                }
             }
         }
         if let Some(prefix) = line.split(" collected").next() {
@@ -250,16 +256,46 @@ fn parse_slowest_tests(stdout: &str, cap: usize) -> Vec<SlowTest> {
 /// Parse a single duration line of the form `<float>s <stage>  <nodeid>`.
 /// Only `call`-stage lines yield a `SlowTest`. Setup/teardown rows are
 /// returned as `None` so the caller can ignore them without an extra pass.
+///
+/// The nodeid is captured as "everything after the stage column" rather
+/// than as the next whitespace-separated token: parametrised pytest ids
+/// such as `tests/test_x.py::test_foo[1, 2]` contain whitespace inside the
+/// `[...]` block, and naïve tokenisation would mangle them.
 fn parse_duration_line(line: &str) -> Option<SlowTest> {
-    let mut toks = line.split_whitespace();
-    let seconds_tok = toks.next()?;
+    // Parse the leading "<float>s" column.
+    let after_seconds = line.trim_start();
+    let (seconds_tok, rest) = split_first_whitespace(after_seconds)?;
     let seconds = seconds_tok.strip_suffix('s')?.parse::<f64>().ok()?;
-    let stage = toks.next()?;
+
+    // Parse the stage column.
+    let (stage, rest) = split_first_whitespace(rest.trim_start())?;
     if stage != "call" {
         return None;
     }
-    let nodeid = toks.next()?.to_string();
-    Some(SlowTest { nodeid, seconds })
+
+    // The remainder of the line is the nodeid verbatim. Capturing it as a
+    // slice (not via `split_whitespace`) preserves parametrise-id spaces in
+    // ids like `tests/test_x.py::test_foo[1, 2]`.
+    let nodeid = rest.trim();
+    if nodeid.is_empty() {
+        return None;
+    }
+    Some(SlowTest { nodeid: nodeid.to_string(), seconds })
+}
+
+/// Split `s` at the first run of whitespace, returning `(head, tail)` where
+/// `head` is the leading non-whitespace token and `tail` is everything
+/// after that token (including any leading whitespace). Returns `None` if
+/// `s` is empty or contains no token.
+fn split_first_whitespace(s: &str) -> Option<(&str, &str)> {
+    let s = s.trim_start();
+    if s.is_empty() {
+        return None;
+    }
+    match s.find(char::is_whitespace) {
+        Some(end) => Some((&s[..end], &s[end..])),
+        None => Some((s, "")),
+    }
 }
 
 /// Parse the final summary line for total runtime: `… in 12.30s` or
@@ -340,6 +376,23 @@ tests/test_b.py .                                                        [100%]
     }
 
     #[test]
+    fn summary_line_only_yields_count() {
+        // No nodeid lines preceding the summary — count must still parse.
+        assert_eq!(parse_collection_count("7 tests collected in 0.10s\n"), Some(7));
+    }
+
+    #[test]
+    fn malformed_line_between_nodeids_does_not_abort_parse() {
+        // A garbled line in the middle of nodeids must not short-circuit out
+        // of the parser before the fallback nodeid-counting branch runs.
+        let stdout = "tests/test_a.py::test_one\n\
+                      X collected\n\
+                      tests/test_a.py::test_two\n\
+                      tests/test_b.py::test_three\n";
+        assert_eq!(parse_collection_count(stdout), Some(3));
+    }
+
+    #[test]
     fn parses_slowest_tests_in_descending_order_and_filters_to_call_stage() {
         let slowest = parse_slowest_tests(DURATIONS_SAMPLE, SLOWEST_TESTS_CAP);
         assert_eq!(slowest.len(), 3, "should keep only `call` rows");
@@ -371,6 +424,39 @@ tests/test_b.py .                                                        [100%]
     fn slowest_returns_empty_when_section_missing() {
         let stdout = "no slowest section here\n3 passed in 1.0s\n";
         assert_eq!(parse_slowest_tests(stdout, SLOWEST_TESTS_CAP).len(), 0);
+    }
+
+    #[test]
+    fn parametrised_nodeid_with_spaces_is_preserved_intact() {
+        // pytest parametrise ids commonly contain commas, and when callers
+        // pass tuple-shaped params the rendered id includes spaces too. The
+        // durations parser must capture the full nodeid as-is, not just up
+        // to the first whitespace.
+        let stdout = "============================= slowest durations =============================
+0.42s call     tests/test_a.py::test_foo[1, 2]
+0.30s call     tests/test_b.py::test_bar[a long id]
+=========================== 2 passed in 1.00s ===========================
+";
+        let slowest = parse_slowest_tests(stdout, SLOWEST_TESTS_CAP);
+        assert_eq!(slowest.len(), 2);
+        assert_eq!(slowest[0].nodeid, "tests/test_a.py::test_foo[1, 2]");
+        assert_eq!(slowest[1].nodeid, "tests/test_b.py::test_bar[a long id]");
+    }
+
+    #[test]
+    fn durations_only_input_parses_runtime_and_slowest() {
+        // The "minimum required" durations-only adversarial case: a stdout
+        // that contains only the slowest-durations section and a summary
+        // line, with no preceding session header. Both the per-test slowest
+        // entries and the trailing `in <secs>s` must still parse.
+        let stdout = "============================= slowest durations =============================
+0.10s call     tests/test_a.py::test_one
+========================= 1 passed in 0.42s =========================
+";
+        let slowest = parse_slowest_tests(stdout, SLOWEST_TESTS_CAP);
+        assert_eq!(slowest.len(), 1);
+        assert_eq!(slowest[0].nodeid, "tests/test_a.py::test_one");
+        assert_eq!(parse_runtime_seconds(stdout), Some(0.42));
     }
 
     #[test]
