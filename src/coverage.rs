@@ -90,22 +90,23 @@ pub fn run_coverage(
             return None;
         }
     };
-    if raw.trim().is_empty() {
-        // pytest didn't write anything to the report path (the most common
-        // shape: coverage.py refused to write because no data was
-        // collected, or pytest blew up before the cov plugin's session-
-        // finish hook ran). Surface the exit code + stderr tail directly;
-        // do **not** let serde_json speak first with "EOF while parsing".
-        tracing::warn!(
-            pytest_exit_code = exit_code,
-            stderr_tail = %stderr_tail,
-            "no coverage data produced (pytest exit={exit_code}, stderr: {stderr_tail})"
-        );
-        return None;
-    }
-    let value: Value = match serde_json::from_str(&raw) {
-        Ok(v) => v,
-        Err(err) => {
+    let value = match classify_raw_report(&raw) {
+        ReportOutcome::Parsed(v) => v,
+        ReportOutcome::Empty => {
+            // pytest didn't write anything to the report path (the most
+            // common shape: coverage.py refused to write because no data
+            // was collected, or pytest blew up before the cov plugin's
+            // session-finish hook ran). Surface the exit code + stderr
+            // tail directly; do **not** let serde_json speak first with
+            // "EOF while parsing".
+            tracing::warn!(
+                pytest_exit_code = exit_code,
+                stderr_tail = %stderr_tail,
+                "no coverage data produced (pytest exit={exit_code}, stderr: {stderr_tail})"
+            );
+            return None;
+        }
+        ReportOutcome::Malformed(err) => {
             // The report file existed and had bytes, but those bytes were
             // not valid JSON — same root cause for the user (pytest /
             // coverage misconfiguration) but a different proximate cause.
@@ -128,6 +129,37 @@ pub fn run_coverage(
         );
         None
     })
+}
+
+/// Result of inspecting the raw bytes coverage.py wrote (or didn't) to the
+/// JSON report path. Split into three branches so the caller can emit a
+/// distinct, structured WARN per failure mode without letting serde's
+/// "EOF while parsing" wording leak into the headline.
+#[derive(Debug)]
+enum ReportOutcome {
+    /// Bytes parsed cleanly into a JSON value.
+    Parsed(Value),
+    /// The file was missing/empty/whitespace-only — coverage.py refused
+    /// to write because no data was collected, or pytest crashed before
+    /// the cov plugin's session-finish hook ran.
+    Empty,
+    /// Bytes were present but not valid JSON. The serde error is carried
+    /// so the caller can surface it as a `caused_by` field, never as the
+    /// primary message.
+    Malformed(serde_json::Error),
+}
+
+/// Inspect the raw bytes of a coverage report and classify the outcome.
+/// Pure function so the empty vs malformed branches can be unit-tested
+/// without spawning a subprocess.
+fn classify_raw_report(raw: &str) -> ReportOutcome {
+    if raw.trim().is_empty() {
+        return ReportOutcome::Empty;
+    }
+    match serde_json::from_str(raw) {
+        Ok(v) => ReportOutcome::Parsed(v),
+        Err(err) => ReportOutcome::Malformed(err),
+    }
 }
 
 /// Truncate `stderr` to the trailing 8 lines or 800 chars (whichever bound
@@ -209,6 +241,59 @@ mod tests {
     fn returns_none_when_neither_key_present() {
         let v = json!({"totals": {"covered_lines": 10}});
         assert_eq!(extract_percent_covered(&v), None);
+    }
+
+    #[test]
+    fn classify_raw_report_treats_empty_string_as_empty() {
+        assert!(matches!(classify_raw_report(""), ReportOutcome::Empty));
+    }
+
+    #[test]
+    fn classify_raw_report_treats_whitespace_only_as_empty() {
+        // pytest sometimes leaves the tempfile with a trailing newline only —
+        // semantically the same as never being written.
+        assert!(matches!(classify_raw_report("\n  \t \n"), ReportOutcome::Empty));
+    }
+
+    #[test]
+    fn classify_raw_report_flags_non_json_bytes_as_malformed() {
+        // Non-JSON bytes (e.g. a stray pytest error stream redirected into
+        // the report path, or a partial coverage write) must trip the
+        // Malformed branch so the caller's WARN can carry serde's error as
+        // a `caused_by` field — never as the headline.
+        let outcome = classify_raw_report("not valid json at all");
+        match outcome {
+            ReportOutcome::Malformed(err) => {
+                let msg = err.to_string();
+                assert!(!msg.is_empty(), "serde error must carry a message");
+            }
+            other => panic!("expected Malformed branch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_raw_report_flags_truncated_json_as_malformed() {
+        // Real-world variant of malformed: pytest started writing the
+        // report but died mid-flush. The bytes look like JSON up to a
+        // point and then end abruptly — still the Malformed branch, not
+        // Empty.
+        assert!(matches!(
+            classify_raw_report("{\"totals\": {\"percent_covered\":"),
+            ReportOutcome::Malformed(_)
+        ));
+    }
+
+    #[test]
+    fn classify_raw_report_returns_parsed_value_for_valid_json() {
+        // Sanity: the happy path round-trips the value so the caller can
+        // hand it to `extract_percent_covered`.
+        let raw = "{\"totals\":{\"percent_covered\":50.0}}";
+        match classify_raw_report(raw) {
+            ReportOutcome::Parsed(v) => {
+                assert_eq!(extract_percent_covered(&v), Some(50.0));
+            }
+            other => panic!("expected Parsed branch, got {other:?}"),
+        }
     }
 
     #[test]

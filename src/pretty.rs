@@ -6,10 +6,14 @@
 //! pipe characters, no markdown — terminal-friendly output users can pipe
 //! into `less` or grep.
 //!
-//! Output shape (locked in Run 3 spec, step 11; Phase 2 adds `stubs`):
+//! Output shape (locked in Run 3 spec, step 11; Phase 2 adds `stubs`;
+//! Run 4 phase 3 updates the title to surface the directory basename and
+//! disambiguate against the pyproject `[project].name` only when they
+//! differ):
 //!
 //! ```text
-//! coati audit — <project name>
+//! coati audit — <basename>                       # when basename == project.name
+//! coati audit — <basename> (<project name>)      # when they differ
 //! ============================
 //!
 //! Suite
