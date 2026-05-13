@@ -126,9 +126,9 @@ fn per_file_assertion_counts_match_annotations() {
         let exp = parse_expectations(&source);
         let fr = by_basename.get(fixture).unwrap_or_else(|| panic!("no FileRecord for {fixture}"));
         assert_eq!(
-            fr["test_count"].as_u64().expect("test_count u64"),
+            fr["test_function_count"].as_u64().expect("test_function_count u64"),
             exp.tests,
-            "test_count mismatch for {fixture}"
+            "test_function_count mismatch for {fixture}"
         );
         assert_eq!(
             fr["assertion_count"].as_u64().expect("assertion_count u64"),
@@ -141,9 +141,9 @@ fn per_file_assertion_counts_match_annotations() {
 #[test]
 fn only_asserts_on_mock_predicate_matches_annotations() {
     let v = run_coati();
-    let tests = v["tests"].as_array().expect("tests must be array");
+    let test_functions = v["test_functions"].as_array().expect("test_functions must be array");
 
-    let by_test_name: BTreeMap<String, &Value> = tests
+    let by_test_name: BTreeMap<String, &Value> = test_functions
         .iter()
         .map(|t| {
             let nodeid = t["nodeid"].as_str().expect("nodeid string");
@@ -170,8 +170,8 @@ fn only_asserts_on_mock_predicate_matches_annotations() {
 #[test]
 fn nodeids_are_relative_to_project_root() {
     let v = run_coati();
-    let tests = v["tests"].as_array().expect("tests must be array");
-    for t in tests {
+    let test_functions = v["test_functions"].as_array().expect("test_functions must be array");
+    for t in test_functions {
         let nodeid = t["nodeid"].as_str().expect("nodeid string");
         assert!(
             nodeid.starts_with("tests/"),
@@ -184,7 +184,7 @@ fn nodeids_are_relative_to_project_root() {
 #[test]
 fn schema_invariants_preserved_under_walker_mode() {
     let v = run_coati();
-    assert_eq!(v["schema_version"], Value::String("1".to_string()));
+    assert_eq!(v["schema_version"], Value::String("2".to_string()));
     assert_eq!(v["tool"]["ran_pytest"], Value::Bool(false));
     assert_eq!(v["tool"]["ran_coverage"], Value::Bool(false));
     assert_eq!(v["suite"]["test_count"], Value::Null);

@@ -1,9 +1,9 @@
 //! Schema-shape integration test for the Inventory output.
 //!
 //! Verifies that `coati::run_static` produces JSON whose top-level structure
-//! exactly matches the locked `schema_version` "1" contract. Key-set
-//! equality is asserted on `serde_json::Value` so cosmetic struct-field
-//! reordering does not break the test.
+//! exactly matches the `schema_version` "2" contract. Key-set equality is
+//! asserted on `serde_json::Value` so cosmetic struct-field reordering does
+//! not break the test.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
@@ -23,7 +23,7 @@ fn keys(v: &Value) -> BTreeSet<String> {
 }
 
 #[test]
-fn inventory_top_level_keys_match_schema_v1() {
+fn inventory_top_level_keys_match_schema_v2() {
     let path = fixture_path("tests/fixtures/simple/empty.py");
     let inv = coati::run_static(&path).expect("run_static on empty.py");
     let v = serde_json::to_value(&inv).expect("serialize inventory");
@@ -33,7 +33,7 @@ fn inventory_top_level_keys_match_schema_v1() {
         "project",
         "suite",
         "files",
-        "tests",
+        "test_functions",
         "sut_calls",
         "top_suspicious",
         "tool",
@@ -42,19 +42,19 @@ fn inventory_top_level_keys_match_schema_v1() {
     .map(|s| (*s).to_string())
     .collect();
 
-    assert_eq!(keys(&v), expected, "top-level keys must match schema v1");
+    assert_eq!(keys(&v), expected, "top-level keys must match schema v2");
 }
 
 #[test]
-fn inventory_schema_version_is_string_one() {
+fn inventory_schema_version_is_string_two() {
     let path = fixture_path("tests/fixtures/simple/empty.py");
     let inv = coati::run_static(&path).expect("run_static on empty.py");
     let v = serde_json::to_value(&inv).expect("serialize inventory");
-    assert_eq!(v["schema_version"], Value::String("1".to_string()));
+    assert_eq!(v["schema_version"], Value::String("2".to_string()));
 }
 
 #[test]
-fn inventory_suite_fields_are_null_in_run_1() {
+fn inventory_suite_fields_are_null_in_static_only_mode() {
     let path = fixture_path("tests/fixtures/simple/empty.py");
     let inv = coati::run_static(&path).expect("run_static on empty.py");
     let v = serde_json::to_value(&inv).expect("serialize inventory");
@@ -73,7 +73,7 @@ fn inventory_suite_fields_are_null_in_run_1() {
 }
 
 #[test]
-fn inventory_tool_fields_are_run_1_defaults() {
+fn inventory_tool_fields_are_static_only_defaults() {
     let path = fixture_path("tests/fixtures/simple/empty.py");
     let inv = coati::run_static(&path).expect("run_static on empty.py");
     let v = serde_json::to_value(&inv).expect("serialize inventory");
@@ -123,18 +123,19 @@ fn inventory_sut_calls_and_top_suspicious_shape() {
     assert_eq!(v["sut_calls"]["by_name"], Value::Array(vec![]));
     assert_eq!(v["sut_calls"]["top_called"], Value::Array(vec![]));
 
-    let top_keys: BTreeSet<String> = ["tests", "files"].iter().map(|s| (*s).to_string()).collect();
+    let top_keys: BTreeSet<String> =
+        ["test_functions", "files"].iter().map(|s| (*s).to_string()).collect();
     assert_eq!(keys(&v["top_suspicious"]), top_keys);
-    assert_eq!(v["top_suspicious"]["tests"], Value::Array(vec![]));
+    assert_eq!(v["top_suspicious"]["test_functions"], Value::Array(vec![]));
     assert_eq!(v["top_suspicious"]["files"], Value::Array(vec![]));
 }
 
 #[test]
-fn inventory_files_and_tests_are_arrays() {
+fn inventory_files_and_test_functions_are_arrays() {
     let path = fixture_path("tests/fixtures/simple/empty.py");
     let inv = coati::run_static(&path).expect("run_static on empty.py");
     let v = serde_json::to_value(&inv).expect("serialize inventory");
 
     assert!(v["files"].is_array(), "files must be array");
-    assert!(v["tests"].is_array(), "tests must be array");
+    assert!(v["test_functions"].is_array(), "test_functions must be array");
 }

@@ -5,9 +5,14 @@
 //! model and the [`run_static`] entry point used by the `coati` binary and
 //! by integration tests.
 //!
-//! The output schema is locked at `schema_version = "1"`. Every top-level
-//! field is always serialized; fields not yet computed in the current run
-//! are populated with their Run-1 defaults (`null` / `0` / `[]`).
+//! The output schema is at `schema_version = "2"` — `"1"` was the initial
+//! Run-1/Run-2 shape; `"2"` renamed `tests[]` to `test_functions[]` and
+//! `test_count` (per-file, per-sut-call, `top_suspicious`) to
+//! `test_function_count` / `test_functions` to disambiguate the AST-level
+//! function count from `suite.test_count` (pytest-collected, parametrize-
+//! expanded). Every top-level field is always serialized; fields not yet
+//! computed in the current run are populated with defaults (`null` / `0` /
+//! `[]`).
 
 use std::path::{Path, PathBuf};
 
@@ -29,7 +34,7 @@ pub struct Inventory {
     pub project: Project,
     pub suite: Suite,
     pub files: Vec<FileRecord>,
-    pub tests: Vec<TestRecord>,
+    pub test_functions: Vec<TestRecord>,
     pub sut_calls: SutCalls,
     pub top_suspicious: TopSuspicious,
     pub tool: ToolInfo,
@@ -69,7 +74,10 @@ pub struct SlowTest {
 #[derive(Debug, Clone, Serialize)]
 pub struct FileRecord {
     pub path: PathBuf,
-    pub test_count: u64,
+    /// Number of `def test_*` functions parsed from this file via AST.
+    /// Class-nested methods are counted; parametrize is **not** expanded —
+    /// see `suite.test_count` for the pytest-collected item count.
+    pub test_function_count: u64,
     pub assertion_count: u64,
     pub mock_construction_count: u64,
     pub patch_decorator_count: u64,
@@ -109,13 +117,16 @@ pub struct SutCalls {
 #[derive(Debug, Clone, Serialize)]
 pub struct SutCallEntry {
     pub name: String,
-    pub test_count: u64,
+    /// Number of test functions whose body invokes a call resolving to this name.
+    pub test_function_count: u64,
     pub test_nodeids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TopSuspicious {
-    pub tests: Vec<String>,
+    /// Nodeids of the top-N suspicious test functions (sorted by suspicion
+    /// score). Each entry references one record in `test_functions[]`.
+    pub test_functions: Vec<String>,
     pub files: Vec<String>,
 }
 
@@ -159,7 +170,7 @@ impl ToolInfo {
 fn empty_file_record(path: &Path) -> FileRecord {
     FileRecord {
         path: path.to_path_buf(),
-        test_count: 0,
+        test_function_count: 0,
         assertion_count: 0,
         mock_construction_count: 0,
         patch_decorator_count: 0,
@@ -169,11 +180,11 @@ fn empty_file_record(path: &Path) -> FileRecord {
 }
 
 /// Build an empty inventory whose project metadata is already filled in.
-/// Callers populate `files` and `tests`; everything else stays at the
-/// Run-1 default shape (every key present, dynamic fields null/empty).
+/// Callers populate `files` and `test_functions`; everything else stays at
+/// the default shape (every key present, dynamic fields null/empty).
 fn empty_inventory(project: Project) -> Inventory {
     Inventory {
-        schema_version: "1".to_string(),
+        schema_version: "2".to_string(),
         project,
         suite: Suite {
             test_count: None,
@@ -182,9 +193,9 @@ fn empty_inventory(project: Project) -> Inventory {
             slowest_tests: Vec::new(),
         },
         files: Vec::new(),
-        tests: Vec::new(),
+        test_functions: Vec::new(),
         sut_calls: SutCalls { by_name: Vec::new(), top_called: Vec::new() },
-        top_suspicious: TopSuspicious { tests: Vec::new(), files: Vec::new() },
+        top_suspicious: TopSuspicious { test_functions: Vec::new(), files: Vec::new() },
         tool: ToolInfo::without_runtime(),
     }
 }
@@ -323,18 +334,18 @@ fn run_static_file(path: &Path) -> Result<Inventory> {
     let project = project_from_file(path);
     let source = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
-    let tests = parser::parse_python_file(&source, path)
+    let test_functions = parser::parse_python_file(&source, path)
         .with_context(|| format!("failed to parse {}", path.display()))?;
 
     let mut file_record = empty_file_record(path);
-    file_record.test_count = tests.len() as u64;
-    file_record.assertion_count = tests.iter().map(|t| t.assertion_count).sum();
+    file_record.test_function_count = test_functions.len() as u64;
+    file_record.assertion_count = test_functions.iter().map(|t| t.assertion_count).sum();
 
     let mut inv = empty_inventory(project);
-    if !tests.is_empty() {
+    if !test_functions.is_empty() {
         inv.files.push(file_record);
     }
-    inv.tests = tests;
+    inv.test_functions = test_functions;
     Ok(inv)
 }
 
@@ -361,9 +372,9 @@ fn run_static_dir(project_root: &Path, tests_dir_override: Option<&Path>) -> Res
 
     for file_path in &files {
         match parse_single_file(file_path, &inv.project.path) {
-            Ok((file_record, mut tests)) => {
+            Ok((file_record, mut tfs)) => {
                 inv.files.push(file_record);
-                inv.tests.append(&mut tests);
+                inv.test_functions.append(&mut tfs);
             }
             Err(err) => {
                 tracing::warn!(
@@ -387,23 +398,24 @@ fn parse_single_file(
     let source = std::fs::read_to_string(file_path)
         .with_context(|| format!("failed to read {}", file_path.display()))?;
     let rel = relativize(file_path, project_root);
-    let mut tests = parser::parse_python_file(&source, &rel)
+    let mut test_functions = parser::parse_python_file(&source, &rel)
         .with_context(|| format!("failed to parse {}", file_path.display()))?;
 
     // The parser builds nodeids using the path it was handed (here `rel`),
     // so no rewriting is needed.
-    let assertion_count: u64 = tests.iter().map(|t| t.assertion_count).sum();
-    let test_count = tests.len() as u64;
+    let assertion_count: u64 = test_functions.iter().map(|t| t.assertion_count).sum();
+    let test_function_count = test_functions.len() as u64;
 
-    // Be tidy about line ordering inside a file so the aggregated `tests`
-    // array is deterministic regardless of how the parser walks the tree.
-    tests.sort_by_key(|t| t.line);
+    // Be tidy about line ordering inside a file so the aggregated
+    // `test_functions` array is deterministic regardless of how the parser
+    // walks the tree.
+    test_functions.sort_by_key(|t| t.line);
 
     let mut record = empty_file_record(&rel);
-    record.test_count = test_count;
+    record.test_function_count = test_function_count;
     record.assertion_count = assertion_count;
 
-    Ok((record, tests))
+    Ok((record, test_functions))
 }
 
 /// Make `path` relative to `base` for output. Falls back to `path` unchanged
