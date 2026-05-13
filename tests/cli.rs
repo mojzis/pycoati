@@ -40,6 +40,52 @@ fn missing_path_returns_nonzero_and_writes_to_stderr() {
 }
 
 #[test]
+fn format_json_emits_valid_json() {
+    let fixture = fixture_path("tests/fixtures/simple/test_basic.py");
+    let assert = Command::cargo_bin("coati")
+        .expect("binary built")
+        .arg(&fixture)
+        .arg("--format")
+        .arg("json")
+        .assert()
+        .success();
+    let stdout =
+        String::from_utf8(assert.get_output().stdout.clone()).expect("stdout must be valid UTF-8");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("stdout must be valid JSON");
+    assert_eq!(v["schema_version"], serde_json::Value::String("2".to_string()));
+}
+
+#[test]
+fn format_pretty_exit_zero_non_empty_stdout() {
+    let fixture = fixture_path("tests/fixtures/simple/test_basic.py");
+    let assert = Command::cargo_bin("coati")
+        .expect("binary built")
+        .arg(&fixture)
+        .arg("--format")
+        .arg("pretty")
+        .assert()
+        .success();
+    let stdout =
+        String::from_utf8(assert.get_output().stdout.clone()).expect("stdout must be valid UTF-8");
+    assert!(!stdout.is_empty(), "pretty stdout must be non-empty");
+    assert!(
+        stdout.starts_with("coati audit"),
+        "pretty output must start with `coati audit`, got: {stdout:?}"
+    );
+}
+
+#[test]
+fn default_format_is_json_when_unset() {
+    // No `--format` flag → output parses as JSON (the default).
+    let fixture = fixture_path("tests/fixtures/simple/test_basic.py");
+    let assert =
+        Command::cargo_bin("coati").expect("binary built").arg(&fixture).assert().success();
+    let stdout =
+        String::from_utf8(assert.get_output().stdout.clone()).expect("stdout must be valid UTF-8");
+    serde_json::from_str::<serde_json::Value>(&stdout).expect("default output must parse as JSON");
+}
+
+#[test]
 fn output_flag_writes_to_file_and_omits_stdout() {
     let fixture = fixture_path("tests/fixtures/simple/test_basic.py");
     let tmp = tempfile::tempdir().expect("create tempdir");

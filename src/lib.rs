@@ -22,9 +22,11 @@ use serde::Serialize;
 pub mod coverage;
 pub mod mock_api;
 pub(crate) mod parser;
+pub(crate) mod pretty;
 pub mod pyproject;
 pub mod pytest;
 pub(crate) mod smells;
+pub(crate) mod suspicion;
 pub(crate) mod sut_calls;
 pub mod walker;
 
@@ -167,6 +169,13 @@ impl ToolInfo {
     }
 }
 
+/// Render the inventory as plain text. Thin pub wrapper over the crate-
+/// private `pretty` module so binaries and integration tests can request the
+/// pretty output without exposing the renderer internals.
+pub fn render_pretty(inv: &Inventory, top_n: usize) -> String {
+    pretty::render(inv, top_n)
+}
+
 /// Build an empty file-record for a single .py file. Counts are filled in by
 /// the caller after parsing.
 fn empty_file_record(path: &Path) -> FileRecord {
@@ -202,6 +211,12 @@ fn empty_inventory(project: Project) -> Inventory {
     }
 }
 
+/// Default `--top-suspicious N` when the CLI flag is not provided.
+///
+/// Mirrors the hardcoded `top_called` cap of 20 — both default lists are the
+/// same length to make the JSON / pretty outputs easy to skim side-by-side.
+pub const DEFAULT_TOP_SUSPICIOUS: usize = 20;
+
 /// Public entry point.
 ///
 /// Dispatches on whether the input path is a single Python file (Phase 1
@@ -215,16 +230,37 @@ pub fn run_static(path: &Path) -> Result<Inventory> {
 /// Same as [`run_static_with_tests_dir`] but accepts an explicit project
 /// package override. When `Some(name)`, the override replaces the
 /// pyproject-detected package list for sut-call resolution.
+///
+/// Uses the [`DEFAULT_TOP_SUSPICIOUS`] cap for the `top_suspicious` lists.
+/// Callers needing a custom cap use [`run_static_with_top_n`].
 pub fn run_static_with_options(
     path: &Path,
     tests_dir_override: Option<&Path>,
     project_package_override: Option<&str>,
 ) -> Result<Inventory> {
+    run_static_with_top_n(
+        path,
+        tests_dir_override,
+        project_package_override,
+        DEFAULT_TOP_SUSPICIOUS,
+    )
+}
+
+/// Like [`run_static_with_options`] but with an explicit `top_n` cap.
+///
+/// Used by the CLI to honor `--top-suspicious N`; library callers normally
+/// use the default-N variant.
+pub fn run_static_with_top_n(
+    path: &Path,
+    tests_dir_override: Option<&Path>,
+    project_package_override: Option<&str>,
+    top_n: usize,
+) -> Result<Inventory> {
     if !path.exists() {
         anyhow::bail!("path does not exist: {}", path.display());
     }
     if path.is_dir() {
-        run_static_dir_with_options(path, tests_dir_override, project_package_override)
+        run_static_dir_with_options(path, tests_dir_override, project_package_override, top_n)
     } else {
         if tests_dir_override.is_some() {
             anyhow::bail!(
@@ -232,7 +268,7 @@ pub fn run_static_with_options(
                 path.display()
             );
         }
-        run_static_file_with_options(path, project_package_override)
+        run_static_file_with_options(path, project_package_override, top_n)
     }
 }
 
@@ -264,8 +300,10 @@ pub fn run_with_pytest(
     pytest_args: &[String],
     no_coverage: bool,
     project_package_override: Option<&str>,
+    top_n: usize,
 ) -> Result<Inventory> {
-    let mut inv = run_static_with_options(project, tests_dir_override, project_package_override)?;
+    let mut inv =
+        run_static_with_top_n(project, tests_dir_override, project_package_override, top_n)?;
 
     // Single-file input has no project-level pytest semantics; leave
     // `suite` and `tool` at their static defaults.
@@ -346,6 +384,7 @@ pub fn run_static_with_tests_dir(
 fn run_static_file_with_options(
     path: &Path,
     project_package_override: Option<&str>,
+    top_n: usize,
 ) -> Result<Inventory> {
     let project = project_from_file(path);
     let source = std::fs::read_to_string(path)
@@ -380,6 +419,7 @@ fn run_static_file_with_options(
         inv.files.push(file_record);
     }
     inv.test_functions = test_functions;
+    score_and_rank(&mut inv, top_n);
     Ok(inv)
 }
 
@@ -390,6 +430,7 @@ fn run_static_dir_with_options(
     project_root: &Path,
     tests_dir_override: Option<&Path>,
     project_package_override: Option<&str>,
+    top_n: usize,
 ) -> Result<Inventory> {
     let project = project_from_root(project_root);
     let mut inv = empty_inventory(project);
@@ -448,7 +489,34 @@ fn run_static_dir_with_options(
         file.smell_hits.extend(smells::derive_file_smells(file, &tests_in_file, &config));
     }
 
+    score_and_rank(&mut inv, top_n);
     Ok(inv)
+}
+
+/// Apply the suspicion-score pipeline: per-test score, per-file score, then
+/// the top-N rankings. Shared between single-file and directory mode so both
+/// paths produce a fully-populated `top_suspicious` block.
+fn score_and_rank(inv: &mut Inventory, top_n: usize) {
+    let weights = suspicion::DEFAULT;
+    // Per-test scores: write back into the record so the JSON `suspicion_score`
+    // field reflects the same number we sort on.
+    for t in &mut inv.test_functions {
+        t.suspicion_score = suspicion::score_test(t, &weights);
+    }
+    // Per-file scores: group test scores by file path (matching TestRecord.file),
+    // then call `score_file` once per file.
+    let mut file_scores: Vec<f64> = Vec::with_capacity(inv.files.len());
+    for file in &inv.files {
+        let scores: Vec<f64> = inv
+            .test_functions
+            .iter()
+            .filter(|t| t.file == file.path)
+            .map(|t| t.suspicion_score)
+            .collect();
+        file_scores.push(suspicion::score_file(file, &scores));
+    }
+    inv.top_suspicious.test_functions = suspicion::top_n_tests(&inv.test_functions, top_n);
+    inv.top_suspicious.files = suspicion::top_n_files(&inv.files, &file_scores, top_n);
 }
 
 /// Determine the active project-package list. CLI override wins and skips

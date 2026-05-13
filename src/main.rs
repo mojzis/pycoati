@@ -1,10 +1,14 @@
 //! `coati` binary: runs an audit of a Python project (or single file)
-//! and prints the resulting [`coati::Inventory`] as JSON.
+//! and prints the resulting [`coati::Inventory`] as JSON or as an aligned-
+//! column plain-text view (`--format pretty`).
 //!
 //! Run 2 makes `--static-only` load-bearing: by default `coati <path>`
 //! now invokes `python -m pytest` three times against the project root
 //! (collection, durations, coverage) and populates `suite.*`. Users opt
 //! out with `--static-only`; `--no-coverage` skips only the coverage run.
+//!
+//! Run 3 adds `--format <json|pretty>` (default `json`). `pretty` writes the
+//! human-readable view; `json` is the structured `Inventory` payload.
 
 use std::fs;
 use std::io::{self, Write};
@@ -12,7 +16,21 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+
+/// Output format selector for `--format`.
+///
+/// `Json` produces the structured `Inventory` payload (pretty-printed). The
+/// JSON path is the default and the contract every downstream consumer
+/// (Phase 2 of the workflow, automation) reads. `Pretty` is the aligned-
+/// column terminal view; it is a human convenience and not load-bearing.
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum Format {
+    /// Structured `Inventory` JSON (pretty-printed). Default.
+    Json,
+    /// Aligned-column plain-text view for terminals.
+    Pretty,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "coati", version, about, long_about = None)]
@@ -21,7 +39,8 @@ struct Cli {
     /// a `.py` file.
     path: PathBuf,
 
-    /// Write the JSON inventory to this file instead of stdout.
+    /// Write the output to this file instead of stdout. The format is
+    /// determined by `--format`.
     #[arg(short, long)]
     output: Option<PathBuf>,
 
@@ -36,7 +55,11 @@ struct Cli {
     #[arg(long)]
     static_only: bool,
 
-    /// Accepted for forward compatibility; suspicion scoring lands in Run 3.
+    /// Cap the `top_suspicious` test and file lists at N entries. Default
+    /// `20`; setting to `0` returns empty lists.
+    ///
+    /// Kept as `Option<usize>` so the absence of the flag is distinguishable
+    /// from an explicit `--top-suspicious 20`; absent → `DEFAULT_TOP_SUSPICIOUS`.
     #[arg(long, value_name = "N")]
     top_suspicious: Option<usize>,
 
@@ -60,6 +83,11 @@ struct Cli {
     /// Skip only the coverage subprocess. Collection + durations still run.
     #[arg(long)]
     no_coverage: bool,
+
+    /// Output format. `json` (default) emits the structured `Inventory`
+    /// payload; `pretty` emits the aligned-column plain-text view.
+    #[arg(long, value_enum, default_value_t = Format::Json)]
+    format: Format,
 }
 
 fn main() -> ExitCode {
@@ -89,14 +117,14 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: &Cli) -> Result<()> {
-    // `--top-suspicious` is still a Run-3 stub.
-    let _ = cli.top_suspicious;
+    let top_n = cli.top_suspicious.unwrap_or(coati::DEFAULT_TOP_SUSPICIOUS);
 
     let inventory = if cli.static_only {
-        coati::run_static_with_options(
+        coati::run_static_with_top_n(
             &cli.path,
             cli.tests_dir.as_deref(),
             cli.project_package.as_deref(),
+            top_n,
         )?
     } else {
         let python_cmd: Vec<String> = cli.python.split_whitespace().map(str::to_string).collect();
@@ -109,17 +137,25 @@ fn run(cli: &Cli) -> Result<()> {
             &pytest_args,
             cli.no_coverage,
             cli.project_package.as_deref(),
+            top_n,
         )?
     };
 
-    let json = serde_json::to_string_pretty(&inventory).context("failed to serialize inventory")?;
+    let payload = match cli.format {
+        Format::Json => {
+            serde_json::to_string_pretty(&inventory).context("failed to serialize inventory")?
+        }
+        Format::Pretty => coati::render_pretty(&inventory, top_n),
+    };
 
     if let Some(out_path) = cli.output.as_ref() {
-        fs::write(out_path, &json)
+        // File output: no trailing newline (matches the Run-2 contract — the
+        // file contents round-trip cleanly through `serde_json::from_str`).
+        fs::write(out_path, &payload)
             .with_context(|| format!("failed to write {}", out_path.display()))?;
     } else {
         let mut stdout = io::stdout().lock();
-        stdout.write_all(json.as_bytes()).context("failed to write inventory to stdout")?;
+        stdout.write_all(payload.as_bytes()).context("failed to write payload to stdout")?;
         stdout.write_all(b"\n").context("failed to write trailing newline")?;
     }
     Ok(())
