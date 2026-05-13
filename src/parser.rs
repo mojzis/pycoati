@@ -101,17 +101,39 @@ fn build_record(func: Node<'_>, name: &str, source: &[u8], file_path: &Path) -> 
 }
 
 /// Collect every `assert_statement` node anywhere in the subtree rooted at
-/// `node`. Uses an explicit stack instead of recursion to keep the function
-/// well within the cognitive-complexity threshold.
+/// `node`. Walks the subtree iteratively with a single
+/// [`tree_sitter::TreeCursor`] — the idiomatic tree-sitter descent pattern,
+/// avoiding the per-node cursor allocations that a children-iterator loop
+/// would incur.
 fn collect_asserts<'a>(node: Node<'a>, out: &mut Vec<Node<'a>>) {
-    let mut stack: Vec<Node<'a>> = vec![node];
-    while let Some(current) = stack.pop() {
+    let mut cursor = node.walk();
+    // Bound the traversal to the subtree rooted at `node` — we must not
+    // ascend past the starting node when backing out of dead-ends.
+    let start_id = node.id();
+    loop {
+        let current = cursor.node();
         if current.kind() == "assert_statement" {
             out.push(current);
         }
-        let mut cursor = current.walk();
-        for child in current.children(&mut cursor) {
-            stack.push(child);
+
+        if cursor.goto_first_child() {
+            continue;
+        }
+        if current.id() != start_id && cursor.goto_next_sibling() {
+            continue;
+        }
+        // Back out until we find a parent with another sibling, or until we
+        // would ascend past the starting node.
+        loop {
+            if !cursor.goto_parent() {
+                return;
+            }
+            if cursor.node().id() == start_id {
+                return;
+            }
+            if cursor.goto_next_sibling() {
+                break;
+            }
         }
     }
 }
@@ -149,10 +171,14 @@ fn first_asserted_expression(assert_stmt: Node<'_>) -> Option<Node<'_>> {
 ///
 /// * `(attribute object: <X> attribute: (identifier) @last)` → returns `@last`
 /// * `(call function: (attribute ... attribute: (identifier) @last) ...)` → returns `@last`
+/// * `(parenthesized_expression <inner>)` → recurses into `<inner>`. Parens
+///   do not change semantics, so `assert (mock.called)` matches just like
+///   `assert mock.called`.
 ///
 /// Everything else — bare identifiers, comparisons, calls without an
-/// attribute head, parenthesised expressions, comprehensions — returns
-/// `None` (i.e. "not a mock-API assert").
+/// attribute head, unary/boolean operators, comprehensions — returns
+/// `None` (i.e. "not a mock-API assert"). Conservative is correct: when
+/// uncertain, callers treat the result as non-mock.
 fn last_attribute_name<'a>(expr: Node<'_>, source: &'a [u8]) -> Option<&'a str> {
     let attribute_node = match expr.kind() {
         "attribute" => expr,
@@ -163,6 +189,10 @@ fn last_attribute_name<'a>(expr: Node<'_>, source: &'a [u8]) -> Option<&'a str> 
             } else {
                 return None;
             }
+        }
+        "parenthesized_expression" => {
+            let inner = expr.named_child(0)?;
+            return last_attribute_name(inner, source);
         }
         _ => return None,
     };
@@ -257,5 +287,48 @@ def test_g():
 ";
         let recs = parse(src);
         assert!(!recs[0].only_asserts_on_mock);
+    }
+
+    #[test]
+    fn parenthesized_mock_attribute_is_recognised() {
+        // Parens do not change semantics; `(mock.called)` is still a
+        // mock-API attribute access.
+        let src = "\
+def test_h():
+    assert (mock.called)
+    assert (repo.save.assert_called_once_with(1))
+";
+        let recs = parse(src);
+        assert_eq!(recs[0].assertion_count, 2);
+        assert!(recs[0].only_asserts_on_mock);
+    }
+
+    #[test]
+    fn unary_negation_is_conservative_non_mock() {
+        // `not mock.called` is NOT an attribute access at the outer level —
+        // the spec says "Conservative is correct: when uncertain, mark as
+        // non-mock." Run-3 may revisit if a clear policy emerges.
+        let src = "\
+def test_i():
+    assert not mock.called
+";
+        let recs = parse(src);
+        assert!(!recs[0].only_asserts_on_mock);
+    }
+
+    #[test]
+    fn nested_asserts_in_if_block_are_collected() {
+        // Exercises the iterative cursor-descent: asserts nested inside
+        // control flow must still be discovered.
+        let src = "\
+def test_j():
+    if True:
+        assert mock.assert_called()
+        if x:
+            assert repo.save.assert_called()
+";
+        let recs = parse(src);
+        assert_eq!(recs[0].assertion_count, 2);
+        assert!(recs[0].only_asserts_on_mock);
     }
 }

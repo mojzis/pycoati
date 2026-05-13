@@ -40,7 +40,11 @@ struct Cli {
 }
 
 fn main() -> ExitCode {
+    // Log to stderr so warnings and other diagnostics never corrupt the
+    // JSON inventory written to stdout. The default writer is stdout, which
+    // would interleave `tracing` output with the structured payload.
     tracing_subscriber::fmt()
+        .with_writer(io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
@@ -63,12 +67,8 @@ fn main() -> ExitCode {
 
 fn run(cli: &Cli) -> Result<()> {
     // `--static-only`, `--top-suspicious`, and `--project-package` are
-    // accepted but have no effect in Run 1. Silence dead-code warnings
-    // without dropping the fields.
-    let _ = cli.static_only;
-    let _ = cli.top_suspicious;
-    let _ = cli.project_package.as_ref();
-
+    // accepted but have no effect in Run 1. They're declared on `Cli` so
+    // clap parses them; we don't read them here.
     let inventory = coati::run_static_with_tests_dir(&cli.path, cli.tests_dir.as_deref())?;
     let json = serde_json::to_string_pretty(&inventory).context("failed to serialize inventory")?;
 

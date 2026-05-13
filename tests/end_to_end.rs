@@ -218,3 +218,50 @@ fn project_package_flag_is_accepted_as_no_op() {
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf-8");
     let _v: Value = serde_json::from_str(&stdout).expect("valid json");
 }
+
+/// A malformed Python file inside the tests directory must NOT abort the run.
+/// The walker should emit a `tracing::warn!` and skip the file, while the
+/// remaining well-formed files still appear in the inventory.
+#[test]
+fn malformed_python_file_is_skipped_with_warning_not_aborted() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path();
+    std::fs::write(project.join("pyproject.toml"), "[project]\nname = \"badproj\"\n")
+        .expect("write pyproject");
+    let tests_dir = project.join("tests");
+    std::fs::create_dir(&tests_dir).expect("mkdir tests");
+
+    // Well-formed file with a single test + single assert.
+    std::fs::write(tests_dir.join("test_ok.py"), "def test_ok():\n    assert 1 == 1\n")
+        .expect("write ok fixture");
+
+    // Malformed file: unterminated string literal — tree-sitter still
+    // returns a tree (it's error-tolerant), so we additionally force a
+    // hard failure by making the file unreadable as UTF-8.
+    std::fs::write(tests_dir.join("test_bad.py"), b"\xff\xfe not valid utf-8")
+        .expect("write bad fixture");
+
+    let assert = Command::cargo_bin("coati").expect("binary built").arg(project).assert().success();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).expect("utf-8 stderr");
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf-8 stdout");
+    let v: Value = serde_json::from_str(&stdout).expect("stdout is valid JSON");
+
+    // The good file still produced a record.
+    let files = v["files"].as_array().expect("files array");
+    let basenames: Vec<&str> =
+        files.iter().filter_map(|f| f["path"].as_str()?.rsplit('/').next()).collect();
+    assert!(
+        basenames.contains(&"test_ok.py"),
+        "expected test_ok.py in inventory, got {basenames:?}"
+    );
+    assert!(
+        !basenames.contains(&"test_bad.py"),
+        "test_bad.py should have been skipped, got {basenames:?}"
+    );
+
+    // The skip emits a warning on stderr (tracing default writer).
+    assert!(
+        stderr.contains("test_bad.py") && stderr.to_lowercase().contains("warn"),
+        "expected a warning mentioning test_bad.py on stderr, got: {stderr}"
+    );
+}
