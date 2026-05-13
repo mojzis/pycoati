@@ -224,9 +224,9 @@ fn render_top_files(out: &mut String, inv: &Inventory, top_n: usize) {
         .iter()
         .take(top_n)
         .filter_map(|path| {
-            by_path
-                .get(path.as_str())
-                .map(|f| build_file_row(path, f, test_scores_by_file.get(path.as_str())))
+            by_path.get(path.as_str()).map(|f| {
+                build_file_row(path, f, test_scores_by_file.get(path.as_str()).map(Vec::as_slice))
+            })
         })
         .collect();
 
@@ -283,17 +283,11 @@ fn render_top_files(out: &mut String, inv: &Inventory, top_n: usize) {
     }
 }
 
-fn build_file_row(path: &str, f: &FileRecord, scores: Option<&Vec<f64>>) -> FileRow {
-    // Reconstruct the score from the per-test scores + file bonus so the
-    // pretty output stays consistent with the JSON ranking, without needing
-    // to round-trip the score through the schema. Bonus shape kept in sync
-    // with `suspicion::score_file` — see `WEIGHTS.md`.
-    let score = scores.map_or(0.0, |s| {
-        let mean = s.iter().copied().sum::<f64>() / s.len() as f64;
-        let denom = f.assertion_count.max(1) as f64;
-        let raw = (f.mock_construction_count as f64 / denom - 1.0).max(0.0) * 0.05;
-        mean + raw.min(0.1)
-    });
+fn build_file_row(path: &str, f: &FileRecord, scores: Option<&[f64]>) -> FileRow {
+    // Delegate to `suspicion::score_file` — single source of truth for the
+    // file-score formula. Without per-test scores the pretty output shows
+    // 0.00 (no scores means nothing to average).
+    let score = scores.map_or(0.0, |s| crate::suspicion::score_file(f, s));
     FileRow {
         score: format!("{score:.2}"),
         path: path.to_string(),
@@ -390,9 +384,20 @@ mod tests {
     fn render_handles_empty_inventory() {
         let inv = empty_inv();
         let out = render(&inv, 20);
-        assert!(out.contains("coati audit"));
-        assert!(out.contains("demo"));
-        assert!(!out.is_empty());
+        let lines: Vec<&str> = out.lines().collect();
+        // Title line + matching `=` underline. `chars().count()` matters
+        // because the title contains the em-dash, which is multi-byte.
+        let title = "coati audit — demo";
+        assert_eq!(lines[0], title);
+        let underline = lines[1];
+        assert_eq!(underline.chars().count(), title.chars().count());
+        assert!(underline.chars().all(|c| c == '='), "underline not all '=': {underline:?}");
+        // All four section headers must render even when their content is empty.
+        for header in
+            ["Suite", "Top suspicious tests", "Top suspicious files", "SUT calls (top 20)"]
+        {
+            assert!(out.contains(header), "missing section header '{header}' in:\n{out}");
+        }
     }
 
     #[test]

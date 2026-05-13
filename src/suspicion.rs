@@ -99,9 +99,9 @@ pub fn top_n_tests(records: &[TestRecord], n: usize) -> Vec<String> {
     }
     let mut ranked: Vec<(&str, f64)> =
         records.iter().map(|t| (t.nodeid.as_str(), t.suspicion_score)).collect();
-    ranked.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(b.0))
-    });
+    // `total_cmp` is a total order over f64 (NaN-aware), so the sort is
+    // panic-free and deterministic even if a NaN somehow slips in.
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
     ranked.into_iter().take(n).map(|(nodeid, _)| nodeid.to_string()).collect()
 }
 
@@ -117,9 +117,7 @@ pub fn top_n_files(files: &[FileRecord], scores: &[f64], n: usize) -> Vec<String
         .zip(scores.iter().copied())
         .map(|(f, s)| (f.path.display().to_string(), s))
         .collect();
-    ranked.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.0.cmp(&b.0))
-    });
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     ranked.into_iter().take(n).map(|(path, _)| path).collect()
 }
 
