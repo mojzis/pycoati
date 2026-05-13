@@ -460,6 +460,26 @@ fn run_static_dir_with_options(
     let files = walker::discover_test_files(&tests_dir)
         .with_context(|| format!("failed to walk {}", tests_dir.display()))?;
 
+    // Symmetric counterpart to the "tests directory not found" WARN above:
+    // when the dir exists but the walker returns zero `test_*.py` files,
+    // emit a distinct WARN so the empty inventory is obviously a project
+    // configuration issue rather than a coati bug. The non-empty path
+    // logs an info-level breadcrumb for the same reason.
+    if files.is_empty() {
+        tracing::warn!(
+            tests_dir = %tests_dir.display(),
+            "no python test files under tests dir; emitting empty inventory"
+        );
+    } else {
+        tracing::info!(
+            tests_dir = %tests_dir.display(),
+            count = files.len(),
+            "found {} python test files under {}",
+            files.len(),
+            tests_dir.display()
+        );
+    }
+
     // Map from the (relativised) parser file path to the file's import map,
     // matching the key used when resolving `TestRecord.file` later.
     let mut imports_per_file: std::collections::BTreeMap<PathBuf, sut_calls::ImportMap> =

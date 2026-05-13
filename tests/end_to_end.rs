@@ -271,6 +271,53 @@ fn malformed_python_file_is_skipped_with_warning_not_aborted() {
     );
 }
 
+/// An empty `tests/` directory must emit a distinct WARN (separate from the
+/// existing "tests directory not found" branch) and produce a valid, empty
+/// JSON inventory. Without the WARN it's painfully easy to interpret a
+/// zero-test inventory as a coati bug rather than a misconfigured project.
+#[test]
+fn empty_tests_directory_emits_warn_and_clean_inventory() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path();
+    std::fs::write(project.join("pyproject.toml"), "[project]\nname = \"emptyproj\"\n")
+        .expect("write pyproject");
+    let tests_dir = project.join("tests");
+    std::fs::create_dir(&tests_dir).expect("mkdir tests");
+    // No files at all under tests/.
+
+    let assert = Command::cargo_bin("coati").expect("binary built").arg(project).assert().success();
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).expect("utf-8 stderr");
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf-8 stdout");
+    let v: Value = serde_json::from_str(&stdout).expect("stdout must be valid JSON");
+
+    // Inventory is clean and empty.
+    assert_eq!(v["files"].as_array().expect("files array").len(), 0);
+    assert_eq!(v["test_functions"].as_array().expect("test_functions array").len(), 0);
+    assert_eq!(v["schema_version"], Value::String("2".to_string()));
+
+    // A WARN must fire that names the test-discovery branch (not just the
+    // pytest WARNs that fire on any empty inventory). The wording must be
+    // distinct from the existing "tests directory not found" line.
+    let lower = stderr.to_lowercase();
+    assert!(
+        lower.contains("no python test files"),
+        "expected a WARN like 'no python test files under …' on stderr, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("tests directory not found"),
+        "the WARN must be distinct from the missing-dir WARN, got: {stderr}"
+    );
+    // The discovery WARN must be a `WARN` level line, not just an info.
+    let discovery_line = stderr
+        .lines()
+        .find(|l| l.to_lowercase().contains("no python test files"))
+        .expect("discovery line present");
+    assert!(
+        discovery_line.contains("WARN"),
+        "expected WARN-level for the no-files line, got: {discovery_line}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Phase 2 — sut_calls + mock smells
 // ---------------------------------------------------------------------------
