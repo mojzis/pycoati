@@ -250,17 +250,22 @@ fn build_record(
     let mut asserts: Vec<Node<'_>> = Vec::new();
     let mut calls: Vec<Node<'_>> = Vec::new();
     let mut raises_blocks: Vec<Node<'_>> = Vec::new();
+    let mut unittest_asserts: Vec<Node<'_>> = Vec::new();
     if let Some(body_node) = body {
         collect_asserts(body_node, &mut asserts);
         collect_calls(body_node, &mut calls);
         collect_raises_blocks(body_node, source, &mut raises_blocks);
+        collect_unittest_asserts(body_node, class_prefix, source, &mut unittest_asserts);
     }
 
     // `with pytest.raises(...)` blocks are non-mock effective assertions: they
     // count toward `assertion_count` and disqualify `only_asserts_on_mock`.
-    let assertion_count = (asserts.len() + raises_blocks.len()) as u64;
+    // `self.assertXxx(...)` method calls inside a `unittest.TestCase` subclass
+    // are also non-mock effective assertions: each call site counts once.
+    let assertion_count = (asserts.len() + raises_blocks.len() + unittest_asserts.len()) as u64;
     let only_asserts_on_mock = !asserts.is_empty()
         && raises_blocks.is_empty()
+        && unittest_asserts.is_empty()
         && asserts.iter().all(|a| assert_targets_mock_api(*a, source));
 
     let mock_construction_count =
@@ -690,6 +695,38 @@ fn collect_raises_blocks<'a>(node: Node<'a>, source: &[u8], out: &mut Vec<Node<'
     for w in withs {
         if with_statement_is_pytest_raises(w, source) {
             out.push(w);
+        }
+    }
+}
+
+/// Collect every `call_expression` in the subtree whose dotted call-head
+/// matches `self.assert*`. These are the `unittest.TestCase` assertion
+/// methods (`self.assertEqual`, `self.assertTrue`, `self.assertIn`, etc.)
+/// and they count as effective assertions just like a bare `assert`.
+///
+/// Gated on `class_prefix.is_some()` because outside a class context
+/// `self.*` cannot bind to a `TestCase` receiver. Inside `Test*` classes the
+/// pytest collection rule already guarantees the surrounding receiver is a
+/// unittest-compatible test instance (pytest happily collects unittest
+/// subclasses), so we accept any `self.assert*` head without further checks.
+fn collect_unittest_asserts<'a>(
+    body: Node<'a>,
+    class_prefix: Option<&str>,
+    source: &[u8],
+    out: &mut Vec<Node<'a>>,
+) {
+    if class_prefix.is_none() {
+        return;
+    }
+    let mut calls: Vec<Node<'a>> = Vec::new();
+    collect_descendants(body, "call", &mut calls);
+    for call in calls {
+        if let Some(head) = call_head_chain(call, source) {
+            if let Some(method) = head.strip_prefix("self.") {
+                if method.starts_with("assert") {
+                    out.push(call);
+                }
+            }
         }
     }
 }

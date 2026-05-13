@@ -66,3 +66,82 @@ fn file_record_aggregates_match_per_test_totals() {
     let expected_asserts: u64 = inv.test_functions.iter().map(|t| t.assertion_count).sum();
     assert_eq!(file.assertion_count, expected_asserts);
 }
+
+#[test]
+fn unittest_self_assert_methods_count_as_assertions() {
+    // The fixture has one class-nested test with 3 `self.assertXxx` calls
+    // plus one `self.assertRaises` block; the parser must count all three
+    // method calls as effective assertions.
+    let path = fixture_path("tests/fixtures/unittest_style/test_unittest.py");
+    let inv = coati::run_static(&path).expect("run_static on unittest fixture");
+
+    let by_name: std::collections::BTreeMap<&str, &coati::TestRecord> = inv
+        .test_functions
+        .iter()
+        .filter_map(|t| t.nodeid.split("::").last().map(|n| (n, t)))
+        .collect();
+
+    let asserts_test =
+        by_name.get("test_unittest_asserts").expect("test_unittest_asserts must be discovered");
+    assert_eq!(
+        asserts_test.assertion_count, 3,
+        "expected 3 self.assertXxx calls counted, got {}",
+        asserts_test.assertion_count
+    );
+}
+
+#[test]
+fn unittest_test_with_real_assertions_is_not_only_mock() {
+    // The unittest fixture's `test_unittest_asserts` asserts on plain
+    // values (self.assertEqual(x, 2), etc.). It must NOT be flagged as
+    // `only_asserts_on_mock`.
+    let path = fixture_path("tests/fixtures/unittest_style/test_unittest.py");
+    let inv = coati::run_static(&path).expect("run_static on unittest fixture");
+
+    let asserts_test = inv
+        .test_functions
+        .iter()
+        .find(|t| t.nodeid.ends_with("::test_unittest_asserts"))
+        .expect("test_unittest_asserts must be discovered");
+    assert!(
+        !asserts_test.only_asserts_on_mock,
+        "unittest assertions on plain values must not be flagged as only_asserts_on_mock"
+    );
+}
+
+#[test]
+fn unittest_assert_raises_block_counts_as_assertion() {
+    // `with self.assertRaises(ValueError):` exposes one effective assertion
+    // via the `self.assertRaises` call inside the with-clause. The
+    // raises-block branch is restricted to `pytest.raises(...)`/`raises(...)`,
+    // but the unittest collector should still catch this call site.
+    let path = fixture_path("tests/fixtures/unittest_style/test_unittest.py");
+    let inv = coati::run_static(&path).expect("run_static on unittest fixture");
+    let raises_test = inv
+        .test_functions
+        .iter()
+        .find(|t| t.nodeid.ends_with("::test_unittest_raises_block"))
+        .expect("test_unittest_raises_block must be discovered");
+    assert_eq!(
+        raises_test.assertion_count, 1,
+        "expected `with self.assertRaises(...)` to count as one assertion, got {}",
+        raises_test.assertion_count
+    );
+}
+
+#[test]
+fn unittest_class_nodeids_include_class_segment() {
+    // Sanity check the existing class-prefix nodeid plumbing for the new
+    // unittest fixture — both methods should appear under `TestThing::`.
+    let path = fixture_path("tests/fixtures/unittest_style/test_unittest.py");
+    let inv = coati::run_static(&path).expect("run_static on unittest fixture");
+    let nodeids: Vec<&str> = inv.test_functions.iter().map(|t| t.nodeid.as_str()).collect();
+    assert_eq!(
+        inv.test_functions.len(),
+        2,
+        "expected 2 unittest methods discovered, got nodeids: {nodeids:?}"
+    );
+    for n in &nodeids {
+        assert!(n.contains("::TestThing::"), "expected TestThing class prefix in {n:?}");
+    }
+}
