@@ -15,7 +15,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 
 use assert_cmd::Command;
@@ -211,5 +211,105 @@ fn broken_python_interpreter_does_not_crash_inventory() {
     assert!(
         stderr.to_lowercase().contains("warn"),
         "expected a warn-level log on stderr when pytest invocation fails, got: {stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 1 — repo addopts must not break pytest collection / durations / coverage
+// ---------------------------------------------------------------------------
+
+/// Build a self-contained pytest project at `project_root` with a `pytest.ini`
+/// whose `addopts` line is `addopts_value`. The project ships one trivial
+/// package (`mini`) with a single function, and one test that exercises it.
+fn scaffold_pytest_project(project_root: &Path, addopts_value: &str) {
+    std::fs::write(project_root.join("pyproject.toml"), "[project]\nname = \"mini\"\n")
+        .expect("write pyproject.toml");
+    std::fs::write(
+        project_root.join("pytest.ini"),
+        format!("[pytest]\naddopts = {addopts_value}\n"),
+    )
+    .expect("write pytest.ini");
+
+    let pkg = project_root.join("mini");
+    std::fs::create_dir(&pkg).expect("mkdir mini");
+    std::fs::write(pkg.join("__init__.py"), "").expect("write __init__.py");
+    std::fs::write(pkg.join("core.py"), "def greet():\n    return 'hi'\n").expect("write core.py");
+
+    let tests = project_root.join("tests");
+    std::fs::create_dir(&tests).expect("mkdir tests");
+    std::fs::write(
+        tests.join("test_greet.py"),
+        "from mini.core import greet\n\n\
+         def test_greet_returns_hi():\n    \
+             assert greet() == 'hi'\n\n\
+         def test_greet_is_truthy():\n    \
+             assert greet()\n",
+    )
+    .expect("write test_greet.py");
+}
+
+#[test]
+fn collection_survives_repo_addopts_with_quiet_flag() {
+    // A `pytest.ini` with `addopts = -q` is benign on its own, but it
+    // exercises the `-o addopts=` neutralisation path: coati should not
+    // reach into the project's `addopts`, and the collection count must
+    // match the number of test functions the fixture declares.
+    let python = integration_python();
+    if !pytest_available(&python) {
+        eprintln!("SKIPPED: pytest not available via `{python}`");
+        return;
+    }
+    let tmp = tempfile::tempdir().expect("tempdir");
+    scaffold_pytest_project(tmp.path(), "-q");
+
+    let assert = Command::cargo_bin("coati")
+        .expect("binary built")
+        .arg(tmp.path())
+        .arg("--python")
+        .arg(&python)
+        .arg("--no-coverage")
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf-8 stdout");
+    let v: Value = serde_json::from_str(&stdout).expect("stdout is valid JSON");
+    let test_count = v["suite"]["test_count"].as_u64();
+    assert_eq!(
+        test_count,
+        Some(2),
+        "expected test_count == Some(2) when repo addopts is `-q`, got {test_count:?}"
+    );
+}
+
+#[test]
+fn collection_survives_repo_addopts_with_cov_flag() {
+    // A `pytest.ini` with `addopts = --cov=foo` is the adversarial case
+    // from the rollout report: when coati runs `pytest --collect-only`
+    // without neutralising addopts, pytest tries to import the
+    // `pytest-cov` plugin against a non-existent package and the
+    // collection count comes back as `None`. With `-o addopts=` the
+    // override clears the line for this run and collection succeeds.
+    let python = integration_python();
+    if !pytest_available(&python) {
+        eprintln!("SKIPPED: pytest not available via `{python}`");
+        return;
+    }
+    let tmp = tempfile::tempdir().expect("tempdir");
+    scaffold_pytest_project(tmp.path(), "--cov=does_not_exist");
+
+    let assert = Command::cargo_bin("coati")
+        .expect("binary built")
+        .arg(tmp.path())
+        .arg("--python")
+        .arg(&python)
+        .arg("--no-coverage")
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf-8 stdout");
+    let v: Value = serde_json::from_str(&stdout).expect("stdout is valid JSON");
+    let test_count = v["suite"]["test_count"].as_u64();
+    assert_eq!(
+        test_count,
+        Some(2),
+        "expected test_count == Some(2) when repo addopts is `--cov=does_not_exist`, got {test_count:?}"
     );
 }

@@ -37,9 +37,17 @@ pub fn run_coverage(
     };
 
     let mut args: Vec<String> = extra_python_args.to_vec();
+    // `-o addopts=` neutralises any `addopts = …` line in the project's
+    // pytest.ini / pyproject.toml for this invocation — see the same
+    // override in `pytest::run_collection` for the rationale. The coverage
+    // pass is especially sensitive to inherited addopts because the
+    // project's own `--cov=…` would overwrite the `--cov-report=json:…`
+    // path that coati relies on for the report file.
     args.extend([
         "-m".into(),
         "pytest".into(),
+        "-o".into(),
+        "addopts=".into(),
         format!("--cov={package}"),
         format!("--cov-report=json:{}", report_file.path().display()),
         "-q".into(),
