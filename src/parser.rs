@@ -5,14 +5,15 @@
 //! `assertion_count` reflects the number of `assert_statement` nodes inside
 //! each test function's body.
 //!
-//! Phase 1 hardcodes `only_asserts_on_mock = false` — the mock-API detector
-//! lands in Phase 2.
+//! Phase 2 adds the [`only_asserts_on_mock`](crate::TestRecord) predicate —
+//! `true` when every assert in the test targets a Mock-API attribute.
 
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use tree_sitter::{Node, Parser};
 
+use crate::mock_api::is_mock_api_attribute;
 use crate::TestRecord;
 
 /// Build a tree-sitter parser pre-configured with the Python grammar.
@@ -53,7 +54,7 @@ fn collect_top_level_test_functions(
         if child.kind() == "function_definition" {
             if let Some(name) = function_name(child, source) {
                 if name.starts_with("test_") {
-                    out.push(build_record(child, name, file_path));
+                    out.push(build_record(child, name, source, file_path));
                 }
             }
         }
@@ -68,22 +69,29 @@ fn function_name<'a>(func: Node<'_>, source: &'a [u8]) -> Option<&'a str> {
 
 /// Build a [`TestRecord`] from a `function_definition` node, counting
 /// `assert_statement` descendants in its body.
-fn build_record(func: Node<'_>, name: &str, file_path: &Path) -> TestRecord {
+fn build_record(func: Node<'_>, name: &str, source: &[u8], file_path: &Path) -> TestRecord {
     // tree-sitter rows are zero-indexed `usize`. On every supported target
     // `usize` is at most 64 bits, so the cast is exact; `saturating_add`
     // converts to a 1-indexed line number without surfacing a bogus
     // sentinel value at the theoretical `u64::MAX` boundary.
     let row = func.start_position().row as u64;
     let line = row.saturating_add(1);
-    let body = func.child_by_field_name("body");
-    let assertion_count = body.map_or(0, |b| count_asserts(b));
+
+    let mut asserts: Vec<Node<'_>> = Vec::new();
+    if let Some(body) = func.child_by_field_name("body") {
+        collect_asserts(body, &mut asserts);
+    }
+
+    let assertion_count = asserts.len() as u64;
+    let only_asserts_on_mock =
+        assertion_count > 0 && asserts.iter().all(|a| assert_targets_mock_api(*a, source));
 
     TestRecord {
         nodeid: format!("{}::{}", file_path.display(), name),
         file: file_path.to_path_buf(),
         line,
         assertion_count,
-        only_asserts_on_mock: false,
+        only_asserts_on_mock,
         patch_decorator_count: 0,
         setup_to_assertion_ratio: 0.0,
         called_names: Vec::new(),
@@ -92,22 +100,162 @@ fn build_record(func: Node<'_>, name: &str, file_path: &Path) -> TestRecord {
     }
 }
 
-/// Count every `assert_statement` node anywhere in the subtree rooted at
+/// Collect every `assert_statement` node anywhere in the subtree rooted at
 /// `node`. Uses an explicit stack instead of recursion to keep the function
 /// well within the cognitive-complexity threshold.
-fn count_asserts(node: Node<'_>) -> u64 {
-    let mut count: u64 = 0;
-    let mut stack: Vec<Node<'_>> = vec![node];
-
+fn collect_asserts<'a>(node: Node<'a>, out: &mut Vec<Node<'a>>) {
+    let mut stack: Vec<Node<'a>> = vec![node];
     while let Some(current) = stack.pop() {
         if current.kind() == "assert_statement" {
-            count += 1;
+            out.push(current);
         }
         let mut cursor = current.walk();
         for child in current.children(&mut cursor) {
             stack.push(child);
         }
     }
+}
 
-    count
+/// Decide whether an `assert_statement` targets a Mock-API attribute.
+///
+/// `assert_statement` in tree-sitter-python has `assert` followed by the
+/// asserted expression(s). We look at the first non-keyword child — the
+/// expression being asserted — and decide whether its **outermost** value
+/// shape is `<receiver>.<mock_api_attribute>` (possibly chained, possibly
+/// called).
+///
+/// Conservative classification: anything we cannot positively identify as a
+/// mock-API attribute access (bare names, comparisons, `isinstance(...)`,
+/// arithmetic, etc.) is treated as non-mock. The optional `msg` argument
+/// after a comma is ignored — only the truth-y expression matters.
+fn assert_targets_mock_api(assert_stmt: Node<'_>, source: &[u8]) -> bool {
+    let Some(expr) = first_asserted_expression(assert_stmt) else {
+        return false;
+    };
+    last_attribute_name(expr, source).is_some_and(is_mock_api_attribute)
+}
+
+/// Return the first asserted expression of an `assert_statement`. The first
+/// child is the `assert` keyword; the next named child is the expression.
+fn first_asserted_expression(assert_stmt: Node<'_>) -> Option<Node<'_>> {
+    // `named_child` is index-based and avoids the lifetime gymnastics of
+    // borrowing a cursor that would have to outlive the returned Node.
+    assert_stmt.named_child(0)
+}
+
+/// Determine the "last attribute" of an expression for Mock-API matching.
+///
+/// Recognised shapes (and only these):
+///
+/// * `(attribute object: <X> attribute: (identifier) @last)` → returns `@last`
+/// * `(call function: (attribute ... attribute: (identifier) @last) ...)` → returns `@last`
+///
+/// Everything else — bare identifiers, comparisons, calls without an
+/// attribute head, parenthesised expressions, comprehensions — returns
+/// `None` (i.e. "not a mock-API assert").
+fn last_attribute_name<'a>(expr: Node<'_>, source: &'a [u8]) -> Option<&'a str> {
+    let attribute_node = match expr.kind() {
+        "attribute" => expr,
+        "call" => {
+            let func = expr.child_by_field_name("function")?;
+            if func.kind() == "attribute" {
+                func
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    let last = attribute_node.child_by_field_name("attribute")?;
+    last.utf8_text(source).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn parse(src: &str) -> Vec<TestRecord> {
+        parse_python_file(src, &PathBuf::from("synthetic.py")).expect("parse")
+    }
+
+    #[test]
+    fn only_mock_asserts_predicate_is_true_for_pure_mock_test() {
+        let src = "\
+def test_a():
+    assert mock.assert_called_once_with(1)
+    assert repo.save.assert_called()
+";
+        let recs = parse(src);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].assertion_count, 2);
+        assert!(recs[0].only_asserts_on_mock);
+    }
+
+    #[test]
+    fn mixed_asserts_yield_false() {
+        let src = "\
+def test_b():
+    assert x == 1
+    assert mock.assert_called()
+";
+        let recs = parse(src);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].assertion_count, 2);
+        assert!(!recs[0].only_asserts_on_mock);
+    }
+
+    #[test]
+    fn isinstance_assert_is_non_mock() {
+        let src = "\
+def test_c():
+    assert isinstance(x, Foo)
+";
+        let recs = parse(src);
+        assert!(!recs[0].only_asserts_on_mock);
+    }
+
+    #[test]
+    fn zero_asserts_yield_false() {
+        let src = "\
+def test_d():
+    pass
+";
+        let recs = parse(src);
+        assert_eq!(recs[0].assertion_count, 0);
+        assert!(!recs[0].only_asserts_on_mock);
+    }
+
+    #[test]
+    fn chained_attribute_uses_last_segment() {
+        // The final attribute in the chain decides — even though `save` is
+        // not a mock-API name, the outermost `.assert_called_once_with` is.
+        let src = "\
+def test_e():
+    assert a.b.c.save.assert_called_once_with(1)
+";
+        let recs = parse(src);
+        assert!(recs[0].only_asserts_on_mock);
+    }
+
+    #[test]
+    fn bare_attribute_without_call_is_recognised() {
+        // `.called` is a property, not a method — no parentheses.
+        let src = "\
+def test_f():
+    assert mock.called
+";
+        let recs = parse(src);
+        assert!(recs[0].only_asserts_on_mock);
+    }
+
+    #[test]
+    fn non_attribute_call_is_non_mock() {
+        let src = "\
+def test_g():
+    assert add(2, 3) == 5
+";
+        let recs = parse(src);
+        assert!(!recs[0].only_asserts_on_mock);
+    }
 }

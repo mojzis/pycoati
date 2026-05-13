@@ -1,9 +1,9 @@
 //! coati library crate.
 //!
 //! Audits Python test suites: counts test functions and assertions per file,
-//! and (in later phases) detects mock-API smells. This crate exposes the
-//! [`Inventory`] data model and the [`run_static`] entry point used by the
-//! `coati` binary and by integration tests.
+//! and detects mock-API smells. This crate exposes the [`Inventory`] data
+//! model and the [`run_static`] entry point used by the `coati` binary and
+//! by integration tests.
 //!
 //! The output schema is locked at `schema_version = "1"`. Every top-level
 //! field is always serialized; fields not yet computed in the current run
@@ -14,7 +14,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Serialize;
 
+pub mod mock_api;
 pub mod parser;
+pub mod pyproject;
+pub mod walker;
 
 /// Top-level audit result. Every field is always serialized (no
 /// `skip_serializing_if`) so the on-the-wire shape is stable across runs.
@@ -54,9 +57,13 @@ pub struct SlowTest {
 
 /// One Python test-bearing file.
 ///
-/// Only emitted when the file contains at least one `test_*` function.
-/// Non-test Python files (or test files with zero matching functions) are
-/// silently skipped and produce no [`FileRecord`].
+/// In directory (walker) mode, one record is emitted per discovered test
+/// file even if it contains zero `test_*` functions — the file was on disk
+/// and matched the naming convention, so the inventory acknowledges it.
+///
+/// In single-file mode, zero-test files are skipped (Phase 1 behaviour
+/// retained for backwards compatibility with the original `--static-only`
+/// single-file invocation).
 #[derive(Debug, Clone, Serialize)]
 pub struct FileRecord {
     pub path: PathBuf,
@@ -145,22 +152,65 @@ fn empty_file_record(path: &Path) -> FileRecord {
     }
 }
 
-/// Public entry point. Parses a single Python file and returns an
-/// [`Inventory`]. Directory inputs are rejected for now (Run 2 adds the
-/// walker).
-pub fn run_static(path: &Path) -> Result<Inventory> {
-    if path.is_dir() {
-        anyhow::bail!(
-            "directory input not supported in this run; pass a single .py file (got {})",
-            path.display()
-        );
+/// Build an empty inventory whose project metadata is already filled in.
+/// Callers populate `files` and `tests`; everything else stays at the
+/// Run-1 default shape (every key present, dynamic fields null/empty).
+fn empty_inventory(project: Project) -> Inventory {
+    Inventory {
+        schema_version: "1".to_string(),
+        project,
+        suite: Suite {
+            test_count: None,
+            runtime_seconds: None,
+            line_coverage_pct: None,
+            slowest_tests: Vec::new(),
+        },
+        files: Vec::new(),
+        tests: Vec::new(),
+        sut_calls: SutCalls { by_name: Vec::new(), top_called: Vec::new() },
+        top_suspicious: TopSuspicious { tests: Vec::new(), files: Vec::new() },
+        tool: ToolInfo::without_runtime(),
     }
+}
+
+/// Public entry point.
+///
+/// Dispatches on whether the input path is a single Python file (Phase 1
+/// single-file mode) or a project root directory (Phase 2 walker mode). The
+/// default `<project_root>/tests` is used for test discovery; see
+/// [`run_static_with_tests_dir`] to override.
+pub fn run_static(path: &Path) -> Result<Inventory> {
+    run_static_with_tests_dir(path, None)
+}
+
+/// Same as [`run_static`] but lets the caller override the tests directory.
+/// Only meaningful in directory mode; passing a tests-dir override alongside
+/// a single-file input is an error.
+pub fn run_static_with_tests_dir(
+    path: &Path,
+    tests_dir_override: Option<&Path>,
+) -> Result<Inventory> {
     if !path.exists() {
         anyhow::bail!("path does not exist: {}", path.display());
     }
+    if path.is_dir() {
+        run_static_dir(path, tests_dir_override)
+    } else {
+        if tests_dir_override.is_some() {
+            anyhow::bail!(
+                "--tests-dir is only meaningful with a project-directory input (got file: {})",
+                path.display()
+            );
+        }
+        run_static_file(path)
+    }
+}
 
-    let project = project_from_path(path);
-
+/// Single-file path: parse one .py file. Retained from Phase 1 so the
+/// existing integration tests stay green and so callers can drive the
+/// parser on synthetic inputs.
+fn run_static_file(path: &Path) -> Result<Inventory> {
+    let project = project_from_file(path);
     let source = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
     let tests = parser::parse_python_file(&source, path)
@@ -170,36 +220,114 @@ pub fn run_static(path: &Path) -> Result<Inventory> {
     file_record.test_count = tests.len() as u64;
     file_record.assertion_count = tests.iter().map(|t| t.assertion_count).sum();
 
-    let files = if tests.is_empty() { Vec::new() } else { vec![file_record] };
+    let mut inv = empty_inventory(project);
+    if !tests.is_empty() {
+        inv.files.push(file_record);
+    }
+    inv.tests = tests;
+    Ok(inv)
+}
 
-    Ok(Inventory {
-        schema_version: "1".to_string(),
-        project,
-        suite: Suite {
-            test_count: None,
-            runtime_seconds: None,
-            line_coverage_pct: None,
-            slowest_tests: Vec::new(),
-        },
-        files,
-        tests,
-        sut_calls: SutCalls { by_name: Vec::new(), top_called: Vec::new() },
-        top_suspicious: TopSuspicious { tests: Vec::new(), files: Vec::new() },
-        tool: ToolInfo::without_runtime(),
-    })
+/// Directory path: discover tests, parse each, aggregate. Per-file parse
+/// failures are logged and the file is skipped — the run as a whole must
+/// not abort just because one fixture is malformed.
+fn run_static_dir(project_root: &Path, tests_dir_override: Option<&Path>) -> Result<Inventory> {
+    let project = project_from_root(project_root);
+    let mut inv = empty_inventory(project);
+
+    let tests_dir =
+        tests_dir_override.map_or_else(|| inv.project.path.join("tests"), Path::to_path_buf);
+
+    if !tests_dir.exists() {
+        tracing::warn!(
+            tests_dir = %tests_dir.display(),
+            "tests directory not found; emitting empty inventory"
+        );
+        return Ok(inv);
+    }
+
+    let files = walker::discover_test_files(&tests_dir)
+        .with_context(|| format!("failed to walk {}", tests_dir.display()))?;
+
+    for file_path in &files {
+        match parse_single_file(file_path, &inv.project.path) {
+            Ok((file_record, mut tests)) => {
+                inv.files.push(file_record);
+                inv.tests.append(&mut tests);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    file = %file_path.display(),
+                    error = %format!("{err:#}"),
+                    "skipping test file due to parse error"
+                );
+            }
+        }
+    }
+    Ok(inv)
+}
+
+/// Parse a single discovered file and produce its `FileRecord` plus
+/// per-test records, with nodeids made relative to `project_root` so the
+/// output is portable across machines.
+fn parse_single_file(
+    file_path: &Path,
+    project_root: &Path,
+) -> Result<(FileRecord, Vec<TestRecord>)> {
+    let source = std::fs::read_to_string(file_path)
+        .with_context(|| format!("failed to read {}", file_path.display()))?;
+    let rel = relativize(file_path, project_root);
+    let mut tests = parser::parse_python_file(&source, &rel)
+        .with_context(|| format!("failed to parse {}", file_path.display()))?;
+
+    // The parser builds nodeids using the path it was handed (here `rel`),
+    // so no rewriting is needed.
+    let assertion_count: u64 = tests.iter().map(|t| t.assertion_count).sum();
+    let test_count = tests.len() as u64;
+
+    // Be tidy about line ordering inside a file so the aggregated `tests`
+    // array is deterministic regardless of how the parser walks the tree.
+    tests.sort_by_key(|t| t.line);
+
+    let mut record = empty_file_record(&rel);
+    record.test_count = test_count;
+    record.assertion_count = assertion_count;
+
+    Ok((record, tests))
+}
+
+/// Make `path` relative to `base` for output. Falls back to `path` unchanged
+/// when stripping fails (e.g. the walker handed back a path the user passed
+/// absolutely from somewhere outside the canonicalized root).
+fn relativize(path: &Path, base: &Path) -> PathBuf {
+    path.strip_prefix(base).map_or_else(|_| path.to_path_buf(), Path::to_path_buf)
 }
 
 /// Derive a [`Project`] from a single-file input. The project `path` is the
 /// directory containing the file, and `name` is that directory's basename.
-/// Phase 2 will replace this with real `pyproject.toml` parsing on a project
-/// root.
 ///
 /// Canonicalization is best-effort: if it fails (broken symlink, permission
 /// denied, etc.) we log a warning via `tracing` and fall back to the raw
-/// input path so `run_static` can still complete. Phase 2's project-root
-/// discovery will tighten this contract.
-fn project_from_path(path: &Path) -> Project {
-    let abs = match std::fs::canonicalize(path) {
+/// input path so `run_static` can still complete.
+fn project_from_file(path: &Path) -> Project {
+    let abs = canonicalize_or_warn(path);
+    let dir = abs.parent().map_or_else(|| abs.clone(), Path::to_path_buf);
+    let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
+    Project { path: dir, name }
+}
+
+/// Derive a [`Project`] from a project-root directory input. The name is
+/// preferred from `pyproject.toml`'s `[project].name`; if absent, fall
+/// back to the canonical directory basename.
+fn project_from_root(root: &Path) -> Project {
+    let abs = canonicalize_or_warn(root);
+    let basename = abs.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
+    let name = pyproject::read_project_name(&abs).unwrap_or(basename);
+    Project { path: abs, name }
+}
+
+fn canonicalize_or_warn(path: &Path) -> PathBuf {
+    match std::fs::canonicalize(path) {
         Ok(abs) => abs,
         Err(err) => {
             tracing::warn!(
@@ -209,8 +337,5 @@ fn project_from_path(path: &Path) -> Project {
             );
             path.to_path_buf()
         }
-    };
-    let dir = abs.parent().map_or_else(|| abs.clone(), Path::to_path_buf);
-    let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
-    Project { path: dir, name }
+    }
 }
