@@ -14,9 +14,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Serialize;
 
+pub mod coverage;
 pub mod mock_api;
 pub mod parser;
 pub mod pyproject;
+pub mod pytest;
 pub mod walker;
 
 /// Top-level audit result. Every field is always serialized (no
@@ -127,13 +129,27 @@ pub struct ToolInfo {
 
 impl ToolInfo {
     /// Defaults for a static-only run (no pytest, no coverage). Used by
-    /// every code path until Run 2 wires up runtime invocation.
+    /// the static path and as the starting point for runs that flip
+    /// `ran_pytest` / `ran_coverage` to `true` after a successful invocation.
     fn without_runtime() -> Self {
         Self {
             name: "coati".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             ran_pytest: false,
             ran_coverage: false,
+        }
+    }
+
+    /// Variant for runs that successfully invoked pytest and/or coverage.
+    /// The `ran_*` flags are wired through verbatim from the caller's
+    /// observations — a failed subprocess leaves the corresponding flag
+    /// `false` even when the user asked for the run.
+    pub fn with_runtime(ran_pytest: bool, ran_coverage: bool) -> Self {
+        Self {
+            name: "coati".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            ran_pytest,
+            ran_coverage,
         }
     }
 }
@@ -181,6 +197,100 @@ fn empty_inventory(project: Project) -> Inventory {
 /// [`run_static_with_tests_dir`] to override.
 pub fn run_static(path: &Path) -> Result<Inventory> {
     run_static_with_tests_dir(path, None)
+}
+
+/// Full-fat entry point.
+///
+/// Runs the static pass, then invokes pytest for collection, durations,
+/// and (optionally) coverage. The static pass is identical to
+/// [`run_static_with_tests_dir`]; pytest invocations layer on top of its
+/// output and degrade gracefully on subprocess failure.
+///
+/// `python_cmd` is the whitespace-split python command (`["python"]` by
+/// default, `["uv", "run", "python"]` for `--python "uv run python"`).
+/// The first token is the program; the rest are prepended to every
+/// `-m pytest ...` invocation.
+///
+/// `pytest_args` is appended to every pytest invocation (same no-shell-
+/// expansion rule).
+///
+/// When `no_coverage` is true, the coverage subprocess is skipped and
+/// `tool.ran_coverage` stays `false`.
+///
+/// `project_package_override` wins over the discovered `Inventory.project.name`
+/// when picking the `--cov=<pkg>` argument. This matches the CLI's
+/// `--project-package` flag.
+pub fn run_with_pytest(
+    project: &Path,
+    tests_dir_override: Option<&Path>,
+    python_cmd: &[String],
+    pytest_args: &[String],
+    no_coverage: bool,
+    project_package_override: Option<&str>,
+) -> Result<Inventory> {
+    let mut inv = run_static_with_tests_dir(project, tests_dir_override)?;
+
+    // Single-file input has no project-level pytest semantics; leave
+    // `suite` and `tool` at their static defaults.
+    if !project.is_dir() {
+        return Ok(inv);
+    }
+
+    let (program, extra_python_args) = split_python_cmd(python_cmd);
+    let tests_dir =
+        tests_dir_override.map_or_else(|| inv.project.path.join("tests"), Path::to_path_buf);
+    let project_root = inv.project.path.clone();
+
+    let collection = pytest::run_collection(
+        &program,
+        &extra_python_args,
+        &project_root,
+        &tests_dir,
+        pytest_args,
+    );
+    let durations =
+        pytest::run_durations(&program, &extra_python_args, &project_root, &tests_dir, pytest_args);
+
+    let ran_pytest = collection.test_count.is_some()
+        || !durations.slowest_tests.is_empty()
+        || durations.runtime_seconds.is_some();
+
+    inv.suite.test_count = collection.test_count;
+    inv.suite.runtime_seconds = durations.runtime_seconds;
+    inv.suite.slowest_tests = durations.slowest_tests;
+
+    let mut ran_coverage = false;
+    if !no_coverage {
+        let pkg = project_package_override.map_or_else(|| inv.project.name.clone(), str::to_string);
+        if pkg.is_empty() {
+            tracing::warn!("no project package name available; skipping coverage");
+        } else {
+            let cov = coverage::run_coverage(
+                &program,
+                &extra_python_args,
+                &project_root,
+                &tests_dir,
+                pytest_args,
+                &pkg,
+            );
+            inv.suite.line_coverage_pct = cov;
+            ran_coverage = cov.is_some();
+        }
+    }
+
+    inv.tool = ToolInfo::with_runtime(ran_pytest, ran_coverage);
+    Ok(inv)
+}
+
+/// Split a whitespace-tokenised python command into program + extra args.
+/// The default of `["python"]` produces `("python", [])`.
+fn split_python_cmd(python_cmd: &[String]) -> (String, Vec<String>) {
+    if python_cmd.is_empty() {
+        return ("python".to_string(), Vec::new());
+    }
+    let program = python_cmd[0].clone();
+    let extras = python_cmd[1..].to_vec();
+    (program, extras)
 }
 
 /// Same as [`run_static`] but lets the caller override the tests directory.

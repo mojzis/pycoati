@@ -1,5 +1,10 @@
-//! `coati` binary: runs a static audit of a Python project (or single file)
+//! `coati` binary: runs an audit of a Python project (or single file)
 //! and prints the resulting [`coati::Inventory`] as JSON.
+//!
+//! Run 2 makes `--static-only` load-bearing: by default `coati <path>`
+//! now invokes `python -m pytest` three times against the project root
+//! (collection, durations, coverage) and populates `suite.*`. Users opt
+//! out with `--static-only`; `--no-coverage` skips only the coverage run.
 
 use std::fs;
 use std::io::{self, Write};
@@ -25,7 +30,9 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     tests_dir: Option<PathBuf>,
 
-    /// Accepted for forward compatibility; Run 1 is implicitly static-only.
+    /// Skip every pytest subprocess and emit the static-only inventory.
+    /// The pre-Run-2 behaviour; useful when pytest isn't available or
+    /// when the runtime numbers aren't needed.
     #[arg(long)]
     static_only: bool,
 
@@ -33,10 +40,26 @@ struct Cli {
     #[arg(long, value_name = "N")]
     top_suspicious: Option<usize>,
 
-    /// Accepted for forward compatibility; consumed by Run 3's `sut_calls`
-    /// resolution.
+    /// Project package name to pass to `pytest --cov=<NAME>`. Defaults to
+    /// the discovered `[project].name` in `pyproject.toml`, falling back
+    /// to the project directory's basename.
     #[arg(long, value_name = "NAME")]
     project_package: Option<String>,
+
+    /// Python command to invoke pytest under. Whitespace-split into
+    /// program + args. `--python "uv run python"` runs
+    /// `uv run python -m pytest …` (no shell expansion).
+    #[arg(long, value_name = "CMD", default_value = "python")]
+    python: String,
+
+    /// Extra arguments appended to every pytest invocation. Whitespace-
+    /// split, no shell expansion.
+    #[arg(long, value_name = "STR", default_value = "")]
+    pytest_args: String,
+
+    /// Skip only the coverage subprocess. Collection + durations still run.
+    #[arg(long)]
+    no_coverage: bool,
 }
 
 fn main() -> ExitCode {
@@ -66,10 +89,25 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: &Cli) -> Result<()> {
-    // `--static-only`, `--top-suspicious`, and `--project-package` are
-    // accepted but have no effect in Run 1. They're declared on `Cli` so
-    // clap parses them; we don't read them here.
-    let inventory = coati::run_static_with_tests_dir(&cli.path, cli.tests_dir.as_deref())?;
+    // `--top-suspicious` is still a Run-3 stub.
+    let _ = cli.top_suspicious;
+
+    let inventory = if cli.static_only {
+        coati::run_static_with_tests_dir(&cli.path, cli.tests_dir.as_deref())?
+    } else {
+        let python_cmd: Vec<String> = cli.python.split_whitespace().map(str::to_string).collect();
+        let pytest_args: Vec<String> =
+            cli.pytest_args.split_whitespace().map(str::to_string).collect();
+        coati::run_with_pytest(
+            &cli.path,
+            cli.tests_dir.as_deref(),
+            &python_cmd,
+            &pytest_args,
+            cli.no_coverage,
+            cli.project_package.as_deref(),
+        )?
+    };
+
     let json = serde_json::to_string_pretty(&inventory).context("failed to serialize inventory")?;
 
     if let Some(out_path) = cli.output.as_ref() {
