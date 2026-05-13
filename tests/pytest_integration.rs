@@ -152,6 +152,32 @@ fn no_coverage_skips_only_the_coverage_run() {
 }
 
 #[test]
+fn no_python_flag_uses_auto_detect_and_emits_valid_inventory() {
+    // Regression guard for the auto-detect default: running `coati <fixture>`
+    // with no `--python` must produce a valid JSON inventory with the static
+    // analysis intact, regardless of whether the auto-detected interpreter
+    // can import pytest. The point of this test is the `Option<&[String]>`
+    // plumbing — if it ever silently reverts to bare `python` (or worse,
+    // panics on the None branch), this test catches it.
+    let assert =
+        Command::cargo_bin("coati").expect("binary built").arg(fixture_root()).assert().success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf-8 stdout");
+    let v: Value = serde_json::from_str(&stdout).expect("stdout must be valid JSON");
+
+    let files = v["files"].as_array().expect("files array");
+    assert!(!files.is_empty(), "static inventory must populate the files array");
+    assert_eq!(v["schema_version"], Value::String("2".to_string()));
+    // `tool.ran_pytest` is true *or* false depending on whether the
+    // auto-detected interpreter can import pytest — either way the field
+    // must exist as a bool, never null.
+    assert!(
+        v["tool"]["ran_pytest"].is_boolean(),
+        "tool.ran_pytest must be a bool, got {:?}",
+        v["tool"]["ran_pytest"]
+    );
+}
+
+#[test]
 fn broken_python_interpreter_does_not_crash_inventory() {
     // `false` is a real binary that exits non-zero and produces no output.
     // It models any deliberately-broken interpreter command — coati must

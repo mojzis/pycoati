@@ -25,6 +25,7 @@ pub(crate) mod parser;
 pub(crate) mod pretty;
 pub mod pyproject;
 pub mod pytest;
+pub mod python_detect;
 pub(crate) mod smells;
 pub(crate) mod suspicion;
 pub(crate) mod sut_calls;
@@ -279,10 +280,13 @@ pub fn run_static_with_top_n(
 /// [`run_static_with_tests_dir`]; pytest invocations layer on top of its
 /// output and degrade gracefully on subprocess failure.
 ///
-/// `python_cmd` is the whitespace-split python command (`["python"]` by
-/// default, `["uv", "run", "python"]` for `--python "uv run python"`).
+/// `python_cmd` is the whitespace-split python command (`Some(["python"])`,
+/// `Some(["uv", "run", "python"])` for `--python "uv run python"`, etc.).
 /// The first token is the program; the rest are prepended to every
-/// `-m pytest ...` invocation.
+/// `-m pytest ...` invocation. Pass `None` to auto-detect the interpreter
+/// (see [`python_detect::detect_python_cmd`]) — detection runs *after* the
+/// static phase succeeds, so an invalid `project` path fails before any
+/// auto-detect output is emitted.
 ///
 /// `pytest_args` is appended to every pytest invocation (same no-shell-
 /// expansion rule).
@@ -296,7 +300,7 @@ pub fn run_static_with_top_n(
 pub fn run_with_pytest(
     project: &Path,
     tests_dir_override: Option<&Path>,
-    python_cmd: &[String],
+    python_cmd: Option<&[String]>,
     pytest_args: &[String],
     no_coverage: bool,
     project_package_override: Option<&str>,
@@ -311,7 +315,14 @@ pub fn run_with_pytest(
         return Ok(inv);
     }
 
-    let (program, extra_python_args) = split_python_cmd(python_cmd);
+    let detected;
+    let resolved_cmd: &[String] = if let Some(cmd) = python_cmd {
+        cmd
+    } else {
+        detected = python_detect::detect_python_cmd(&inv.project.path);
+        &detected
+    };
+    let (program, extra_python_args) = split_python_cmd(resolved_cmd);
     let tests_dir =
         tests_dir_override.map_or_else(|| inv.project.path.join("tests"), Path::to_path_buf);
     let project_root = inv.project.path.clone();

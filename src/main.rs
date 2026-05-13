@@ -33,7 +33,22 @@ enum Format {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "coati", version, about, long_about = None)]
+#[command(
+    name = "coati",
+    version,
+    about,
+    long_about = "Audit Python test suites for mock smells and suspicious tests.\n\n\
+        coati walks a Python project (or a single file), parses every test with \
+        tree-sitter, and — unless --static-only is passed — runs `python -m pytest` \
+        three times to capture collection, durations, and coverage. By default the \
+        Python interpreter is auto-detected: an ancestor `.venv/bin/python` wins, \
+        else `uv run --no-sync python` if uv is installed, else bare `python`. \
+        Override with `--python <cmd>`.\n\n\
+        It emits an Inventory describing test functions, assertion counts, mock-API \
+        smells, and a per-test suspicion score that flags tests likely exercising \
+        mocks instead of production code. Output is JSON by default; use \
+        --format pretty for an aligned terminal view."
+)]
 struct Cli {
     /// Path to a Python project root (directory) or, for single-file mode,
     /// a `.py` file.
@@ -72,8 +87,12 @@ struct Cli {
     /// Python command to invoke pytest under. Whitespace-split into
     /// program + args. `--python "uv run python"` runs
     /// `uv run python -m pytest …` (no shell expansion).
-    #[arg(long, value_name = "CMD", default_value = "python")]
-    python: String,
+    ///
+    /// When omitted, coati auto-detects: an ancestor `.venv/bin/python`
+    /// wins, then `uv run --no-sync python` if `uv --version` succeeds,
+    /// else bare `python`.
+    #[arg(long, value_name = "CMD")]
+    python: Option<String>,
 
     /// Extra arguments appended to every pytest invocation. Whitespace-
     /// split, no shell expansion.
@@ -127,13 +146,14 @@ fn run(cli: &Cli) -> Result<()> {
             top_n,
         )?
     } else {
-        let python_cmd: Vec<String> = cli.python.split_whitespace().map(str::to_string).collect();
+        let python_cmd: Option<Vec<String>> =
+            cli.python.as_deref().map(|s| s.split_whitespace().map(str::to_string).collect());
         let pytest_args: Vec<String> =
             cli.pytest_args.split_whitespace().map(str::to_string).collect();
         coati::run_with_pytest(
             &cli.path,
             cli.tests_dir.as_deref(),
-            &python_cmd,
+            python_cmd.as_deref(),
             &pytest_args,
             cli.no_coverage,
             cli.project_package.as_deref(),

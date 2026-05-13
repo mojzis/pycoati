@@ -2,7 +2,7 @@
 name = "coati"
 version = "0.1.0"
 edition = "2021"
-description = "A new tool"
+description = "Audit Python test suites for mock smells and suspicious tests"
 license = "MIT"
 repository = "https://github.com/mojzis/coati"
 authors = ["mojzis <mojzisek@gmail.com>"]
