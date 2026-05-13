@@ -36,6 +36,38 @@ pub const MOCK_API_ATTRIBUTES: &[&str] = &[
 pub const MOCK_CONSTRUCTORS: &[&str] =
     &["Mock", "MagicMock", "AsyncMock", "create_autospec", "patch"];
 
+/// Stub-API dotted call-heads.
+///
+/// Fixture-driven patching is structurally distinct from `unittest.mock`
+/// construction / decoration: a test asks the `monkeypatch` or `mocker`
+/// fixture to temporarily rewire the system under test, rather than
+/// instantiating a `Mock()` directly. The `stubs_count` signal tracks how
+/// many such fixture-driven patches a test (or file) performs, and feeds
+/// into the `mock_overuse` smell alongside `mock_construction_count` and
+/// `patch_decorator_count`.
+///
+/// Each entry is an exact dotted call-head matched against the
+/// `call_head_chain` of a `call_expression`. The list is closed: anything
+/// not enumerated here is not a stub for counting purposes.
+pub(crate) const STUB_HEADS: &[&str] = &[
+    // pytest's built-in `monkeypatch` fixture.
+    "monkeypatch.setattr",
+    "monkeypatch.setenv",
+    "monkeypatch.delattr",
+    "monkeypatch.delenv",
+    "monkeypatch.context",
+    "monkeypatch.syspath_prepend",
+    "monkeypatch.chdir",
+    // pytest-mock's `mocker` fixture wraps the `unittest.mock` API.
+    "mocker.patch",
+    "mocker.patch.object",
+    "mocker.patch.dict",
+    "mocker.patch.multiple",
+    "mocker.spy",
+    "mocker.stub",
+    "mocker.MagicMock",
+];
+
 /// True iff `name` matches a Mock-API attribute (exact, case-sensitive).
 #[inline]
 pub fn is_mock_api_attribute(name: &str) -> bool {
@@ -46,6 +78,15 @@ pub fn is_mock_api_attribute(name: &str) -> bool {
 #[inline]
 pub fn is_mock_constructor(name: &str) -> bool {
     MOCK_CONSTRUCTORS.contains(&name)
+}
+
+/// True iff `head` matches one of the fixture-driven stub call-heads in
+/// [`STUB_HEADS`] (exact, case-sensitive). The input is the dotted
+/// call-head emitted by the parser (e.g. `"monkeypatch.setattr"`,
+/// `"mocker.patch.object"`).
+#[inline]
+pub(crate) fn is_stub_call_head(head: &str) -> bool {
+    STUB_HEADS.contains(&head)
 }
 
 #[cfg(test)]
@@ -89,5 +130,55 @@ mod tests {
         // Case-sensitive: `mock.patch` is matched at the decorator-name
         // level, not via this constructor predicate.
         assert!(!is_mock_constructor("MOCK"));
+    }
+
+    #[test]
+    fn known_stub_heads_are_recognised() {
+        for head in [
+            "monkeypatch.setattr",
+            "monkeypatch.setenv",
+            "monkeypatch.delattr",
+            "monkeypatch.delenv",
+            "monkeypatch.context",
+            "monkeypatch.syspath_prepend",
+            "monkeypatch.chdir",
+            "mocker.patch",
+            "mocker.patch.object",
+            "mocker.patch.dict",
+            "mocker.patch.multiple",
+            "mocker.spy",
+            "mocker.stub",
+            "mocker.MagicMock",
+        ] {
+            assert!(is_stub_call_head(head), "{head} should be a stub call-head");
+        }
+    }
+
+    #[test]
+    fn arbitrary_heads_are_not_stub_heads() {
+        // Bare `patch` is a Mock-API constructor, not a stub call-head.
+        assert!(!is_stub_call_head("patch"));
+        assert!(!is_stub_call_head("mock.patch"));
+        // `monkeypatch` alone (no method) is not a call.
+        assert!(!is_stub_call_head("monkeypatch"));
+        // `mocker` alone is the fixture parameter, not a call.
+        assert!(!is_stub_call_head("mocker"));
+        // Empty / unrelated.
+        assert!(!is_stub_call_head(""));
+        assert!(!is_stub_call_head("repo.save"));
+        // Case-sensitive.
+        assert!(!is_stub_call_head("MonkeyPatch.setattr"));
+    }
+
+    #[test]
+    fn stub_heads_disjoint_from_mock_constructors() {
+        // Constructors and stub heads must not overlap — they feed
+        // separate counts that are summed by the smell layer.
+        for h in STUB_HEADS {
+            assert!(
+                !MOCK_CONSTRUCTORS.contains(h),
+                "{h} appears in both STUB_HEADS and MOCK_CONSTRUCTORS"
+            );
+        }
     }
 }

@@ -6,7 +6,7 @@
 //! pipe characters, no markdown — terminal-friendly output users can pipe
 //! into `less` or grep.
 //!
-//! Output shape (locked in Run 3 spec, step 11):
+//! Output shape (locked in Run 3 spec, step 11; Phase 2 adds `stubs`):
 //!
 //! ```text
 //! coati audit — <project name>
@@ -20,12 +20,12 @@
 //!
 //! Top suspicious tests
 //! --------------------
-//!   score  nodeid                                    asserts  mocks  smells
+//!   score  nodeid                                    asserts  mocks  stubs  smells
 //!    …
 //!
 //! Top suspicious files
 //! --------------------
-//!   score  path                  tests  asserts  mocks  smells
+//!   score  path                  tests  asserts  mocks  stubs  smells
 //!    …
 //!
 //! SUT calls (top 20)
@@ -98,6 +98,7 @@ struct TestRow {
     nodeid: String,
     asserts: String,
     mocks: String,
+    stubs: String,
     smells: String,
 }
 
@@ -125,8 +126,8 @@ fn render_top_tests(out: &mut String, inv: &Inventory, top_n: usize) {
         return;
     }
 
-    let headers = ["score", "nodeid", "asserts", "mocks", "smells"];
-    let mut widths = [0_usize; 5];
+    let headers = ["score", "nodeid", "asserts", "mocks", "stubs", "smells"];
+    let mut widths = [0_usize; 6];
     for (i, h) in headers.iter().enumerate() {
         widths[i] = h.len();
     }
@@ -135,37 +136,42 @@ fn render_top_tests(out: &mut String, inv: &Inventory, top_n: usize) {
         widths[1] = widths[1].max(r.nodeid.chars().count());
         widths[2] = widths[2].max(r.asserts.chars().count());
         widths[3] = widths[3].max(r.mocks.chars().count());
-        widths[4] = widths[4].max(r.smells.chars().count());
+        widths[4] = widths[4].max(r.stubs.chars().count());
+        widths[5] = widths[5].max(r.smells.chars().count());
     }
 
-    // Header line: score / asserts / mocks right-aligned (numeric), nodeid
-    // and smells left-aligned.
+    // Header line: score / asserts / mocks / stubs right-aligned (numeric),
+    // nodeid and smells left-aligned.
     let _ = writeln!(
         out,
-        "  {sc:>w0$}  {nd:<w1$}  {as_:>w2$}  {mk:>w3$}  {sm}",
+        "  {sc:>w0$}  {nd:<w1$}  {as_:>w2$}  {mk:>w3$}  {st:>w4$}  {sm}",
         sc = headers[0],
         nd = headers[1],
         as_ = headers[2],
         mk = headers[3],
-        sm = headers[4],
+        st = headers[4],
+        sm = headers[5],
         w0 = widths[0],
         w1 = widths[1],
         w2 = widths[2],
         w3 = widths[3],
+        w4 = widths[4],
     );
     for r in &rows {
         let _ = writeln!(
             out,
-            "  {sc:>w0$}  {nd:<w1$}  {as_:>w2$}  {mk:>w3$}  {sm}",
+            "  {sc:>w0$}  {nd:<w1$}  {as_:>w2$}  {mk:>w3$}  {st:>w4$}  {sm}",
             sc = r.score,
             nd = r.nodeid,
             as_ = r.asserts,
             mk = r.mocks,
+            st = r.stubs,
             sm = r.smells,
             w0 = widths[0],
             w1 = widths[1],
             w2 = widths[2],
             w3 = widths[3],
+            w4 = widths[4],
         );
     }
 }
@@ -178,8 +184,10 @@ fn build_test_row(nodeid: &str, t: &TestRecord) -> TestRow {
         asserts: t.assertion_count.to_string(),
         // Test records don't carry `mock_construction_count`; use the
         // patch-decorator count as the per-test mock proxy (matches the
-        // mock_overuse smell logic in `smells.rs`).
+        // mock_overuse smell logic in `smells.rs`). `stubs_count` renders
+        // in its own column.
         mocks: t.patch_decorator_count.to_string(),
+        stubs: t.stubs_count.to_string(),
         smells,
     }
 }
@@ -200,6 +208,7 @@ struct FileRow {
     tests: String,
     asserts: String,
     mocks: String,
+    stubs: String,
     smells: String,
 }
 
@@ -235,8 +244,8 @@ fn render_top_files(out: &mut String, inv: &Inventory, top_n: usize) {
         return;
     }
 
-    let headers = ["score", "path", "tests", "asserts", "mocks", "smells"];
-    let mut widths = [0_usize; 6];
+    let headers = ["score", "path", "tests", "asserts", "mocks", "stubs", "smells"];
+    let mut widths = [0_usize; 7];
     for (i, h) in headers.iter().enumerate() {
         widths[i] = h.len();
     }
@@ -246,39 +255,44 @@ fn render_top_files(out: &mut String, inv: &Inventory, top_n: usize) {
         widths[2] = widths[2].max(r.tests.chars().count());
         widths[3] = widths[3].max(r.asserts.chars().count());
         widths[4] = widths[4].max(r.mocks.chars().count());
-        widths[5] = widths[5].max(r.smells.chars().count());
+        widths[5] = widths[5].max(r.stubs.chars().count());
+        widths[6] = widths[6].max(r.smells.chars().count());
     }
 
     let _ = writeln!(
         out,
-        "  {sc:>w0$}  {pt:<w1$}  {ts:>w2$}  {as_:>w3$}  {mk:>w4$}  {sm}",
+        "  {sc:>w0$}  {pt:<w1$}  {ts:>w2$}  {as_:>w3$}  {mk:>w4$}  {st:>w5$}  {sm}",
         sc = headers[0],
         pt = headers[1],
         ts = headers[2],
         as_ = headers[3],
         mk = headers[4],
-        sm = headers[5],
+        st = headers[5],
+        sm = headers[6],
         w0 = widths[0],
         w1 = widths[1],
         w2 = widths[2],
         w3 = widths[3],
         w4 = widths[4],
+        w5 = widths[5],
     );
     for r in &rows {
         let _ = writeln!(
             out,
-            "  {sc:>w0$}  {pt:<w1$}  {ts:>w2$}  {as_:>w3$}  {mk:>w4$}  {sm}",
+            "  {sc:>w0$}  {pt:<w1$}  {ts:>w2$}  {as_:>w3$}  {mk:>w4$}  {st:>w5$}  {sm}",
             sc = r.score,
             pt = r.path,
             ts = r.tests,
             as_ = r.asserts,
             mk = r.mocks,
+            st = r.stubs,
             sm = r.smells,
             w0 = widths[0],
             w1 = widths[1],
             w2 = widths[2],
             w3 = widths[3],
             w4 = widths[4],
+            w5 = widths[5],
         );
     }
 }
@@ -294,6 +308,7 @@ fn build_file_row(path: &str, f: &FileRecord, scores: Option<&[f64]>) -> FileRow
         tests: f.test_function_count.to_string(),
         asserts: f.assertion_count.to_string(),
         mocks: (f.mock_construction_count + f.patch_decorator_count).to_string(),
+        stubs: f.stubs_count.to_string(),
         smells: f.smell_hits.len().to_string(),
     }
 }
@@ -373,6 +388,7 @@ mod tests {
             assertion_count: asserts,
             only_asserts_on_mock: false,
             patch_decorator_count: patches,
+            stubs_count: 0,
             setup_to_assertion_ratio: 0.0,
             called_names: Vec::new(),
             smell_hits: Vec::new(),
@@ -507,6 +523,84 @@ mod tests {
         let out = render(&inv, 20);
         assert!(!out.contains('|'), "pipe characters disallowed, got:\n{out}");
         assert!(!out.contains("---|"), "markdown table separators disallowed, got:\n{out}");
+    }
+
+    #[test]
+    fn render_includes_stubs_column_in_test_table() {
+        let mut inv = empty_inv();
+        let mut t = make_test("tests/a.py::test_x", 0.5, 1, 0);
+        t.stubs_count = 4;
+        inv.top_suspicious.test_functions = vec![t.nodeid.clone()];
+        inv.test_functions = vec![t];
+        let out = render(&inv, 20);
+
+        // Header line contains a `stubs` column between `mocks` and `smells`.
+        let lines: Vec<&str> = out.lines().collect();
+        let header = lines
+            .iter()
+            .find(|l| l.contains("score") && l.contains("nodeid") && l.contains("stubs"))
+            .expect("tests header with stubs column");
+        let mocks_at = header.find("mocks").expect("mocks header present");
+        let stubs_at = header.find("stubs").expect("stubs header present");
+        let smells_at = header.find("smells").expect("smells header present");
+        assert!(
+            mocks_at < stubs_at && stubs_at < smells_at,
+            "expected column order mocks < stubs < smells, got header: {header:?}"
+        );
+
+        // The data row carries `4` in the stubs column.
+        let row =
+            lines.iter().find(|l| l.contains("::test_x")).expect("data row for test_x rendered");
+        // The `4` should be rendered somewhere after `mocks` and before
+        // `smells` — confirm the row contains the stubs value.
+        assert!(row.contains(" 4 "), "expected stubs value 4 in row, got: {row:?}");
+    }
+
+    #[test]
+    fn render_includes_stubs_column_in_file_table() {
+        // Build an inventory whose only file has a non-zero stubs_count and
+        // sits in `top_suspicious.files`.
+        let mut inv = empty_inv();
+        let t = make_test("tests/a.py::test_x", 0.5, 1, 0);
+        let file_path = "tests/a.py".to_string();
+        let file = FileRecord {
+            path: PathBuf::from(&file_path),
+            test_function_count: 1,
+            assertion_count: 1,
+            mock_construction_count: 0,
+            patch_decorator_count: 0,
+            stubs_count: 7,
+            fixture_count: 0,
+            smell_hits: Vec::new(),
+        };
+        inv.top_suspicious.test_functions = vec![t.nodeid.clone()];
+        inv.test_functions = vec![t];
+        inv.files = vec![file];
+        inv.top_suspicious.files = vec![file_path];
+        let out = render(&inv, 20);
+
+        // Locate the files-table header (the one with `path` + `stubs`).
+        let lines: Vec<&str> = out.lines().collect();
+        let header = lines
+            .iter()
+            .find(|l| l.contains("score") && l.contains("path") && l.contains("stubs"))
+            .expect("files header with stubs column");
+        let mocks_at = header.find("mocks").expect("mocks present");
+        let stubs_at = header.find("stubs").expect("stubs present");
+        let smells_at = header.find("smells").expect("smells present");
+        assert!(
+            mocks_at < stubs_at && stubs_at < smells_at,
+            "expected files column order mocks < stubs < smells, got header: {header:?}"
+        );
+
+        // The file-table data row carries `7` in the stubs column. (The
+        // test-table also mentions `tests/a.py` via the nodeid, so search
+        // for a row that does NOT carry `::test_x` to disambiguate.)
+        let row = lines
+            .iter()
+            .find(|l| l.contains("tests/a.py") && !l.contains("::test_x") && !l.contains("score"))
+            .expect("file-table data row for tests/a.py rendered");
+        assert!(row.contains(" 7 "), "expected stubs value 7 in row, got: {row:?}");
     }
 
     #[test]

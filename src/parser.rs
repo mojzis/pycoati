@@ -56,7 +56,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use tree_sitter::{Node, Parser};
 
-use crate::mock_api::{is_mock_api_attribute, is_mock_constructor};
+use crate::mock_api::{is_mock_api_attribute, is_mock_constructor, is_stub_call_head};
 use crate::sut_calls::{dotted_head, ImportMap};
 use crate::TestRecord;
 
@@ -75,6 +75,10 @@ pub struct ParsedFile {
     pub mock_construction_count: u64,
     /// Sum of `patch_decorator_count` across every test record.
     pub patch_decorator_count: u64,
+    /// Sum across every test body of `call_expression` heads matching
+    /// [`crate::mock_api::STUB_HEADS`] — fixture-driven patching via
+    /// `monkeypatch.*` or `mocker.*`.
+    pub stubs_count: u64,
     /// Count of `@pytest.fixture` / `@fixture` decorators anywhere in the file.
     pub fixture_count: u64,
     /// Per-file import map for Phase 2 sut-call resolution.
@@ -212,6 +216,10 @@ fn try_collect_test_function(
                 out.mock_construction_count.saturating_add(mock_constructions);
             out.patch_decorator_count =
                 out.patch_decorator_count.saturating_add(record.patch_decorator_count);
+            // `stubs_count` is per-test (lives on `TestRecord`); the file
+            // aggregate is just the sum of the per-test counts. Mirrors the
+            // `patch_decorator_count` aggregation above.
+            out.stubs_count = out.stubs_count.saturating_add(record.stubs_count);
             out.test_functions.push(record);
         }
     }
@@ -273,6 +281,14 @@ fn build_record(
     let mock_construction_count =
         calls.iter().filter(|c| call_head_is_mock_constructor(**c, source)).count() as u64;
 
+    // Fixture-driven stub call sites in this test's body. Walks the same
+    // `calls` vector — no extra tree walk.
+    let stubs_count = calls
+        .iter()
+        .filter_map(|c| call_head_chain(*c, source))
+        .filter(|h| is_stub_call_head(h))
+        .count() as u64;
+
     let called_names = called_names_for_test(&calls, source);
 
     let patch_decorator_count = decorated.map_or(0, |d| count_patch_decorators(d, source));
@@ -292,6 +308,7 @@ fn build_record(
         assertion_count,
         only_asserts_on_mock,
         patch_decorator_count,
+        stubs_count,
         setup_to_assertion_ratio,
         called_names,
         smell_hits: Vec::new(),
@@ -1520,5 +1537,95 @@ def test_nested():
 ";
         let recs = parse(src);
         assert_eq!(recs[0].assertion_count, 1);
+    }
+
+    // ---- Phase 2 stubs_count -----------------------------------------------
+
+    #[test]
+    fn monkeypatch_calls_increment_stubs_count() {
+        let src = "\
+def test_x(monkeypatch):
+    monkeypatch.setattr(os, 'getcwd', lambda: '/x')
+    monkeypatch.setenv('FOO', 'bar')
+    monkeypatch.delenv('BAZ', raising=False)
+    assert True
+";
+        let parsed = parse_full(src);
+        let t = &parsed.test_functions[0];
+        assert_eq!(t.stubs_count, 3);
+        assert_eq!(parsed.stubs_count, 3);
+    }
+
+    #[test]
+    fn mocker_calls_increment_stubs_count() {
+        let src = "\
+def test_x(mocker):
+    mocker.patch('mod.thing')
+    mocker.patch.object(Foo, 'bar')
+    mocker.spy(Foo, 'baz')
+    mocker.MagicMock()
+    assert True
+";
+        let parsed = parse_full(src);
+        let t = &parsed.test_functions[0];
+        assert_eq!(t.stubs_count, 4);
+        assert_eq!(parsed.stubs_count, 4);
+    }
+
+    #[test]
+    fn stubs_count_is_per_test_and_aggregated_to_file() {
+        let src = "\
+def test_one(monkeypatch):
+    monkeypatch.setattr(os, 'getcwd', lambda: '/x')
+    assert True
+
+def test_two(mocker):
+    mocker.patch('a')
+    mocker.patch('b')
+    assert True
+";
+        let parsed = parse_full(src);
+        let by_name: std::collections::BTreeMap<&str, u64> = parsed
+            .test_functions
+            .iter()
+            .map(|t| (t.nodeid.rsplit("::").next().unwrap_or(""), t.stubs_count))
+            .collect();
+        assert_eq!(by_name.get("test_one"), Some(&1));
+        assert_eq!(by_name.get("test_two"), Some(&2));
+        assert_eq!(parsed.stubs_count, 3);
+    }
+
+    #[test]
+    fn unrelated_calls_do_not_increment_stubs_count() {
+        // `mock.patch` (Mock-API module) and `monkeypatch.foobar` (unknown
+        // method) must not count — STUB_HEADS is a closed list of exact
+        // dotted call-heads.
+        let src = "\
+def test_x(mocker):
+    mock.patch('a')
+    monkeypatch.foobar()
+    repo.save(1)
+    assert True
+";
+        let parsed = parse_full(src);
+        assert_eq!(parsed.test_functions[0].stubs_count, 0);
+        assert_eq!(parsed.stubs_count, 0);
+    }
+
+    #[test]
+    fn stubs_count_disjoint_from_mock_construction_count() {
+        // A test body that mixes `Mock()` (constructor) with
+        // `monkeypatch.setattr` (stub head) reports each on its own axis —
+        // the two counts must not collide.
+        let src = "\
+def test_x(monkeypatch):
+    m = Mock()
+    monkeypatch.setattr(os, 'getcwd', lambda: '/x')
+    assert True
+";
+        let parsed = parse_full(src);
+        assert_eq!(parsed.mock_construction_count, 1);
+        assert_eq!(parsed.stubs_count, 1);
+        assert_eq!(parsed.test_functions[0].stubs_count, 1);
     }
 }

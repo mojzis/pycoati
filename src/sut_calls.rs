@@ -217,6 +217,7 @@ mod tests {
             assertion_count: 0,
             only_asserts_on_mock: false,
             patch_decorator_count: 0,
+            stubs_count: 0,
             setup_to_assertion_ratio: 0.0,
             called_names: called.iter().map(|s| (*s).to_string()).collect(),
             smell_hits: Vec::new(),

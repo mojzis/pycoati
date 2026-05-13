@@ -52,15 +52,12 @@ pub fn derive_test_smells(test: &TestRecord, config: &MockSmellConfig) -> Vec<Sm
         });
     }
 
-    // mock_construction_count is per-file in schema v2; per-test the only
-    // sources of mock-shaped objects we have are the patch decorators.
-    // The plan defines mock_overuse with `(mock_construction_count +
-    // patch_decorator_count)` — at the test level, mock_construction_count
-    // is not stored on the record (it lives on FileRecord). To keep the
-    // test-level smell meaningful, we use `patch_decorator_count` as the
-    // mock-construction proxy at test scope: a test decorated with N
-    // `@patch` decorators "constructs" N mocks injected into it.
-    let test_mocks = test.patch_decorator_count;
+    // Per-test `mock_overuse` consumes `(patch_decorator_count + stubs_count)`.
+    // Body-level `mock_construction_count` is deliberately a file-only signal
+    // (the AST count lives on `FileRecord`, not `TestRecord`); the per-test
+    // smell therefore covers decorator-driven and fixture-driven patching
+    // and leaves bare `Mock()`/`MagicMock()` constructions to the file scope.
+    let test_mocks = test.patch_decorator_count.saturating_add(test.stubs_count);
     if mock_overuse_fires(test_mocks, test.assertion_count, config) {
         hits.push(SmellHit {
             category: "mock_overuse".to_string(),
@@ -100,7 +97,10 @@ pub fn derive_file_smells(
         });
     }
 
-    let file_mocks = file.mock_construction_count.saturating_add(file.patch_decorator_count);
+    let file_mocks = file
+        .mock_construction_count
+        .saturating_add(file.patch_decorator_count)
+        .saturating_add(file.stubs_count);
     if mock_overuse_fires(file_mocks, file.assertion_count, config) {
         hits.push(SmellHit {
             category: "mock_overuse".to_string(),
@@ -139,6 +139,7 @@ mod tests {
             assertion_count: 0,
             only_asserts_on_mock: false,
             patch_decorator_count: 0,
+            stubs_count: 0,
             setup_to_assertion_ratio: 0.0,
             called_names: Vec::new(),
             smell_hits: Vec::new(),
@@ -153,6 +154,7 @@ mod tests {
             assertion_count: 0,
             mock_construction_count: 0,
             patch_decorator_count: 0,
+            stubs_count: 0,
             fixture_count: 0,
             smell_hits: Vec::new(),
         }
@@ -253,5 +255,45 @@ mod tests {
         assert!(hits.iter().any(|h| h.category == "mock_overuse"));
         let hit = hits.iter().find(|h| h.category == "mock_overuse").unwrap();
         assert_eq!(hit.evidence, "5 mocks, 1 assertions");
+    }
+
+    #[test]
+    fn per_test_mock_overuse_consumes_stubs_count() {
+        // No `@patch` decorators, but four fixture-driven stubs and one
+        // assert — `(0 + 4)` should fire the smell on its own.
+        let mut t = make_test("a::t");
+        t.patch_decorator_count = 0;
+        t.stubs_count = 4;
+        t.assertion_count = 1;
+        let hits = derive_test_smells(&t, &MockSmellConfig::default());
+        let mo = hits.iter().find(|h| h.category == "mock_overuse").expect("mock_overuse hit");
+        assert_eq!(mo.evidence, "4 mocks, 1 assertions");
+    }
+
+    #[test]
+    fn per_test_mock_overuse_sums_patches_and_stubs() {
+        // 2 patches + 2 stubs = 4 against 1 assert.
+        let mut t = make_test("a::t");
+        t.patch_decorator_count = 2;
+        t.stubs_count = 2;
+        t.assertion_count = 1;
+        let hits = derive_test_smells(&t, &MockSmellConfig::default());
+        let mo = hits.iter().find(|h| h.category == "mock_overuse").expect("mock_overuse hit");
+        assert_eq!(mo.evidence, "4 mocks, 1 assertions");
+    }
+
+    #[test]
+    fn file_level_mock_overuse_includes_stubs_count() {
+        // No constructions / no decorators, but a stub-heavy file with one
+        // assert — `(0 + 0 + 5)` fires `mock_overuse` at file scope.
+        let mut f = make_file("a");
+        f.mock_construction_count = 0;
+        f.patch_decorator_count = 0;
+        f.stubs_count = 5;
+        f.assertion_count = 1;
+        let refs: Vec<&TestRecord> = Vec::new();
+        let hits = derive_file_smells(&f, &refs, &MockSmellConfig::default());
+        let mo = hits.iter().find(|h| h.category == "mock_overuse").expect("mock_overuse hit");
+        assert_eq!(mo.evidence, "5 mocks, 1 assertions");
     }
 }

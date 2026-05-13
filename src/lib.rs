@@ -86,6 +86,11 @@ pub struct FileRecord {
     pub assertion_count: u64,
     pub mock_construction_count: u64,
     pub patch_decorator_count: u64,
+    /// Number of fixture-driven stub-API call sites (`monkeypatch.*`,
+    /// `mocker.*` — see [`mock_api::STUB_HEADS`]) across every test body in
+    /// this file. Feeds into the file-level `mock_overuse` smell alongside
+    /// `mock_construction_count` and `patch_decorator_count`.
+    pub stubs_count: u64,
     pub fixture_count: u64,
     pub smell_hits: Vec<SmellHit>,
 }
@@ -99,6 +104,11 @@ pub struct TestRecord {
     pub assertion_count: u64,
     pub only_asserts_on_mock: bool,
     pub patch_decorator_count: u64,
+    /// Number of fixture-driven stub-API call sites in this test's body.
+    /// At per-test scope, `mock_overuse` consumes
+    /// `(patch_decorator_count + stubs_count)` — body-level Mock-API
+    /// constructions remain a file-scope signal only.
+    pub stubs_count: u64,
     pub setup_to_assertion_ratio: f64,
     pub called_names: Vec<String>,
     pub smell_hits: Vec<SmellHit>,
@@ -186,6 +196,7 @@ fn empty_file_record(path: &Path) -> FileRecord {
         assertion_count: 0,
         mock_construction_count: 0,
         patch_decorator_count: 0,
+        stubs_count: 0,
         fixture_count: 0,
         smell_hits: Vec::new(),
     }
@@ -408,6 +419,7 @@ fn run_static_file_with_options(
     file_record.assertion_count = parsed.test_functions.iter().map(|t| t.assertion_count).sum();
     file_record.mock_construction_count = parsed.mock_construction_count;
     file_record.patch_decorator_count = parsed.patch_decorator_count;
+    file_record.stubs_count = parsed.stubs_count;
     file_record.fixture_count = parsed.fixture_count;
 
     let mut inv = empty_inventory(project);
@@ -607,6 +619,7 @@ fn parse_single_file(
     record.assertion_count = assertion_count;
     record.mock_construction_count = parsed.mock_construction_count;
     record.patch_decorator_count = parsed.patch_decorator_count;
+    record.stubs_count = parsed.stubs_count;
     record.fixture_count = parsed.fixture_count;
 
     Ok((record, test_functions, parsed.import_map))

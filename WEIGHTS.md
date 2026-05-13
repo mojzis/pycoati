@@ -75,10 +75,40 @@ Its v1 thresholds:
   `mocks > max(asserts, floor)` predicate. Stops the smell firing on a
   test with zero or one assertion just because the mock count is small
   but non-zero.
-- `mock_overuse_ratio = 2.0` — the `(mocks + patches) / max(asserts, 1)`
-  ratio that must be exceeded for `mock_overuse` to fire.
+- `mock_overuse_ratio = 2.0` — the `mocks / max(asserts, 1)` ratio that
+  must be exceeded for `mock_overuse` to fire, where `mocks` is the
+  sum defined below.
 - Both predicates use strict `>` semantics — a 2-mock-2-assert test sits
   on the boundary and does **not** fire.
+
+### `mocks` decomposition
+
+The numerator of `mock_overuse` is a sum of three independent signals:
+
+- `mock_construction_count` — bare constructor calls to
+  `Mock` / `MagicMock` / `AsyncMock` / `create_autospec` /
+  `patch(...)`-as-context-manager inside a test body. Counted at file
+  scope only; not stored per-test.
+- `patch_decorator_count` — `@patch` / `@mock.patch` / `@patch.object`
+  / `@<x>.patch` decorators on a test function. Counted both per-test
+  (decorators belong to a specific test) and per-file (sum across tests).
+- `stubs_count` — fixture-driven patch calls whose dotted call-head
+  matches `STUB_HEADS` (`monkeypatch.setattr`, `monkeypatch.setenv`,
+  `monkeypatch.delattr`, `monkeypatch.delenv`, `monkeypatch.context`,
+  `monkeypatch.syspath_prepend`, `monkeypatch.chdir`, `mocker.patch`,
+  `mocker.patch.object`, `mocker.patch.dict`, `mocker.patch.multiple`,
+  `mocker.spy`, `mocker.stub`, `mocker.MagicMock`). Counted both
+  per-test and per-file. Stubs are structurally distinct from
+  `unittest.mock` constructions: they rewire the system under test from
+  the outside via pytest's `monkeypatch` / `mocker` fixtures rather
+  than instantiating a `Mock()` directly.
+
+At file scope `mock_overuse` consumes
+`mock_construction_count + patch_decorator_count + stubs_count`. At
+per-test scope it consumes `patch_decorator_count + stubs_count` only —
+body-level `Mock()` constructions are not stored on `TestRecord`, so
+the per-test predicate intentionally covers decorator-driven and
+fixture-driven patching only.
 
 ## File-level score
 
