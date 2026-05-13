@@ -471,12 +471,13 @@ fn run_static_dir_with_options(
             "no python test files under tests dir; emitting empty inventory"
         );
     } else {
+        // Static message + structured fields, matching the WARN above —
+        // the fmt subscriber renders both, so interpolating the same data
+        // into the message would double-stamp it in user-visible output.
         tracing::info!(
             tests_dir = %tests_dir.display(),
             count = files.len(),
-            "found {} python test files under {}",
-            files.len(),
-            tests_dir.display()
+            "discovered python test files"
         );
     }
 

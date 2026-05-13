@@ -132,16 +132,38 @@ fn unittest_assert_raises_block_counts_as_assertion() {
 #[test]
 fn unittest_class_nodeids_include_class_segment() {
     // Sanity check the existing class-prefix nodeid plumbing for the new
-    // unittest fixture — both methods should appear under `TestThing::`.
+    // unittest fixture — every method should appear under `TestThing::`.
     let path = fixture_path("tests/fixtures/unittest_style/test_unittest.py");
     let inv = coati::run_static(&path).expect("run_static on unittest fixture");
     let nodeids: Vec<&str> = inv.test_functions.iter().map(|t| t.nodeid.as_str()).collect();
     assert_eq!(
         inv.test_functions.len(),
-        2,
-        "expected 2 unittest methods discovered, got nodeids: {nodeids:?}"
+        3,
+        "expected 3 unittest methods discovered, got nodeids: {nodeids:?}"
     );
     for n in &nodeids {
         assert!(n.contains("::TestThing::"), "expected TestThing class prefix in {n:?}");
     }
+}
+
+#[test]
+fn unittest_assert_predicate_rejects_snake_case_and_prefix_collisions() {
+    // `test_camelcase_strictness` in the fixture mixes one real
+    // `self.assertEqual` with three lookalikes that must be rejected:
+    //   - `self.assert_called_with` (Mock API, snake_case after `assert`)
+    //   - `self.assertion_count`    (user helper, `assert<lowercase>` prefix)
+    //   - `self.assert_logged`      (user helper, snake_case after `assert`)
+    // Only the real assertion must count.
+    let path = fixture_path("tests/fixtures/unittest_style/test_unittest.py");
+    let inv = coati::run_static(&path).expect("run_static on unittest fixture");
+    let strict_test = inv
+        .test_functions
+        .iter()
+        .find(|t| t.nodeid.ends_with("::test_camelcase_strictness"))
+        .expect("test_camelcase_strictness must be discovered");
+    assert_eq!(
+        strict_test.assertion_count, 1,
+        "only the real `self.assertEqual` should count; got {} (lookalikes leaked through)",
+        strict_test.assertion_count
+    );
 }

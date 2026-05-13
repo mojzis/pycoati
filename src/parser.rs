@@ -255,7 +255,9 @@ fn build_record(
         collect_asserts(body_node, &mut asserts);
         collect_calls(body_node, &mut calls);
         collect_raises_blocks(body_node, source, &mut raises_blocks);
-        collect_unittest_asserts(body_node, class_prefix, source, &mut unittest_asserts);
+        // Reuse the `calls` vector already walked above instead of rewalking
+        // the body — keeps the parse pass single-walk per node kind.
+        collect_unittest_asserts(&calls, class_prefix, source, &mut unittest_asserts);
     }
 
     // `with pytest.raises(...)` blocks are non-mock effective assertions: they
@@ -699,18 +701,26 @@ fn collect_raises_blocks<'a>(node: Node<'a>, source: &[u8], out: &mut Vec<Node<'
     }
 }
 
-/// Collect every `call_expression` in the subtree whose dotted call-head
-/// matches `self.assert*`. These are the `unittest.TestCase` assertion
-/// methods (`self.assertEqual`, `self.assertTrue`, `self.assertIn`, etc.)
-/// and they count as effective assertions just like a bare `assert`.
+/// Collect every `call_expression` in `calls` whose dotted call-head matches
+/// the strict `camelCase` `self.assert<Upper…>` shape used by
+/// `unittest.TestCase` assertion methods (`self.assertEqual`,
+/// `self.assertTrue`, `self.assertIn`, the bare `self.assert`, …). These
+/// count as effective assertions just like a bare `assert`.
 ///
 /// Gated on `class_prefix.is_some()` because outside a class context
-/// `self.*` cannot bind to a `TestCase` receiver. Inside `Test*` classes the
-/// pytest collection rule already guarantees the surrounding receiver is a
-/// unittest-compatible test instance (pytest happily collects unittest
-/// subclasses), so we accept any `self.assert*` head without further checks.
+/// `self.*` cannot bind to a `TestCase` receiver. Inside `Test*` classes
+/// pytest happily collects unittest subclasses, so we accept any
+/// `camelCase` `self.assert*` head without further static checks.
+///
+/// The `camelCase` rule deliberately rejects `snake_case` lookalikes like
+/// `self.assert_called_with` (which belongs to `Mock`'s API, not unittest)
+/// and prefix collisions like `self.assertion_count(...)` or
+/// `self.assert_logged(...)` (user-defined helpers that are not effective
+/// assertions). Callers pass the body's `calls` vector that was already
+/// collected once during `build_record` — this function does not rewalk
+/// the tree.
 fn collect_unittest_asserts<'a>(
-    body: Node<'a>,
+    calls: &[Node<'a>],
     class_prefix: Option<&str>,
     source: &[u8],
     out: &mut Vec<Node<'a>>,
@@ -718,16 +728,28 @@ fn collect_unittest_asserts<'a>(
     if class_prefix.is_none() {
         return;
     }
-    let mut calls: Vec<Node<'a>> = Vec::new();
-    collect_descendants(body, "call", &mut calls);
-    for call in calls {
+    for &call in calls {
         if let Some(head) = call_head_chain(call, source) {
             if let Some(method) = head.strip_prefix("self.") {
-                if method.starts_with("assert") {
+                if is_unittest_assert_method(method) {
                     out.push(call);
                 }
             }
         }
+    }
+}
+
+/// Strict `camelCase` predicate: `assert` followed by either nothing
+/// (the bare `assert` method) or an uppercase ASCII letter. Rejects
+/// `assert_called_with` (Mock API), `assertion_count` (user helper),
+/// `asserter` (anything starting with `assert<lowercase>`).
+fn is_unittest_assert_method(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("assert") else {
+        return false;
+    };
+    match rest.as_bytes().first() {
+        None => true,
+        Some(b) => b.is_ascii_uppercase(),
     }
 }
 
