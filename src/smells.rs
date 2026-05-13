@@ -14,6 +14,12 @@
 use crate::{FileRecord, SmellHit, TestRecord};
 
 /// Configurable thresholds for the mock-overuse smell.
+///
+/// Lives in the crate-private `smells` module — reachable only from inside
+/// the crate. v1 does not expose these thresholds as CLI flags; every caller
+/// today uses [`MockSmellConfig::default`]. Exposing the knob is a contract
+/// change to land alongside whatever surface (CLI flag, env var, `--config`
+/// file) the user-facing tuning ends up using.
 #[derive(Debug, Clone, Copy)]
 pub struct MockSmellConfig {
     /// Minimum mocks-vs-asserts spread before `mock_overuse` fires. Acts as

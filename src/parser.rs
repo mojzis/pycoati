@@ -54,11 +54,16 @@ use anyhow::{Context, Result};
 use tree_sitter::{Node, Parser};
 
 use crate::mock_api::{is_mock_api_attribute, is_mock_constructor};
-use crate::sut_calls::ImportMap;
+use crate::sut_calls::{dotted_head, ImportMap};
 use crate::TestRecord;
 
 /// What [`parse_python_file`] returns: the per-test records plus per-file
 /// aggregates and the import map needed for Phase 2 sut-call resolution.
+///
+/// Lives in the crate-private `parser` module; nothing outside the crate
+/// touches the parser's structured output — the public entry point is
+/// [`crate::run_static`], which returns a fully-populated
+/// [`crate::Inventory`].
 #[derive(Debug, Clone, Default)]
 pub struct ParsedFile {
     pub test_functions: Vec<TestRecord>,
@@ -538,7 +543,7 @@ fn record_import_statement(stmt: Node<'_>, source: &[u8], map: &mut ImportMap) {
         match child.kind() {
             "dotted_name" => {
                 if let Some(full) = attribute_or_dotted_text(child, source) {
-                    let local = full.split('.').next().unwrap_or(&full).to_string();
+                    let local = dotted_head(&full).to_string();
                     map.aliases.insert(local, full);
                 }
             }
@@ -593,7 +598,7 @@ fn record_import_from(stmt: Node<'_>, source: &[u8], map: &mut ImportMap) {
             }
             "dotted_name" => {
                 if let Some(imported) = attribute_or_dotted_text(child, source) {
-                    let imported_head = imported.split('.').next().unwrap_or(&imported).to_string();
+                    let imported_head = dotted_head(&imported).to_string();
                     let canonical = format!("{source_module}.{imported_head}");
                     buffered.push((imported_head, canonical));
                 }

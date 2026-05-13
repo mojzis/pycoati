@@ -18,6 +18,12 @@ use crate::{SutCallEntry, SutCalls, TestRecord};
 
 /// Per-file import map. Both fields are sorted (BTree-backed) so downstream
 /// consumers see deterministic iteration order.
+///
+/// The struct lives in the crate-private `sut_calls` module — its `pub`
+/// fields are reachable only from inside the crate. It is the
+/// parser→aggregator hand-off contract; nothing outside the crate has a
+/// reason to construct or inspect an `ImportMap` (the public output is
+/// `SutCalls`).
 #[derive(Debug, Clone, Default)]
 pub struct ImportMap {
     /// `local_name -> canonical_full_dotted_name`.
@@ -39,6 +45,17 @@ pub struct ImportMap {
     /// 2 uses this set to opportunistically classify unresolved bare-name
     /// calls as project-internal when one of the star sources is a project
     /// package.
+    ///
+    /// **Policy — deliberately over-inclusive:** a bare call like
+    /// `compute()` in a file with `from myproj import *` is counted as
+    /// `myproj.compute` even when `compute` is actually a stdlib builtin or
+    /// a local helper. Resolving a star import correctly would require
+    /// reading the source module's `__all__` (or executing it), which is
+    /// out of scope for a static analyzer. False positives are intentional
+    /// in v1; the alternative — silently dropping calls under a star import
+    /// — is worse because it would hide genuine SUT calls. A future
+    /// revision may flag these as "low-confidence" rather than dropping
+    /// them.
     pub star_sources: BTreeSet<String>,
 }
 
@@ -153,7 +170,20 @@ pub fn aggregate(
     SutCalls { by_name: entries, top_called }
 }
 
-/// Split a dot-joined chain into `(head, optional_rest)`.
+/// Return the head segment of a dot-joined identifier chain — the substring
+/// before the first `.`, or the whole string if there is no `.`.
+///
+/// Shared between the parser (when recording import bindings — the head of
+/// `foo.bar` is the local name bound by `import foo.bar`) and the resolver
+/// (when checking whether a call's head identifies a project package). One
+/// helper avoids two slightly-different implementations drifting apart and
+/// keeps the "we treat dotted chains as `head . tail`" rule in one place.
+pub fn dotted_head(name: &str) -> &str {
+    name.split_once('.').map_or(name, |(h, _)| h)
+}
+
+/// Split a dot-joined chain into `(head, optional_rest)`. Built on
+/// [`dotted_head`] to keep the split semantics consistent.
 fn split_head(raw: &str) -> (&str, Option<&str>) {
     match raw.split_once('.') {
         Some((h, rest)) => (h, Some(rest)),
@@ -163,8 +193,7 @@ fn split_head(raw: &str) -> (&str, Option<&str>) {
 
 /// True iff the head segment of `module` is a project package.
 fn head_under_project(module: &str, project_packages: &BTreeSet<String>) -> bool {
-    let head = module.split('.').next().unwrap_or(module);
-    project_packages.contains(head)
+    project_packages.contains(dotted_head(module))
 }
 
 #[cfg(test)]
@@ -330,9 +359,9 @@ mod tests {
 
     #[test]
     fn aggregator_dedupes_test_nodeids() {
-        // One test calling repo.save twice would already be deduped by the
-        // parser; this exercises the aggregator-side dedupe via two
-        // resolved names from the same nodeid.
+        // Same raw name appearing twice in a single test's called_names
+        // resolves to the same canonical and must produce a single by_name
+        // entry with `test_function_count = 1` and one nodeid.
         let mut imports = ImportMap::default();
         imports
             .aliases
@@ -343,8 +372,9 @@ mod tests {
         imports_per_file.insert(PathBuf::from("tests/test_x.py"), imports);
         let sc = aggregate(&mut tests, &imports_per_file, &pkgs(["myproj"]));
         assert_eq!(sc.by_name.len(), 1);
+        assert_eq!(sc.by_name[0].name, "myproj.repository.Repository.save");
         assert_eq!(sc.by_name[0].test_function_count, 1);
-        assert_eq!(sc.by_name[0].test_nodeids.len(), 1);
+        assert_eq!(sc.by_name[0].test_nodeids, vec!["tests/test_x.py::test_a".to_string()]);
     }
 
     #[test]
@@ -368,6 +398,9 @@ mod tests {
 
     #[test]
     fn aggregator_top_called_caps_at_twenty() {
+        // 25 unique called names all with `test_function_count = 1` — the
+        // tiebreaker (name ascending) picks the lexicographically-smallest
+        // 20. Names are zero-padded so the lex order matches numeric.
         let mut imports = ImportMap::default();
         imports.star_sources.insert("myproj".to_string());
         let names: Vec<String> = (0..25).map(|i| format!("n{i:02}")).collect();
@@ -377,6 +410,8 @@ mod tests {
         imports_per_file.insert(PathBuf::from("tests/test_x.py"), imports);
         let sc = aggregate(&mut tests, &imports_per_file, &pkgs(["myproj"]));
         assert_eq!(sc.top_called.len(), 20);
+        assert_eq!(sc.top_called.first().map(String::as_str), Some("myproj.n00"));
+        assert_eq!(sc.top_called.last().map(String::as_str), Some("myproj.n19"));
     }
 
     #[test]

@@ -21,11 +21,11 @@ use serde::Serialize;
 
 pub mod coverage;
 pub mod mock_api;
-pub mod parser;
+pub(crate) mod parser;
 pub mod pyproject;
 pub mod pytest;
-pub mod smells;
-pub mod sut_calls;
+pub(crate) mod smells;
+pub(crate) mod sut_calls;
 pub mod walker;
 
 /// Top-level audit result. Every field is always serialized (no
