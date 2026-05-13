@@ -37,11 +37,17 @@ saturates each saturating sub-metric reaches a score of 1.0.
 
 ## Sub-metric definitions
 
-- `setup_to_assertion_ratio` (locked, Run 3): when at least one
-  `assert_statement` exists in the body,
-  `(first_assert_line - def_line) / max(assertion_count, 1)` measured in
-  tree-sitter `start_position().row` deltas. When the body has zero
-  `assert_statement` nodes, the numerator becomes
+- `assertion_count` includes both `assert_statement` nodes and
+  `with pytest.raises(...)` / `with raises(...)` context-manager blocks.
+  A raises block is treated as one effective non-mock assertion: it
+  contributes to the count, disqualifies `only_asserts_on_mock`, and
+  participates in `setup_to_assertion_ratio` like an `assert_statement`.
+- `setup_to_assertion_ratio` (locked, Run 3; extended to raises blocks):
+  when at least one effective assertion exists in the body,
+  `(first_effective_line - def_line) / effective_count` measured in
+  tree-sitter `start_position().row` deltas, where an effective assertion
+  is an `assert_statement` or a `with pytest.raises(...)` block. When the
+  body has no effective assertions, the numerator becomes
   `(last_body_line - def_line)` and the denominator is `1` — the result
   is the body height. This naturally pushes setup-heavy zero-assert tests
   up the ranking, complementing the `w_zero_asserts` term.

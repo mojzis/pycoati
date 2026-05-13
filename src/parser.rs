@@ -14,10 +14,13 @@
 //! Functions nested inside other functions are deliberately not collected —
 //! pytest does not collect them either.
 //!
-//! `assertion_count` reflects the number of `assert_statement` nodes inside
-//! each test function's body. The [`only_asserts_on_mock`](crate::TestRecord)
-//! predicate is `true` when every assert in the test targets a Mock-API
-//! attribute.
+//! `assertion_count` reflects the number of effective assertions in each
+//! test function's body — `assert_statement` nodes plus `with pytest.raises(...)`
+//! / `with raises(...)` blocks. A raises block is a non-mock effective
+//! assertion: it contributes to the count and disqualifies
+//! [`only_asserts_on_mock`](crate::TestRecord). The `only_asserts_on_mock`
+//! predicate is `true` when every `assert_statement` targets a Mock-API
+//! attribute *and* the test contains no raises blocks.
 //!
 //! Per-test AST counts (Run 3 phase 1):
 //!
@@ -246,14 +249,19 @@ fn build_record(
 
     let mut asserts: Vec<Node<'_>> = Vec::new();
     let mut calls: Vec<Node<'_>> = Vec::new();
+    let mut raises_blocks: Vec<Node<'_>> = Vec::new();
     if let Some(body_node) = body {
         collect_asserts(body_node, &mut asserts);
         collect_calls(body_node, &mut calls);
+        collect_raises_blocks(body_node, source, &mut raises_blocks);
     }
 
-    let assertion_count = asserts.len() as u64;
-    let only_asserts_on_mock =
-        assertion_count > 0 && asserts.iter().all(|a| assert_targets_mock_api(*a, source));
+    // `with pytest.raises(...)` blocks are non-mock effective assertions: they
+    // count toward `assertion_count` and disqualify `only_asserts_on_mock`.
+    let assertion_count = (asserts.len() + raises_blocks.len()) as u64;
+    let only_asserts_on_mock = !asserts.is_empty()
+        && raises_blocks.is_empty()
+        && asserts.iter().all(|a| assert_targets_mock_api(*a, source));
 
     let mock_construction_count =
         calls.iter().filter(|c| call_head_is_mock_constructor(**c, source)).count() as u64;
@@ -262,7 +270,8 @@ fn build_record(
 
     let patch_decorator_count = decorated.map_or(0, |d| count_patch_decorators(d, source));
 
-    let setup_to_assertion_ratio = compute_setup_to_assertion_ratio(func, body, &asserts);
+    let setup_to_assertion_ratio =
+        compute_setup_to_assertion_ratio(func, body, &asserts, &raises_blocks);
 
     let nodeid = match class_prefix {
         Some(cls) => format!("{}::{}::{}", file_path.display(), cls, name),
@@ -284,12 +293,13 @@ fn build_record(
     (record, mock_construction_count)
 }
 
-/// Compute `setup_to_assertion_ratio` per the locked Run 3 definition.
+/// Compute `setup_to_assertion_ratio` per the locked Run 3 definition,
+/// extended to treat `with pytest.raises(...)` blocks as effective assertions.
 ///
-/// With at least one `assert_statement` in the body:
-///   `(first_assert_row - def_row) / max(assertion_count, 1)`
+/// With at least one effective assertion (assert statement or raises block):
+///   `(first_effective_row - def_row) / effective_count`
 ///
-/// With zero asserts:
+/// With zero effective assertions:
 ///   `(last_body_row - def_row) / 1`
 ///
 /// Row deltas are taken from tree-sitter `start_position().row` (0-indexed);
@@ -298,12 +308,15 @@ fn compute_setup_to_assertion_ratio(
     func: Node<'_>,
     body: Option<Node<'_>>,
     asserts: &[Node<'_>],
+    raises_blocks: &[Node<'_>],
 ) -> f64 {
     let def_row = func.start_position().row;
-    if let Some(first) = asserts.first() {
-        let first_row = first.start_position().row;
-        let delta = first_row.saturating_sub(def_row) as f64;
-        let denom = asserts.len().max(1) as f64;
+    let effective_count = asserts.len() + raises_blocks.len();
+    let first_row =
+        asserts.iter().chain(raises_blocks.iter()).map(|n| n.start_position().row).min();
+    if let Some(first) = first_row {
+        let delta = first.saturating_sub(def_row) as f64;
+        let denom = effective_count.max(1) as f64;
         return delta / denom;
     }
     // Zero-assert fallback: body height, divided by 1. "Last body row" is
@@ -661,6 +674,77 @@ fn collect_calls<'a>(node: Node<'a>, out: &mut Vec<Node<'a>>) {
 /// `node`.
 fn collect_asserts<'a>(node: Node<'a>, out: &mut Vec<Node<'a>>) {
     collect_descendants(node, "assert_statement", out);
+}
+
+/// Collect every `with_statement` in the subtree whose context manager is a
+/// call to `pytest.raises(...)` or bare `raises(...)`. These are treated as
+/// effective assertions (a pytest test passes when the expected exception is
+/// raised inside the block, so the `with` line is the assertion site).
+///
+/// Bare `raises` matches `from pytest import raises` usage; the tiny
+/// false-positive risk (an unrelated `raises()` context manager) is accepted
+/// for the UX win on the very common pytest pattern.
+fn collect_raises_blocks<'a>(node: Node<'a>, source: &[u8], out: &mut Vec<Node<'a>>) {
+    let mut withs: Vec<Node<'a>> = Vec::new();
+    collect_descendants(node, "with_statement", &mut withs);
+    for w in withs {
+        if with_statement_is_pytest_raises(w, source) {
+            out.push(w);
+        }
+    }
+}
+
+/// Decide whether a `with_statement` opens a `pytest.raises(...)` or bare
+/// `raises(...)` context manager. Examines the first `with_item` only —
+/// chained items like `with pytest.raises(X), pytest.raises(Y):` would each
+/// be a single block; multiple `with`-statements are how pytest tests
+/// actually express multiple expected exceptions in series.
+fn with_statement_is_pytest_raises(with_stmt: Node<'_>, source: &[u8]) -> bool {
+    let mut cursor = with_stmt.walk();
+    let Some(clause) = with_stmt.named_children(&mut cursor).find(|c| c.kind() == "with_clause")
+    else {
+        return false;
+    };
+    let mut clause_cursor = clause.walk();
+    let Some(item) = clause.named_children(&mut clause_cursor).find(|c| c.kind() == "with_item")
+    else {
+        return false;
+    };
+    let Some(value) = item.named_child(0) else {
+        return false;
+    };
+    // `with raises(X) as ei:` wraps the call in an `as_pattern`.
+    let call_node = match value.kind() {
+        "call" => value,
+        "as_pattern" => match value.named_child(0) {
+            Some(n) if n.kind() == "call" => n,
+            _ => return false,
+        },
+        _ => return false,
+    };
+    let Some(func) = call_node.child_by_field_name("function") else {
+        return false;
+    };
+    call_function_is_pytest_raises(func, source)
+}
+
+/// Match `pytest.raises` (attribute) or bare `raises` (identifier).
+fn call_function_is_pytest_raises(func: Node<'_>, source: &[u8]) -> bool {
+    match func.kind() {
+        "identifier" => func.utf8_text(source).ok() == Some("raises"),
+        "attribute" => {
+            let obj = func.child_by_field_name("object");
+            let attr = func.child_by_field_name("attribute");
+            matches!(
+                (
+                    obj.and_then(|n| n.utf8_text(source).ok()),
+                    attr.and_then(|n| n.utf8_text(source).ok())
+                ),
+                (Some("pytest"), Some("raises"))
+            )
+        }
+        _ => false,
+    }
 }
 
 /// Iterative tree-sitter cursor descent: collect every descendant of
@@ -1299,5 +1383,83 @@ from foo import *
         assert!(parsed.import_map.star_sources.contains("foo"));
         // No alias-map entry for star imports.
         assert!(parsed.import_map.aliases.is_empty());
+    }
+
+    #[test]
+    fn with_pytest_raises_counts_as_assertion() {
+        let src = "\
+def test_raises_value():
+    with pytest.raises(ValueError):
+        do_thing()
+";
+        let recs = parse(src);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].assertion_count, 1);
+        assert!(!recs[0].only_asserts_on_mock);
+    }
+
+    #[test]
+    fn bare_raises_counts_as_assertion() {
+        let src = "\
+def test_raises_bare():
+    with raises(KeyError) as ei:
+        do_thing()
+";
+        let recs = parse(src);
+        assert_eq!(recs[0].assertion_count, 1);
+    }
+
+    #[test]
+    fn raises_block_disqualifies_only_asserts_on_mock() {
+        // Mock assert plus a pytest.raises block: the raises block is a
+        // non-mock effective assertion, so only_asserts_on_mock must be false.
+        let src = "\
+def test_mixed():
+    assert mock.called
+    with pytest.raises(ValueError):
+        boom()
+";
+        let recs = parse(src);
+        assert_eq!(recs[0].assertion_count, 2);
+        assert!(!recs[0].only_asserts_on_mock);
+    }
+
+    #[test]
+    fn multiple_raises_blocks_each_count() {
+        let src = "\
+def test_two_raises():
+    with pytest.raises(ValueError):
+        a()
+    with pytest.raises(KeyError):
+        b()
+";
+        let recs = parse(src);
+        assert_eq!(recs[0].assertion_count, 2);
+    }
+
+    #[test]
+    fn unrelated_with_block_is_not_an_assertion() {
+        // `with open(...)` is not an assertion; only pytest.raises / raises.
+        let src = "\
+def test_opens_file():
+    with open('x') as f:
+        f.read()
+";
+        let recs = parse(src);
+        assert_eq!(recs[0].assertion_count, 0);
+    }
+
+    #[test]
+    fn nested_with_pytest_raises_is_collected() {
+        // Mirrors `nested_asserts_in_if_block_are_collected`: a raises block
+        // buried in control flow must still be discovered.
+        let src = "\
+def test_nested():
+    if cond:
+        with pytest.raises(ValueError):
+            boom()
+";
+        let recs = parse(src);
+        assert_eq!(recs[0].assertion_count, 1);
     }
 }
