@@ -18,14 +18,60 @@
 //! each test function's body. The [`only_asserts_on_mock`](crate::TestRecord)
 //! predicate is `true` when every assert in the test targets a Mock-API
 //! attribute.
+//!
+//! Per-test AST counts (Run 3 phase 1):
+//!
+//! * `patch_decorator_count` — `@patch`, `@mock.patch`, `@patch.object`, or
+//!   any `@<something>.patch` decorator on the test function (or on its
+//!   wrapping `decorated_definition`).
+//! * `setup_to_assertion_ratio` — `(first_assert_line - def_line) /
+//!   max(assertion_count, 1)` as `f64`, using tree-sitter `start_position()`
+//!   row deltas. When the body contains no `assert_statement`, the
+//!   numerator becomes `last_body_line - def_line` and the denominator is
+//!   `1`, so zero-assert setup-heavy tests naturally rank high on the
+//!   suspicion-score axis.
+//! * `called_names` — raw, sorted, deduped dot-joined attribute chain at
+//!   the `function` child of every `call_expression` in the test body,
+//!   minus calls whose head chain starts with `self.`. Phase 2 resolves
+//!   these against the file's [`crate::sut_calls::ImportMap`] and replaces
+//!   the field with the project-internal subset.
+//!
+//! Per-file AST counts (returned alongside the per-test records via
+//! [`ParsedFile`]):
+//!
+//! * `mock_construction_count` — count of `call_expression` nodes inside
+//!   any test body whose head name matches
+//!   [`crate::mock_api::MOCK_CONSTRUCTORS`].
+//! * `patch_decorator_count` — sum of the per-test counts.
+//! * `fixture_count` — number of `@pytest.fixture` / `@fixture` decorators
+//!   anywhere in the file (counted on any `decorated_definition`, not just
+//!   tests).
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use tree_sitter::{Node, Parser};
 
-use crate::mock_api::is_mock_api_attribute;
+use crate::mock_api::{is_mock_api_attribute, is_mock_constructor};
+use crate::sut_calls::ImportMap;
 use crate::TestRecord;
+
+/// What [`parse_python_file`] returns: the per-test records plus per-file
+/// aggregates and the import map needed for Phase 2 sut-call resolution.
+#[derive(Debug, Clone, Default)]
+pub struct ParsedFile {
+    pub test_functions: Vec<TestRecord>,
+    /// Sum across every test body of `call_expression` heads matching
+    /// [`crate::mock_api::MOCK_CONSTRUCTORS`].
+    pub mock_construction_count: u64,
+    /// Sum of `patch_decorator_count` across every test record.
+    pub patch_decorator_count: u64,
+    /// Count of `@pytest.fixture` / `@fixture` decorators anywhere in the file.
+    pub fixture_count: u64,
+    /// Per-file import map for Phase 2 sut-call resolution.
+    pub import_map: ImportMap,
+}
 
 /// Build a tree-sitter parser pre-configured with the Python grammar.
 fn python_parser() -> Result<Parser> {
@@ -36,42 +82,48 @@ fn python_parser() -> Result<Parser> {
     Ok(parser)
 }
 
-/// Parse one Python source file and return one record per `test_*` function.
+/// Parse one Python source file and return the per-test records plus
+/// per-file aggregates and the import map.
 ///
 /// The supplied `file_path` is used to build pytest-style nodeids
 /// (`<path>::<test_name>` for module-level tests, `<path>::<Class>::<test>`
 /// for class-nested tests); it is otherwise opaque to the parser.
-pub fn parse_python_file(source: &str, file_path: &Path) -> Result<Vec<TestRecord>> {
+pub fn parse_python_file(source: &str, file_path: &Path) -> Result<ParsedFile> {
     let mut parser = python_parser()?;
     let tree = parser.parse(source, None).context("tree-sitter returned no tree")?;
     let root = tree.root_node();
+    let bytes = source.as_bytes();
 
-    let mut records = Vec::new();
-    collect_module_tests(root, source.as_bytes(), file_path, &mut records);
-    Ok(records)
+    let mut parsed = ParsedFile::default();
+    collect_module_tests(root, bytes, file_path, &mut parsed);
+    parsed.fixture_count = count_fixture_decorators(root, bytes);
+    parsed.import_map = build_import_map(root, bytes);
+    Ok(parsed)
 }
 
 /// Iterate the immediate children of the module and dispatch on node kind:
 /// bare `function_definition`s (top-level tests), `decorated_definition`s
 /// (wrapping a function or a class), and `class_definition`s (pytest test
 /// containers when named `Test*`).
-fn collect_module_tests(
-    module: Node<'_>,
-    source: &[u8],
-    file_path: &Path,
-    out: &mut Vec<TestRecord>,
-) {
+fn collect_module_tests(module: Node<'_>, source: &[u8], file_path: &Path, out: &mut ParsedFile) {
     let mut cursor = module.walk();
     for child in module.children(&mut cursor) {
         match child.kind() {
             "function_definition" => {
-                try_collect_test_function(child, source, file_path, None, out);
+                try_collect_test_function(child, None, source, file_path, None, out);
             }
             "decorated_definition" => {
                 if let Some(inner) = child.child_by_field_name("definition") {
                     match inner.kind() {
                         "function_definition" => {
-                            try_collect_test_function(inner, source, file_path, None, out);
+                            try_collect_test_function(
+                                inner,
+                                Some(child),
+                                source,
+                                file_path,
+                                None,
+                                out,
+                            );
                         }
                         "class_definition" => {
                             collect_class_tests(inner, source, file_path, out);
@@ -97,7 +149,7 @@ fn collect_class_tests(
     class_node: Node<'_>,
     source: &[u8],
     file_path: &Path,
-    out: &mut Vec<TestRecord>,
+    out: &mut ParsedFile,
 ) {
     let Some(class_name) = node_name(class_node, source) else {
         return;
@@ -112,12 +164,19 @@ fn collect_class_tests(
     for child in body.children(&mut cursor) {
         match child.kind() {
             "function_definition" => {
-                try_collect_test_function(child, source, file_path, Some(class_name), out);
+                try_collect_test_function(child, None, source, file_path, Some(class_name), out);
             }
             "decorated_definition" => {
                 if let Some(inner) = child.child_by_field_name("definition") {
                     if inner.kind() == "function_definition" {
-                        try_collect_test_function(inner, source, file_path, Some(class_name), out);
+                        try_collect_test_function(
+                            inner,
+                            Some(child),
+                            source,
+                            file_path,
+                            Some(class_name),
+                            out,
+                        );
                     }
                 }
             }
@@ -126,17 +185,26 @@ fn collect_class_tests(
     }
 }
 
-/// Push one record if the `function_definition` is a `test_*`.
+/// Push one record if the `function_definition` is a `test_*`. When the
+/// function is wrapped by a `decorated_definition`, `decorated` carries
+/// that wrapper so decorator counts can be extracted.
 fn try_collect_test_function(
     func: Node<'_>,
+    decorated: Option<Node<'_>>,
     source: &[u8],
     file_path: &Path,
     class_prefix: Option<&str>,
-    out: &mut Vec<TestRecord>,
+    out: &mut ParsedFile,
 ) {
     if let Some(name) = node_name(func, source) {
         if name.starts_with("test_") {
-            out.push(build_record(func, name, source, file_path, class_prefix));
+            let (record, mock_constructions) =
+                build_record(func, decorated, name, source, file_path, class_prefix);
+            out.mock_construction_count =
+                out.mock_construction_count.saturating_add(mock_constructions);
+            out.patch_decorator_count =
+                out.patch_decorator_count.saturating_add(record.patch_decorator_count);
+            out.test_functions.push(record);
         }
     }
 }
@@ -148,17 +216,20 @@ fn node_name<'a>(node: Node<'_>, source: &'a [u8]) -> Option<&'a str> {
     name_node.utf8_text(source).ok()
 }
 
-/// Build a [`TestRecord`] from a `function_definition` node, counting
-/// `assert_statement` descendants in its body. When `class_prefix` is
-/// `Some`, the nodeid is formatted as `<file>::<Class>::<method>` to match
-/// pytest's collected/durations output.
+/// Build a [`TestRecord`] from a `function_definition` node plus the
+/// surrounding `decorated_definition` (if any).
+///
+/// Returns the record plus the count of mock-constructor call sites in
+/// the test body, which is aggregated at file level (no per-test field
+/// exists for it on `TestRecord`).
 fn build_record(
     func: Node<'_>,
+    decorated: Option<Node<'_>>,
     name: &str,
     source: &[u8],
     file_path: &Path,
     class_prefix: Option<&str>,
-) -> TestRecord {
+) -> (TestRecord, u64) {
     // tree-sitter rows are zero-indexed `usize`. On every supported target
     // `usize` is at most 64 bits, so the cast is exact; `saturating_add`
     // converts to a 1-indexed line number without surfacing a bogus
@@ -166,47 +237,431 @@ fn build_record(
     let row = func.start_position().row as u64;
     let line = row.saturating_add(1);
 
+    let body = func.child_by_field_name("body");
+
     let mut asserts: Vec<Node<'_>> = Vec::new();
-    if let Some(body) = func.child_by_field_name("body") {
-        collect_asserts(body, &mut asserts);
+    let mut calls: Vec<Node<'_>> = Vec::new();
+    if let Some(body_node) = body {
+        collect_asserts(body_node, &mut asserts);
+        collect_calls(body_node, &mut calls);
     }
 
     let assertion_count = asserts.len() as u64;
     let only_asserts_on_mock =
         assertion_count > 0 && asserts.iter().all(|a| assert_targets_mock_api(*a, source));
 
+    let mock_construction_count =
+        calls.iter().filter(|c| call_head_is_mock_constructor(**c, source)).count() as u64;
+
+    let called_names = called_names_for_test(&calls, source);
+
+    let patch_decorator_count = decorated.map_or(0, |d| count_patch_decorators(d, source));
+
+    let setup_to_assertion_ratio = compute_setup_to_assertion_ratio(func, body, &asserts);
+
     let nodeid = match class_prefix {
         Some(cls) => format!("{}::{}::{}", file_path.display(), cls, name),
         None => format!("{}::{}", file_path.display(), name),
     };
 
-    TestRecord {
+    let record = TestRecord {
         nodeid,
         file: file_path.to_path_buf(),
         line,
         assertion_count,
         only_asserts_on_mock,
-        patch_decorator_count: 0,
-        setup_to_assertion_ratio: 0.0,
-        called_names: Vec::new(),
+        patch_decorator_count,
+        setup_to_assertion_ratio,
+        called_names,
         smell_hits: Vec::new(),
         suspicion_score: 0.0,
+    };
+    (record, mock_construction_count)
+}
+
+/// Compute `setup_to_assertion_ratio` per the locked Run 3 definition.
+///
+/// With at least one `assert_statement` in the body:
+///   `(first_assert_row - def_row) / max(assertion_count, 1)`
+///
+/// With zero asserts:
+///   `(last_body_row - def_row) / 1`
+///
+/// Row deltas are taken from tree-sitter `start_position().row` (0-indexed);
+/// only the delta matters, so the index base is irrelevant.
+fn compute_setup_to_assertion_ratio(
+    func: Node<'_>,
+    body: Option<Node<'_>>,
+    asserts: &[Node<'_>],
+) -> f64 {
+    let def_row = func.start_position().row;
+    if let Some(first) = asserts.first() {
+        let first_row = first.start_position().row;
+        let delta = first_row.saturating_sub(def_row) as f64;
+        let denom = asserts.len().max(1) as f64;
+        return delta / denom;
+    }
+    // Zero-assert fallback: body height, divided by 1. "Last body row" is
+    // the start row of the body's last named statement — this is the row
+    // index a human would point at as "the last line of the function body".
+    let Some(body_node) = body else {
+        return 0.0;
+    };
+    let last_body_row = last_named_child_row(body_node).unwrap_or(def_row);
+    last_body_row.saturating_sub(def_row) as f64
+}
+
+/// Return the `start_position().row` of the last named child of `node`,
+/// or `None` if the node has no named children.
+fn last_named_child_row(node: Node<'_>) -> Option<usize> {
+    // Walk via cursor and track the last named child we see.
+    let mut cursor = node.walk();
+    let mut last: Option<Node<'_>> = None;
+    for child in node.named_children(&mut cursor) {
+        last = Some(child);
+    }
+    last.map(|n| n.start_position().row)
+}
+
+/// True iff the `call_expression`'s `function` child has a head name
+/// (bare identifier or first segment of an attribute chain) that matches
+/// one of the known Mock-API constructors.
+fn call_head_is_mock_constructor(call: Node<'_>, source: &[u8]) -> bool {
+    let Some(func) = call.child_by_field_name("function") else {
+        return false;
+    };
+    match func.kind() {
+        "identifier" => func.utf8_text(source).is_ok_and(is_mock_constructor),
+        "attribute" => {
+            // For `mock.patch(...)` the head segment is `mock`; for our
+            // strict semantics we treat only an exact head match against
+            // the constructor set as a mock construction. This keeps
+            // `repo.save(...)` out of the count and avoids double-counting
+            // `mock.patch(...)` calls (the `@patch` decorator pathway
+            // captures decorator usage separately).
+            head_identifier(func, source).is_some_and(|h| is_mock_constructor(h) && h != "patch")
+        }
+        _ => false,
     }
 }
 
+/// Walk down an `attribute` node until the leftmost identifier is reached,
+/// returning that identifier's text.
+fn head_identifier<'a>(mut node: Node<'_>, source: &'a [u8]) -> Option<&'a str> {
+    loop {
+        match node.kind() {
+            "identifier" => return node.utf8_text(source).ok(),
+            "attribute" => {
+                let object = node.child_by_field_name("object")?;
+                node = object;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Compute the dot-joined attribute chain at a `call_expression`'s
+/// `function` child. Supports bare identifiers (`Repository`) and
+/// attribute chains of arbitrary depth (`uuid.uuid4`, `a.b.c.save`).
+/// Returns `None` for callable forms we don't model (calls on subscripts,
+/// lambda invocations, chained `().method()`-style suffixes, etc.).
+fn call_head_chain(call: Node<'_>, source: &[u8]) -> Option<String> {
+    let func = call.child_by_field_name("function")?;
+    attribute_chain_text(func, source)
+}
+
+/// Recursively render an expression as `"a.b.c"`. Returns `None` if the
+/// expression contains anything other than identifiers and `attribute`
+/// nodes — calls, subscripts, parentheses, etc. break the chain.
+fn attribute_chain_text(node: Node<'_>, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "identifier" => node.utf8_text(source).ok().map(String::from),
+        "attribute" => {
+            let object = node.child_by_field_name("object")?;
+            let attr = node.child_by_field_name("attribute")?;
+            let lhs = attribute_chain_text(object, source)?;
+            let rhs = attr.utf8_text(source).ok()?;
+            Some(format!("{lhs}.{rhs}"))
+        }
+        _ => None,
+    }
+}
+
+/// Collect, dedupe, sort, and `self.*`-filter the called-name chains for
+/// one test body.
+fn called_names_for_test(calls: &[Node<'_>], source: &[u8]) -> Vec<String> {
+    let mut set = BTreeSet::new();
+    for call in calls {
+        if let Some(chain) = call_head_chain(*call, source) {
+            if chain == "self" || chain.starts_with("self.") {
+                continue;
+            }
+            set.insert(chain);
+        }
+    }
+    set.into_iter().collect()
+}
+
+/// Count `@patch`-shaped decorators on a `decorated_definition` node.
+///
+/// Recognised decorator shapes:
+/// - `@patch` (bare identifier)
+/// - `@<something>.patch` (any attribute chain ending in `.patch`, e.g.
+///   `mock.patch`, `unittest.mock.patch`)
+/// - `@patch.object`, `@patch.dict`, … (any attribute chain whose head
+///   identifier is `patch`)
+/// - the same forms when used as call expressions: `@patch('a')`,
+///   `@mock.patch('a')`, `@patch.object(SomeClass, 'method')`.
+fn count_patch_decorators(decorated: Node<'_>, source: &[u8]) -> u64 {
+    let mut count: u64 = 0;
+    let mut cursor = decorated.walk();
+    for child in decorated.children(&mut cursor) {
+        if child.kind() == "decorator" && decorator_is_patch(child, source) {
+            count = count.saturating_add(1);
+        }
+    }
+    count
+}
+
+/// Walk a `decorator` node and decide whether its decorator-expression is
+/// a `@patch`-shaped form. The decorator-expression is the first named
+/// child of the `decorator` node; it is either an `identifier`, an
+/// `attribute`, or a `call` whose `function` child is one of those.
+fn decorator_is_patch(decorator: Node<'_>, source: &[u8]) -> bool {
+    let Some(expr) = decorator.named_child(0) else {
+        return false;
+    };
+    let target = if expr.kind() == "call" {
+        match expr.child_by_field_name("function") {
+            Some(f) => f,
+            None => return false,
+        }
+    } else {
+        expr
+    };
+    match target.kind() {
+        "identifier" => target.utf8_text(source).is_ok_and(|t| t == "patch"),
+        "attribute" => {
+            // Match when the dotted chain ends in `patch` (mock.patch,
+            // unittest.mock.patch, …) OR starts with `patch`
+            // (patch.object, patch.dict, …). Either pattern qualifies as
+            // a "patch-shaped" decorator for counting purposes.
+            let Some(chain) = attribute_chain_text(target, source) else {
+                return false;
+            };
+            let segments: Vec<&str> = chain.split('.').collect();
+            segments.first() == Some(&"patch") || segments.last() == Some(&"patch")
+        }
+        _ => false,
+    }
+}
+
+/// Count `@pytest.fixture` / `@fixture` decorators on every
+/// `decorated_definition` in the file. The fixture decoration can apply
+/// to module-level functions, methods inside any class (test class or
+/// not), or even nested defs — pytest itself only collects module-level
+/// and class-scoped ones, but the spec asks for a coarse file-level
+/// count, so we count any `decorated_definition` descendant.
+fn count_fixture_decorators(root: Node<'_>, source: &[u8]) -> u64 {
+    let mut count: u64 = 0;
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "decorated_definition" {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "decorator" && decorator_is_fixture(child, source) {
+                    count = count.saturating_add(1);
+                }
+            }
+        }
+        // Recurse into every named child — we want to find decorated defs
+        // nested arbitrarily deep (inside classes, conditionals, etc.).
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            // Skip the decorators themselves to avoid re-entering them.
+            if child.kind() != "decorator" {
+                stack.push(child);
+            }
+        }
+    }
+    count
+}
+
+/// True iff a `decorator` node is `@pytest.fixture` (with or without
+/// parens) or `@fixture` (with or without parens). Anything else is
+/// not a pytest fixture decoration for counting purposes.
+fn decorator_is_fixture(decorator: Node<'_>, source: &[u8]) -> bool {
+    let Some(expr) = decorator.named_child(0) else {
+        return false;
+    };
+    let target = if expr.kind() == "call" {
+        match expr.child_by_field_name("function") {
+            Some(f) => f,
+            None => return false,
+        }
+    } else {
+        expr
+    };
+    match target.kind() {
+        "identifier" => target.utf8_text(source).is_ok_and(|t| t == "fixture"),
+        "attribute" => attribute_chain_text(target, source).is_some_and(|c| c == "pytest.fixture"),
+        _ => false,
+    }
+}
+
+/// Build the per-file [`ImportMap`] by walking the module's top-level
+/// `import_statement` and `import_from_statement` nodes. Phase 1 returns
+/// the map for downstream consumption by Phase 2 (`sut_calls` resolution);
+/// no resolution logic lives in this module.
+fn build_import_map(root: Node<'_>, source: &[u8]) -> ImportMap {
+    let mut map = ImportMap::default();
+    let mut cursor = root.walk();
+    for child in root.children(&mut cursor) {
+        match child.kind() {
+            "import_statement" => record_import_statement(child, source, &mut map),
+            "import_from_statement" => record_import_from(child, source, &mut map),
+            _ => {}
+        }
+    }
+    map
+}
+
+/// Record one `import_statement` (e.g. `import foo`, `import foo.bar`,
+/// `import foo as f`, `import foo.bar as fb`, `import a, b`).
+fn record_import_statement(stmt: Node<'_>, source: &[u8], map: &mut ImportMap) {
+    let mut cursor = stmt.walk();
+    for child in stmt.named_children(&mut cursor) {
+        match child.kind() {
+            "dotted_name" => {
+                if let Some(full) = attribute_or_dotted_text(child, source) {
+                    let local = full.split('.').next().unwrap_or(&full).to_string();
+                    map.aliases.insert(local, full);
+                }
+            }
+            "aliased_import" => {
+                // (aliased_import name: (dotted_name) alias: (identifier))
+                if let (Some(name_node), Some(alias_node)) =
+                    (child.child_by_field_name("name"), child.child_by_field_name("alias"))
+                {
+                    if let (Some(full), Ok(alias)) =
+                        (attribute_or_dotted_text(name_node, source), alias_node.utf8_text(source))
+                    {
+                        map.aliases.insert(alias.to_string(), full);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Record one `import_from_statement` (e.g. `from foo import bar`,
+/// `from foo import bar as b`, `from foo import *`, `from foo import a, b`).
+fn record_import_from(stmt: Node<'_>, source: &[u8], map: &mut ImportMap) {
+    // The `module_name` field carries the source module's dotted name.
+    let Some(module_node) = stmt.child_by_field_name("module_name") else {
+        return;
+    };
+    let Some(source_module) = attribute_or_dotted_text(module_node, source) else {
+        return;
+    };
+
+    // Star import: tree-sitter-python represents `*` as a `wildcard_import`
+    // node sibling. No alias-map entry — record only the source module.
+    let mut cursor = stmt.walk();
+    let mut is_star = false;
+    for child in stmt.children(&mut cursor) {
+        if child.kind() == "wildcard_import" {
+            is_star = true;
+            break;
+        }
+    }
+    if is_star {
+        map.star_sources.insert(source_module);
+        return;
+    }
+
+    // For named imports, walk the `name` field children. tree-sitter-python
+    // can structure `from m import a, b` either via repeated `name`
+    // fields or as a list under a single name node; iterate every named
+    // child after the module_name and look at each `dotted_name` /
+    // `aliased_import`.
+    let mut cursor = stmt.walk();
+    for child in stmt.named_children(&mut cursor) {
+        if child.id() == module_node.id() {
+            continue;
+        }
+        match child.kind() {
+            "dotted_name" => {
+                if let Some(local) = attribute_or_dotted_text(child, source) {
+                    let local_head = local.split('.').next().unwrap_or(&local).to_string();
+                    map.aliases.insert(local_head, source_module.clone());
+                }
+            }
+            "aliased_import" => {
+                if let (Some(_name_node), Some(alias_node)) =
+                    (child.child_by_field_name("name"), child.child_by_field_name("alias"))
+                {
+                    if let Ok(alias) = alias_node.utf8_text(source) {
+                        map.aliases.insert(alias.to_string(), source_module.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Render a `dotted_name` or `attribute` node as its dotted text.
+fn attribute_or_dotted_text(node: Node<'_>, source: &[u8]) -> Option<String> {
+    match node.kind() {
+        "dotted_name" => {
+            // `dotted_name` children alternate `identifier` and `.` tokens
+            // — collect just the identifiers.
+            let mut parts: Vec<&str> = Vec::new();
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "identifier" {
+                    if let Ok(t) = child.utf8_text(source) {
+                        parts.push(t);
+                    }
+                }
+            }
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("."))
+            }
+        }
+        "identifier" => node.utf8_text(source).ok().map(String::from),
+        "attribute" => attribute_chain_text(node, source),
+        _ => None,
+    }
+}
+
+/// Collect every `call_expression` node anywhere in the subtree rooted at
+/// `node`. Uses the same iterative cursor descent as `collect_asserts`.
+fn collect_calls<'a>(node: Node<'a>, out: &mut Vec<Node<'a>>) {
+    collect_descendants(node, "call", out);
+}
+
 /// Collect every `assert_statement` node anywhere in the subtree rooted at
-/// `node`. Walks the subtree iteratively with a single
-/// [`tree_sitter::TreeCursor`] — the idiomatic tree-sitter descent pattern,
-/// avoiding the per-node cursor allocations that a children-iterator loop
-/// would incur.
+/// `node`.
 fn collect_asserts<'a>(node: Node<'a>, out: &mut Vec<Node<'a>>) {
+    collect_descendants(node, "assert_statement", out);
+}
+
+/// Iterative tree-sitter cursor descent: collect every descendant of
+/// `node` whose `kind() == target_kind`. Walks the subtree iteratively,
+/// avoiding the per-node cursor allocations that a children-iterator loop
+/// would incur. Bounded to the subtree rooted at `node` — we must not
+/// ascend past the starting node when backing out of dead-ends.
+fn collect_descendants<'a>(node: Node<'a>, target_kind: &str, out: &mut Vec<Node<'a>>) {
     let mut cursor = node.walk();
-    // Bound the traversal to the subtree rooted at `node` — we must not
-    // ascend past the starting node when backing out of dead-ends.
     let start_id = node.id();
     loop {
         let current = cursor.node();
-        if current.kind() == "assert_statement" {
+        if current.kind() == target_kind {
             out.push(current);
         }
 
@@ -216,8 +671,6 @@ fn collect_asserts<'a>(node: Node<'a>, out: &mut Vec<Node<'a>>) {
         if current.id() != start_id && cursor.goto_next_sibling() {
             continue;
         }
-        // Back out until we find a parent with another sibling, or until we
-        // would ascend past the starting node.
         loop {
             if !cursor.goto_parent() {
                 return;
@@ -254,8 +707,6 @@ fn assert_targets_mock_api(assert_stmt: Node<'_>, source: &[u8]) -> bool {
 /// Return the first asserted expression of an `assert_statement`. The first
 /// child is the `assert` keyword; the next named child is the expression.
 fn first_asserted_expression(assert_stmt: Node<'_>) -> Option<Node<'_>> {
-    // `named_child` is index-based and avoids the lifetime gymnastics of
-    // borrowing a cursor that would have to outlive the returned Node.
     assert_stmt.named_child(0)
 }
 
@@ -300,6 +751,10 @@ mod tests {
     use std::path::PathBuf;
 
     fn parse(src: &str) -> Vec<TestRecord> {
+        parse_python_file(src, &PathBuf::from("synthetic.py")).expect("parse").test_functions
+    }
+
+    fn parse_full(src: &str) -> ParsedFile {
         parse_python_file(src, &PathBuf::from("synthetic.py")).expect("parse")
     }
 
@@ -428,9 +883,6 @@ def test_j():
 
     #[test]
     fn decorated_top_level_test_is_detected() {
-        // Decorators wrap the def in a `decorated_definition` node — the
-        // walker must unwrap them, otherwise every `@pytest.mark.parametrize`
-        // test in real-world suites is invisible.
         let src = "\
 @pytest.mark.parametrize('x', [1, 2])
 def test_decorated(x):
@@ -482,9 +934,6 @@ async def test_decorated_async():
 
     #[test]
     fn class_nested_test_method_uses_pytest_nodeid_format() {
-        // pytest's nodeid for class-nested tests is `<file>::<Class>::<method>`.
-        // Coati must emit the same shape so its records align with pytest's
-        // collected / durations output.
         let src = "\
 class TestFoo:
     def test_bar(self):
@@ -532,8 +981,6 @@ class TestThing:
 
     #[test]
     fn non_test_class_is_ignored() {
-        // pytest only collects test methods from classes named `Test*`. A
-        // helper class with a `test_*` method is plumbing, not a test.
         let src = "\
 class Helper:
     def test_bar(self):
@@ -545,8 +992,6 @@ class Helper:
 
     #[test]
     fn decorated_test_class_methods_are_detected() {
-        // Decorated `class TestFoo` — rare but valid (e.g. @dataclass on a
-        // test container, though unusual). Methods inside still count.
         let src = "\
 @some_decorator
 class TestFoo:
@@ -560,8 +1005,6 @@ class TestFoo:
 
     #[test]
     fn non_test_function_named_test_is_skipped() {
-        // The `test_` prefix filter still applies — helper functions and
-        // fixtures that don't start with `test_` are not collected.
         let src = "\
 @pytest.fixture
 def some_fixture():
@@ -572,5 +1015,269 @@ def helper():
 ";
         let recs = parse(src);
         assert!(recs.is_empty());
+    }
+
+    // ---- Run 3 Phase 1 additions ------------------------------------------
+
+    #[test]
+    fn mock_construction_counted_for_each_constructor_name() {
+        let src = "\
+def test_x():
+    a = Mock()
+    b = MagicMock()
+    c = AsyncMock()
+    d = create_autospec(Service)
+    with patch('mod.thing') as p:
+        assert a.called
+";
+        let parsed = parse_full(src);
+        // Five constructor calls in the test body: Mock, MagicMock,
+        // AsyncMock, create_autospec, patch.
+        assert_eq!(parsed.mock_construction_count, 5);
+        assert_eq!(parsed.test_functions.len(), 1);
+    }
+
+    #[test]
+    fn patch_decorators_counted_on_top_level_and_class_methods() {
+        let src = "\
+@patch('a')
+def test_one():
+    assert True
+
+@mock.patch('b')
+def test_two():
+    assert True
+
+@patch.object(Foo, 'bar')
+def test_three():
+    assert True
+
+@foo.patch
+def test_four():
+    assert True
+
+class TestK:
+    @patch('z')
+    def test_method(self):
+        assert True
+";
+        let parsed = parse_full(src);
+        let by_name: std::collections::BTreeMap<&str, u64> = parsed
+            .test_functions
+            .iter()
+            .map(|t| (t.nodeid.rsplit("::").next().unwrap_or(""), t.patch_decorator_count))
+            .collect();
+        assert_eq!(by_name.get("test_one"), Some(&1));
+        assert_eq!(by_name.get("test_two"), Some(&1));
+        assert_eq!(by_name.get("test_three"), Some(&1));
+        assert_eq!(by_name.get("test_four"), Some(&1));
+        assert_eq!(by_name.get("test_method"), Some(&1));
+        // Five tests, one patch decorator each → file-level sum = 5.
+        assert_eq!(parsed.patch_decorator_count, 5);
+    }
+
+    #[test]
+    fn patch_decorator_count_handles_stacked_decorators() {
+        let src = "\
+@patch('a')
+@patch('b')
+def test_x():
+    assert True
+";
+        let parsed = parse_full(src);
+        assert_eq!(parsed.test_functions.len(), 1);
+        assert_eq!(parsed.test_functions[0].patch_decorator_count, 2);
+        assert_eq!(parsed.patch_decorator_count, 2);
+    }
+
+    #[test]
+    fn fixture_count_at_file_level_counts_only_pytest_fixtures() {
+        let src = "\
+import pytest
+from dataclasses import dataclass
+
+@pytest.fixture
+def fix_a():
+    return 1
+
+@fixture
+def fix_b():
+    return 2
+
+@pytest.fixture()
+def fix_c():
+    return 3
+
+@dataclass
+class Foo:
+    x: int
+
+class Bar:
+    @property
+    def value(self):
+        return 1
+
+def test_x():
+    assert True
+";
+        let parsed = parse_full(src);
+        assert_eq!(parsed.fixture_count, 3);
+    }
+
+    #[test]
+    fn setup_to_assertion_ratio_lines_between_def_and_first_assert() {
+        let src = "\
+def test_x():
+    a = 1
+    b = 2
+    c = 3
+    assert a == 1
+";
+        let parsed = parse_full(src);
+        let t = &parsed.test_functions[0];
+        // def at row 0, first assert at row 4 → delta 4; one assert → 4/1.
+        assert!((t.setup_to_assertion_ratio - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn setup_to_assertion_ratio_zero_assert_fallback() {
+        let src = "\
+def test_x():
+    a = 1
+    b = 2
+    c = 3
+";
+        let parsed = parse_full(src);
+        let t = &parsed.test_functions[0];
+        // def at row 0; body's last statement at row 3; ratio = 3 / 1.
+        assert!((t.setup_to_assertion_ratio - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn setup_to_assertion_ratio_multiple_asserts_divides_by_assertion_count() {
+        let src = "\
+def test_x():
+    a = 1
+    assert a == 1
+    assert a > 0
+";
+        let parsed = parse_full(src);
+        let t = &parsed.test_functions[0];
+        // def at row 0, first assert at row 2 → delta 2; two asserts → 2/2.
+        assert!((t.setup_to_assertion_ratio - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn called_names_emit_dot_joined_head_chains() {
+        let src = "\
+def test_x():
+    repo.save(1)
+    Repository()
+    uuid.uuid4()
+    assert True
+";
+        let parsed = parse_full(src);
+        let names = &parsed.test_functions[0].called_names;
+        assert_eq!(
+            names,
+            &vec!["Repository".to_string(), "repo.save".to_string(), "uuid.uuid4".to_string()]
+        );
+    }
+
+    #[test]
+    fn called_names_filter_self_calls() {
+        let src = "\
+class TestT:
+    def test_x(self):
+        self.assertTrue(True)
+        self.client.get('/')
+        assert True
+";
+        let parsed = parse_full(src);
+        assert_eq!(parsed.test_functions.len(), 1);
+        let names = &parsed.test_functions[0].called_names;
+        assert!(names.is_empty(), "expected no called_names, got {names:?}");
+    }
+
+    #[test]
+    fn called_names_dedup_and_sort_within_test() {
+        let src = "\
+def test_x():
+    repo.save(1)
+    repo.save(2)
+    repo.load(3)
+    assert True
+";
+        let parsed = parse_full(src);
+        let names = &parsed.test_functions[0].called_names;
+        assert_eq!(names, &vec!["repo.load".to_string(), "repo.save".to_string()]);
+    }
+
+    #[test]
+    fn called_names_both_nodeid_shapes() {
+        let src = "\
+class TestT:
+    def test_method(self):
+        repo.save(1)
+        assert True
+
+def test_top_level():
+    Service().run()
+    assert True
+";
+        let parsed = parse_full(src);
+        let by_id: std::collections::BTreeMap<&str, &Vec<String>> =
+            parsed.test_functions.iter().map(|t| (t.nodeid.as_str(), &t.called_names)).collect();
+        let cls =
+            by_id.get("synthetic.py::TestT::test_method").expect("class-nested record present");
+        assert!(!cls.is_empty(), "class-nested test should have called_names");
+        let top = by_id.get("synthetic.py::test_top_level").expect("top-level record present");
+        assert!(!top.is_empty(), "top-level test should have called_names");
+    }
+
+    // ---- ImportMap construction (optional Phase 1 work) -------------------
+
+    #[test]
+    fn import_map_handles_plain_imports() {
+        let src = "\
+import foo
+import bar.baz
+";
+        let parsed = parse_full(src);
+        assert_eq!(parsed.import_map.aliases.get("foo"), Some(&"foo".to_string()));
+        assert_eq!(parsed.import_map.aliases.get("bar"), Some(&"bar.baz".to_string()));
+    }
+
+    #[test]
+    fn import_map_handles_aliases() {
+        let src = "\
+import foo.bar as fb
+import quux as q
+";
+        let parsed = parse_full(src);
+        assert_eq!(parsed.import_map.aliases.get("fb"), Some(&"foo.bar".to_string()));
+        assert_eq!(parsed.import_map.aliases.get("q"), Some(&"quux".to_string()));
+    }
+
+    #[test]
+    fn import_map_handles_from_imports() {
+        let src = "\
+from foo import bar
+from foo import baz as b
+";
+        let parsed = parse_full(src);
+        assert_eq!(parsed.import_map.aliases.get("bar"), Some(&"foo".to_string()));
+        assert_eq!(parsed.import_map.aliases.get("b"), Some(&"foo".to_string()));
+    }
+
+    #[test]
+    fn import_map_records_star_imports() {
+        let src = "\
+from foo import *
+";
+        let parsed = parse_full(src);
+        assert!(parsed.import_map.star_sources.contains("foo"));
+        // No alias-map entry for star imports.
+        assert!(parsed.import_map.aliases.is_empty());
     }
 }

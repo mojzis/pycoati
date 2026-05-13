@@ -24,6 +24,7 @@ pub mod mock_api;
 pub mod parser;
 pub mod pyproject;
 pub mod pytest;
+pub mod sut_calls;
 pub mod walker;
 
 /// Top-level audit result. Every field is always serialized (no
@@ -334,18 +335,21 @@ fn run_static_file(path: &Path) -> Result<Inventory> {
     let project = project_from_file(path);
     let source = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
-    let test_functions = parser::parse_python_file(&source, path)
+    let parsed = parser::parse_python_file(&source, path)
         .with_context(|| format!("failed to parse {}", path.display()))?;
 
     let mut file_record = empty_file_record(path);
-    file_record.test_function_count = test_functions.len() as u64;
-    file_record.assertion_count = test_functions.iter().map(|t| t.assertion_count).sum();
+    file_record.test_function_count = parsed.test_functions.len() as u64;
+    file_record.assertion_count = parsed.test_functions.iter().map(|t| t.assertion_count).sum();
+    file_record.mock_construction_count = parsed.mock_construction_count;
+    file_record.patch_decorator_count = parsed.patch_decorator_count;
+    file_record.fixture_count = parsed.fixture_count;
 
     let mut inv = empty_inventory(project);
-    if !test_functions.is_empty() {
+    if !parsed.test_functions.is_empty() {
         inv.files.push(file_record);
     }
-    inv.test_functions = test_functions;
+    inv.test_functions = parsed.test_functions;
     Ok(inv)
 }
 
@@ -398,14 +402,15 @@ fn parse_single_file(
     let source = std::fs::read_to_string(file_path)
         .with_context(|| format!("failed to read {}", file_path.display()))?;
     let rel = relativize(file_path, project_root);
-    let mut test_functions = parser::parse_python_file(&source, &rel)
+    let parsed = parser::parse_python_file(&source, &rel)
         .with_context(|| format!("failed to parse {}", file_path.display()))?;
 
     // The parser builds nodeids using the path it was handed (here `rel`),
     // so no rewriting is needed.
-    let assertion_count: u64 = test_functions.iter().map(|t| t.assertion_count).sum();
-    let test_function_count = test_functions.len() as u64;
+    let assertion_count: u64 = parsed.test_functions.iter().map(|t| t.assertion_count).sum();
+    let test_function_count = parsed.test_functions.len() as u64;
 
+    let mut test_functions = parsed.test_functions;
     // Be tidy about line ordering inside a file so the aggregated
     // `test_functions` array is deterministic regardless of how the parser
     // walks the tree.
@@ -414,6 +419,9 @@ fn parse_single_file(
     let mut record = empty_file_record(&rel);
     record.test_function_count = test_function_count;
     record.assertion_count = assertion_count;
+    record.mock_construction_count = parsed.mock_construction_count;
+    record.patch_decorator_count = parsed.patch_decorator_count;
+    record.fixture_count = parsed.fixture_count;
 
     Ok((record, test_functions))
 }

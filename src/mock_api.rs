@@ -1,9 +1,12 @@
-//! Single source of truth for the Python `unittest.mock` attribute set used
-//! by the `only_asserts_on_mock` predicate.
+//! Mock-API name sets.
 //!
-//! The literal attribute names live in this module only. No other source
-//! file should reference these strings directly — go through
-//! [`is_mock_api_attribute`] or the [`MOCK_API_ATTRIBUTES`] slice.
+//! Single source of truth for the Python `unittest.mock` attribute set used
+//! by the `only_asserts_on_mock` predicate, plus the constructor-name set
+//! used to count Mock-API object constructions in test bodies.
+//!
+//! The literal attribute / constructor names live in this module only. No
+//! other source file should reference these strings directly — go through
+//! [`is_mock_api_attribute`] / [`is_mock_constructor`] or the two slices.
 
 /// Attribute names on `unittest.mock.Mock` / `MagicMock` instances that
 /// indicate an assertion about the mock itself rather than about the system
@@ -24,10 +27,25 @@ pub const MOCK_API_ATTRIBUTES: &[&str] = &[
     "assert_has_calls",
 ];
 
+/// Mock-API constructor names.
+///
+/// Names whose call-expression head identifies a Mock-API object being
+/// constructed inside a test body. `patch` is included because
+/// `patch(...)` used as a context manager (rather than as a decorator) is
+/// effectively a mock construction at the call site.
+pub const MOCK_CONSTRUCTORS: &[&str] =
+    &["Mock", "MagicMock", "AsyncMock", "create_autospec", "patch"];
+
 /// True iff `name` matches a Mock-API attribute (exact, case-sensitive).
 #[inline]
 pub fn is_mock_api_attribute(name: &str) -> bool {
     MOCK_API_ATTRIBUTES.contains(&name)
+}
+
+/// True iff `name` matches a Mock-API constructor (exact, case-sensitive).
+#[inline]
+pub fn is_mock_constructor(name: &str) -> bool {
+    MOCK_CONSTRUCTORS.contains(&name)
 }
 
 #[cfg(test)]
@@ -54,5 +72,22 @@ mod tests {
     #[test]
     fn attribute_set_has_eleven_entries() {
         assert_eq!(MOCK_API_ATTRIBUTES.len(), 11);
+    }
+
+    #[test]
+    fn known_mock_constructors_are_recognised() {
+        for name in ["Mock", "MagicMock", "AsyncMock", "create_autospec", "patch"] {
+            assert!(is_mock_constructor(name), "{name} should be a mock constructor");
+        }
+    }
+
+    #[test]
+    fn arbitrary_names_are_not_mock_constructors() {
+        assert!(!is_mock_constructor("Repository"));
+        assert!(!is_mock_constructor("mock"));
+        assert!(!is_mock_constructor(""));
+        // Case-sensitive: `mock.patch` is matched at the decorator-name
+        // level, not via this constructor predicate.
+        assert!(!is_mock_constructor("MOCK"));
     }
 }
