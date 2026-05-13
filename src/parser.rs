@@ -69,9 +69,12 @@ fn function_name<'a>(func: Node<'_>, source: &'a [u8]) -> Option<&'a str> {
 /// Build a [`TestRecord`] from a `function_definition` node, counting
 /// `assert_statement` descendants in its body.
 fn build_record(func: Node<'_>, name: &str, file_path: &Path) -> TestRecord {
-    // tree-sitter rows are zero-indexed usize; cap at u64::MAX defensively
-    // so the conversion never panics on impossibly large files.
-    let line = u64::try_from(func.start_position().row).unwrap_or(u64::MAX - 1) + 1;
+    // tree-sitter rows are zero-indexed `usize`. On every supported target
+    // `usize` is at most 64 bits, so the cast is exact; `saturating_add`
+    // converts to a 1-indexed line number without surfacing a bogus
+    // sentinel value at the theoretical `u64::MAX` boundary.
+    let row = func.start_position().row as u64;
+    let line = row.saturating_add(1);
     let body = func.child_by_field_name("body");
     let assertion_count = body.map_or(0, |b| count_asserts(b));
 

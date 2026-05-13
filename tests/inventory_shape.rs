@@ -99,8 +99,16 @@ fn inventory_project_fields_present() {
     let project_keys: BTreeSet<String> =
         ["path", "name"].iter().map(|s| (*s).to_string()).collect();
     assert_eq!(keys(&v["project"]), project_keys);
-    assert!(v["project"]["path"].is_string());
-    assert!(v["project"]["name"].is_string());
+
+    // The fixture lives under tests/fixtures/simple/, so `name` should be
+    // the parent directory's basename and `path` should end with that
+    // directory.
+    assert_eq!(v["project"]["name"], Value::String("simple".to_string()));
+    let project_path = v["project"]["path"].as_str().expect("project.path must be string");
+    assert!(
+        project_path.ends_with("tests/fixtures/simple"),
+        "project.path={project_path:?} should end with tests/fixtures/simple"
+    );
 }
 
 #[test]

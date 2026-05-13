@@ -40,6 +40,10 @@ fn main() -> ExitCode {
     match run(&cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
+            // Intentionally bypass `tracing` for the user-facing failure
+            // line: a `coati: <error>` line on stderr plus a non-zero exit
+            // is the standard CLI contract and must not be affected by
+            // `RUST_LOG` filtering.
             eprintln!("coati: {err:#}");
             ExitCode::FAILURE
         }

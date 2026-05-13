@@ -53,6 +53,10 @@ pub struct SlowTest {
 }
 
 /// One Python test-bearing file.
+///
+/// Only emitted when the file contains at least one `test_*` function.
+/// Non-test Python files (or test files with zero matching functions) are
+/// silently skipped and produce no [`FileRecord`].
 #[derive(Debug, Clone, Serialize)]
 pub struct FileRecord {
     pub path: PathBuf,
@@ -115,7 +119,9 @@ pub struct ToolInfo {
 }
 
 impl ToolInfo {
-    fn run_1_default() -> Self {
+    /// Defaults for a static-only run (no pytest, no coverage). Used by
+    /// every code path until Run 2 wires up runtime invocation.
+    fn without_runtime() -> Self {
         Self {
             name: "coati".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -179,7 +185,7 @@ pub fn run_static(path: &Path) -> Result<Inventory> {
         tests,
         sut_calls: SutCalls { by_name: Vec::new(), top_called: Vec::new() },
         top_suspicious: TopSuspicious { tests: Vec::new(), files: Vec::new() },
-        tool: ToolInfo::run_1_default(),
+        tool: ToolInfo::without_runtime(),
     })
 }
 
@@ -187,8 +193,23 @@ pub fn run_static(path: &Path) -> Result<Inventory> {
 /// directory containing the file, and `name` is that directory's basename.
 /// Phase 2 will replace this with real `pyproject.toml` parsing on a project
 /// root.
+///
+/// Canonicalization is best-effort: if it fails (broken symlink, permission
+/// denied, etc.) we log a warning via `tracing` and fall back to the raw
+/// input path so `run_static` can still complete. Phase 2's project-root
+/// discovery will tighten this contract.
 fn project_from_path(path: &Path) -> Project {
-    let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let abs = match std::fs::canonicalize(path) {
+        Ok(abs) => abs,
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "failed to canonicalize input path; falling back to non-canonical path"
+            );
+            path.to_path_buf()
+        }
+    };
     let dir = abs.parent().map_or_else(|| abs.clone(), Path::to_path_buf);
     let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
     Project { path: dir, name }
