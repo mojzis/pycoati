@@ -424,20 +424,11 @@ fn count_patch_decorators(decorated: Node<'_>, source: &[u8]) -> u64 {
 }
 
 /// Walk a `decorator` node and decide whether its decorator-expression is
-/// a `@patch`-shaped form. The decorator-expression is the first named
-/// child of the `decorator` node; it is either an `identifier`, an
-/// `attribute`, or a `call` whose `function` child is one of those.
+/// a `@patch`-shaped form. See [`decorator_target`] for the shared
+/// unwrap-bare-or-call-target logic.
 fn decorator_is_patch(decorator: Node<'_>, source: &[u8]) -> bool {
-    let Some(expr) = decorator.named_child(0) else {
+    let Some(target) = decorator_target(decorator) else {
         return false;
-    };
-    let target = if expr.kind() == "call" {
-        match expr.child_by_field_name("function") {
-            Some(f) => f,
-            None => return false,
-        }
-    } else {
-        expr
     };
     match target.kind() {
         "identifier" => target.utf8_text(source).is_ok_and(|t| t == "patch"),
@@ -449,8 +440,15 @@ fn decorator_is_patch(decorator: Node<'_>, source: &[u8]) -> bool {
             let Some(chain) = attribute_chain_text(target, source) else {
                 return false;
             };
-            let segments: Vec<&str> = chain.split('.').collect();
-            segments.first() == Some(&"patch") || segments.last() == Some(&"patch")
+            // Match when either end of the dotted chain is `patch`:
+            // - first segment `patch` covers `patch.object`, `patch.dict`,
+            //   and the bare `patch` after the early `==` check below.
+            // - last segment `patch` covers `mock.patch`,
+            //   `unittest.mock.patch`, etc.
+            let mut segments = chain.split('.');
+            let first = segments.next();
+            let last = segments.next_back().or(first);
+            first == Some("patch") || last == Some("patch")
         }
         _ => false,
     }
@@ -491,21 +489,27 @@ fn count_fixture_decorators(root: Node<'_>, source: &[u8]) -> u64 {
 /// parens) or `@fixture` (with or without parens). Anything else is
 /// not a pytest fixture decoration for counting purposes.
 fn decorator_is_fixture(decorator: Node<'_>, source: &[u8]) -> bool {
-    let Some(expr) = decorator.named_child(0) else {
+    let Some(target) = decorator_target(decorator) else {
         return false;
-    };
-    let target = if expr.kind() == "call" {
-        match expr.child_by_field_name("function") {
-            Some(f) => f,
-            None => return false,
-        }
-    } else {
-        expr
     };
     match target.kind() {
         "identifier" => target.utf8_text(source).is_ok_and(|t| t == "fixture"),
         "attribute" => attribute_chain_text(target, source).is_some_and(|c| c == "pytest.fixture"),
         _ => false,
+    }
+}
+
+/// Unwrap a `decorator` node to the identifier-or-attribute that names
+/// the decorator. For `@foo` and `@a.b` returns the `foo` / `a.b` node;
+/// for `@foo(...)` and `@a.b(...)` returns the `function` child of the
+/// inner `call`. Returns `None` for shapes we don't classify (subscripts,
+/// lambdas, etc.).
+fn decorator_target(decorator: Node<'_>) -> Option<Node<'_>> {
+    let expr = decorator.named_child(0)?;
+    if expr.kind() == "call" {
+        expr.child_by_field_name("function")
+    } else {
+        Some(expr)
     }
 }
 
@@ -566,49 +570,41 @@ fn record_import_from(stmt: Node<'_>, source: &[u8], map: &mut ImportMap) {
         return;
     };
 
-    // Star import: tree-sitter-python represents `*` as a `wildcard_import`
-    // node sibling. No alias-map entry — record only the source module.
-    let mut cursor = stmt.walk();
-    let mut is_star = false;
-    for child in stmt.children(&mut cursor) {
-        if child.kind() == "wildcard_import" {
-            is_star = true;
-            break;
-        }
-    }
-    if is_star {
-        map.star_sources.insert(source_module);
-        return;
-    }
-
-    // For named imports, walk the `name` field children. tree-sitter-python
-    // can structure `from m import a, b` either via repeated `name`
-    // fields or as a list under a single name node; iterate every named
-    // child after the module_name and look at each `dotted_name` /
-    // `aliased_import`.
+    // Single pass over named children:
+    // * `wildcard_import` short-circuits to recording only the source module
+    //   (no alias entries; star imports bind an unknown set of names).
+    // * `dotted_name` and `aliased_import` produce alias-map entries.
+    // tree-sitter-python represents `from m import *` as a `wildcard_import`
+    // sibling, and `from m import a, b` as repeated named children.
+    let mut buffered: Vec<(String, String)> = Vec::new();
     let mut cursor = stmt.walk();
     for child in stmt.named_children(&mut cursor) {
         if child.id() == module_node.id() {
             continue;
         }
         match child.kind() {
+            "wildcard_import" => {
+                map.star_sources.insert(source_module);
+                return;
+            }
             "dotted_name" => {
                 if let Some(local) = attribute_or_dotted_text(child, source) {
                     let local_head = local.split('.').next().unwrap_or(&local).to_string();
-                    map.aliases.insert(local_head, source_module.clone());
+                    buffered.push((local_head, source_module.clone()));
                 }
             }
             "aliased_import" => {
-                if let (Some(_name_node), Some(alias_node)) =
-                    (child.child_by_field_name("name"), child.child_by_field_name("alias"))
-                {
+                if let Some(alias_node) = child.child_by_field_name("alias") {
                     if let Ok(alias) = alias_node.utf8_text(source) {
-                        map.aliases.insert(alias.to_string(), source_module.clone());
+                        buffered.push((alias.to_string(), source_module.clone()));
                     }
                 }
             }
             _ => {}
         }
+    }
+    for (local, src) in buffered {
+        map.aliases.insert(local, src);
     }
 }
 
@@ -1230,9 +1226,13 @@ def test_top_level():
             parsed.test_functions.iter().map(|t| (t.nodeid.as_str(), &t.called_names)).collect();
         let cls =
             by_id.get("synthetic.py::TestT::test_method").expect("class-nested record present");
-        assert!(!cls.is_empty(), "class-nested test should have called_names");
+        assert_eq!(*cls, &vec!["repo.save".to_string()]);
         let top = by_id.get("synthetic.py::test_top_level").expect("top-level record present");
-        assert!(!top.is_empty(), "top-level test should have called_names");
+        // `Service().run()` chains a call onto another call — only `Service`
+        // is a pure attribute chain at the function child of the outermost
+        // call expression; the `.run()` callable's function child is itself
+        // a `call`, which `call_head_chain` returns `None` for.
+        assert_eq!(*top, &vec!["Service".to_string()]);
     }
 
     // ---- ImportMap construction (optional Phase 1 work) -------------------
