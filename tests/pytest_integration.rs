@@ -33,6 +33,49 @@ fn hyphen_fixture_root() -> PathBuf {
     p
 }
 
+/// Recursively copy a fixture tree into `dst`, skipping the build artifacts
+/// pytest/coverage.py leave behind. We use this to give each integration
+/// test that targets `hyphen_project` its own writable copy: `pytest-cov`
+/// writes `.coverage` (and `.pytest_cache/`) to the project root, and two
+/// tests pointed at the same directory race on those files in parallel
+/// `cargo test` runs — see the test docstrings below for the failure mode
+/// (the override test would observe a non-null coverage value leaked from
+/// the default test). Tempdir copies eliminate the race and also keep the
+/// source tree clean.
+fn copy_fixture_tree(src: &Path, dst: &Path) {
+    for entry in std::fs::read_dir(src).expect("read fixture dir") {
+        let entry = entry.expect("dir entry");
+        let name = entry.file_name();
+        // Skip artifacts a previous run may have left in the source tree.
+        let name_str = name.to_string_lossy();
+        if matches!(name_str.as_ref(), ".coverage" | ".pytest_cache" | "__pycache__" | ".coati") {
+            continue;
+        }
+        let src_path = entry.path();
+        let dst_path = dst.join(&name);
+        let ft = entry.file_type().expect("file type");
+        if ft.is_dir() {
+            std::fs::create_dir_all(&dst_path).expect("create dir in tempdir");
+            copy_fixture_tree(&src_path, &dst_path);
+        } else if ft.is_file() {
+            std::fs::copy(&src_path, &dst_path).expect("copy fixture file");
+        }
+        // Symlinks / others: fixture tree has none today; skip if encountered.
+    }
+}
+
+/// Stage the hyphenated-distribution fixture in a fresh tempdir and return
+/// the (`TempDir` guard, project root) pair. Holding the guard alive for the
+/// duration of the test keeps the tempdir on disk; dropping it removes the
+/// copy plus any `.coverage` / `.pytest_cache` pytest-cov writes there.
+fn staged_hyphen_fixture() -> (tempfile::TempDir, PathBuf) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("hyphen_project");
+    std::fs::create_dir_all(&root).expect("create staged fixture root");
+    copy_fixture_tree(&hyphen_fixture_root(), &root);
+    (tmp, root)
+}
+
 /// Whitespace-split a command-line string into program + args.
 fn split_command(cmd: &str) -> Option<(String, Vec<String>)> {
     let mut tokens = cmd.split_whitespace();
@@ -493,9 +536,17 @@ fn hyphenated_pyproject_name_produces_non_zero_coverage_via_default() {
         return;
     }
 
+    // Per-test staged copy: `pytest-cov` writes `.coverage` (and a
+    // `.pytest_cache/`) into the project root. The sibling override test
+    // also targets this fixture; under parallel `cargo test` execution
+    // they would race on those files and the override test could see
+    // coverage data leaked from this one. Staging in a tempdir per test
+    // eliminates the race and keeps the source tree clean.
+    let (_guard, fixture_root) = staged_hyphen_fixture();
+
     let assert = Command::cargo_bin("coati")
         .expect("binary built")
-        .arg(hyphen_fixture_root())
+        .arg(&fixture_root)
         .arg("--python")
         .arg(&python)
         .assert()
@@ -548,9 +599,15 @@ fn cli_project_package_override_with_hyphen_is_passed_verbatim() {
         return;
     }
 
+    // Per-test staged copy — see the sibling default test for the race
+    // this avoids. With both tests sharing the source-tree fixture, the
+    // override test below would intermittently observe coverage > 0
+    // leaked from the default test's `.coverage` write.
+    let (_guard, fixture_root) = staged_hyphen_fixture();
+
     let assert = Command::cargo_bin("coati")
         .expect("binary built")
-        .arg(hyphen_fixture_root())
+        .arg(&fixture_root)
         .arg("--python")
         .arg(&python)
         .arg("--project-package")
@@ -558,6 +615,7 @@ fn cli_project_package_override_with_hyphen_is_passed_verbatim() {
         .assert()
         .success();
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf-8 stdout");
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).expect("utf-8 stderr");
     let v: Value = serde_json::from_str(&stdout).expect("stdout is valid JSON");
 
     // Verbatim hyphen reaches `--cov=` → pytest-cov can't import it →
@@ -568,4 +626,15 @@ fn cli_project_package_override_with_hyphen_is_passed_verbatim() {
         "explicit --project-package override must be verbatim — a hyphenated override should NOT silently become an importable module"
     );
     assert_eq!(v["tool"]["ran_coverage"], Value::Bool(false));
+
+    // Direct assertion on coati's own contract: when coverage produces no
+    // data, coati emits a structured WARN naming the failure mode. This
+    // tightens the test from "observe null coverage" (which depends on
+    // pytest-cov's specific behaviour with an invalid `--cov=` value) to
+    // "coati surfaced the no-data path with a non-zero pytest exit",
+    // which is the message coati itself owns in `src/coverage.rs`.
+    assert!(
+        stderr.contains("no coverage data produced"),
+        "expected coati to emit its 'no coverage data produced' WARN when the verbatim hyphenated override fails to resolve to a module, stderr was: {stderr}"
+    );
 }
