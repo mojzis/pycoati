@@ -372,7 +372,8 @@ pub fn run_with_pytest(
 
     let mut ran_coverage = false;
     if !no_coverage {
-        let pkg = project_package_override.map_or_else(|| inv.project.name.clone(), str::to_string);
+        let pkg = project_package_override
+            .map_or_else(|| default_cov_package_for(&inv.project.name), str::to_string);
         if pkg.is_empty() {
             tracing::warn!("no project package name available; skipping coverage");
         } else {
@@ -680,5 +681,44 @@ fn canonicalize_or_warn(path: &Path) -> PathBuf {
             );
             path.to_path_buf()
         }
+    }
+}
+
+/// Normalize a project distribution name into the importable Python module
+/// name that `pytest --cov=<NAME>` expects. Hyphens are never valid in Python
+/// identifiers, so a hyphenated distribution name like `my-pkg` (which maps to
+/// an importable `my_pkg` module by convention) would otherwise cause
+/// `pytest-cov` to emit `module-not-imported`. This is **hyphens-only**: we
+/// do not lowercase, strip dots, or perform full PEP 503 normalization —
+/// YAGNI until a confirmed failing case demands it.
+///
+/// Only applied to the auto-derived default. An explicit
+/// `--project-package <value>` override is passed verbatim, since the user
+/// knows what they typed.
+fn default_cov_package_for(project_name: &str) -> String {
+    project_name.replace('-', "_")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_cov_package_for;
+
+    #[test]
+    fn default_cov_package_for_replaces_hyphens_with_underscores() {
+        assert_eq!(default_cov_package_for("b3d-validate"), "b3d_validate");
+        assert_eq!(default_cov_package_for("gh-project-monitor"), "gh_project_monitor");
+    }
+
+    #[test]
+    fn default_cov_package_for_passes_through_already_valid_names() {
+        assert_eq!(default_cov_package_for("already_fine"), "already_fine");
+        assert_eq!(default_cov_package_for("myproj"), "myproj");
+    }
+
+    #[test]
+    fn default_cov_package_for_does_not_lowercase_or_strip_dots() {
+        // YAGNI guard: this helper is hyphens-only by design.
+        assert_eq!(default_cov_package_for("MyPkg"), "MyPkg");
+        assert_eq!(default_cov_package_for("ns.sub"), "ns.sub");
     }
 }

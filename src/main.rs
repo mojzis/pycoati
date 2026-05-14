@@ -80,7 +80,15 @@ struct Cli {
 
     /// Project package name to pass to `pytest --cov=<NAME>`. Defaults to
     /// the discovered `[project].name` in `pyproject.toml`, falling back
-    /// to the project directory's basename.
+    /// to the project directory's basename. Hyphens in the discovered name
+    /// are converted to underscores for the default (since `--cov=` needs
+    /// an importable Python module name, and hyphens are never valid in
+    /// Python identifiers — e.g. `my-pkg` becomes `--cov=my_pkg`).
+    ///
+    /// For unusual layouts (monorepos with no top-level package, or names
+    /// that diverge from the distribution name by more than hyphens), pass
+    /// `--project-package <module-name>` explicitly. The override is used
+    /// verbatim — no normalization is applied.
     #[arg(long, value_name = "NAME")]
     project_package: Option<String>,
 

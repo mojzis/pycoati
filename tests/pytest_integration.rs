@@ -27,6 +27,12 @@ fn fixture_root() -> PathBuf {
     p
 }
 
+fn hyphen_fixture_root() -> PathBuf {
+    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    p.push("tests/fixtures/hyphen_project");
+    p
+}
+
 /// Whitespace-split a command-line string into program + args.
 fn split_command(cmd: &str) -> Option<(String, Vec<String>)> {
     let mut tokens = cmd.split_whitespace();
@@ -468,4 +474,98 @@ fn collection_survives_repo_addopts_with_cov_flag() {
         Some(2),
         "expected test_count == Some(2) when repo addopts is `--cov=does_not_exist`, got {test_count:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5 — hyphen-to-underscore normalization for the auto-derived --cov=
+// ---------------------------------------------------------------------------
+
+/// When `[project].name` is hyphenated (`my-pkg`), the importable module is
+/// conventionally the underscored form (`my_pkg`). Coati must normalize the
+/// auto-derived default so `pytest --cov=my_pkg` finds the module — *without*
+/// the normalization, pytest-cov emits `module-not-imported` and coverage
+/// stays null. The override path is verified separately to remain verbatim.
+#[test]
+fn hyphenated_pyproject_name_produces_non_zero_coverage_via_default() {
+    let python = integration_python();
+    if !pytest_available(&python) {
+        eprintln!("SKIPPED: pytest not available via `{python}`");
+        return;
+    }
+
+    let assert = Command::cargo_bin("coati")
+        .expect("binary built")
+        .arg(hyphen_fixture_root())
+        .arg("--python")
+        .arg(&python)
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf-8 stdout");
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).expect("utf-8 stderr");
+    let v: Value = serde_json::from_str(&stdout).expect("stdout is valid JSON");
+
+    // The display name in the inventory keeps the original hyphenated form;
+    // only the `--cov=` target gets normalized.
+    assert_eq!(
+        v["project"]["name"],
+        Value::String("my-pkg".to_string()),
+        "project.name must remain the original hyphenated distribution name"
+    );
+
+    // Coverage actually ran and reported a real percentage — *not* null.
+    let cov = v["suite"]["line_coverage_pct"].as_f64();
+    assert!(
+        cov.is_some(),
+        "line_coverage_pct must be populated when the hyphenated name is normalized to an importable module, got {:?} (stderr: {stderr})",
+        v["suite"]["line_coverage_pct"]
+    );
+    assert!(
+        cov.unwrap() > 0.0,
+        "expected non-zero coverage from my_pkg.greet exercised by test_greet_says_hi, got {cov:?}"
+    );
+    assert_eq!(v["tool"]["ran_coverage"], Value::Bool(true));
+
+    // Negative assertion: pytest-cov's `module-not-imported` warning must NOT
+    // appear on stderr, since that's the exact regression this fix targets.
+    assert!(
+        !stderr.contains("module-not-imported"),
+        "default-derived --cov= must resolve to an importable module, got: {stderr}"
+    );
+}
+
+/// The verbatim-override contract: when the user passes
+/// `--project-package <value>`, the value goes straight into `--cov=<value>`
+/// with no normalization. We prove this *behaviourally* by overriding the
+/// hyphen fixture with the hyphenated form `my-pkg` (the distribution name as
+/// written in pyproject.toml). If the override were silently rewritten to
+/// `my_pkg` it would actually succeed; we assert the opposite — that the
+/// invalid hyphenated module name reaches pytest-cov and coverage degrades.
+#[test]
+fn cli_project_package_override_with_hyphen_is_passed_verbatim() {
+    let python = integration_python();
+    if !pytest_available(&python) {
+        eprintln!("SKIPPED: pytest not available via `{python}`");
+        return;
+    }
+
+    let assert = Command::cargo_bin("coati")
+        .expect("binary built")
+        .arg(hyphen_fixture_root())
+        .arg("--python")
+        .arg(&python)
+        .arg("--project-package")
+        .arg("my-pkg")
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf-8 stdout");
+    let v: Value = serde_json::from_str(&stdout).expect("stdout is valid JSON");
+
+    // Verbatim hyphen reaches `--cov=` → pytest-cov can't import it →
+    // coverage stays null. If normalization had been (incorrectly) applied
+    // to the override path, this would have been > 0.
+    assert_eq!(
+        v["suite"]["line_coverage_pct"], Value::Null,
+        "explicit --project-package override must be verbatim — a hyphenated override should NOT silently become an importable module"
+    );
+    assert_eq!(v["tool"]["ran_coverage"], Value::Bool(false));
 }
