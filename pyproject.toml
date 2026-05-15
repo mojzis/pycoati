@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "coati"
-description = "A new tool"
+description = "Audit Python test suites for mock smells and suspicious tests"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}

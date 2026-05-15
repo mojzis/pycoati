@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-coati is a new tool. Hybrid Rust/Python project: builds a Rust binary (`coati`) and packages it as a Python package via maturin for distribution through pip/uv.
+coati audits Python test suites for mock smells and suspicious tests. Hybrid Rust/Python project: builds a Rust binary (`coati`) and packages it as a Python package via maturin for distribution through pip/uv.
 
 ## Common Commands
 
