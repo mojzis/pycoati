@@ -41,7 +41,37 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use crate::{FileRecord, Inventory, Project, TestRecord};
+use crate::{FileRecord, Inventory, Project, TestRecord, WorkspaceInventory};
+
+/// Render a [`WorkspaceInventory`] as plain text: a workspace-level
+/// header naming the basename + member count, followed by one section
+/// per member. Each member section is rendered via the existing
+/// [`render`] helper so the per-member output is unchanged.
+pub fn render_workspace(ws: &WorkspaceInventory, top_n: usize) -> String {
+    let mut out = String::new();
+    let basename = ws.workspace_root.file_name().and_then(|n| n.to_str()).unwrap_or("workspace");
+    let header = format!("pycoati workspace audit — {basename} ({} members)", ws.members.len());
+    out.push_str(&header);
+    out.push('\n');
+    for _ in 0..header.chars().count() {
+        out.push('=');
+    }
+    out.push('\n');
+    for inv in &ws.members {
+        out.push('\n');
+        let member_name =
+            inv.project.path.file_name().and_then(|n| n.to_str()).unwrap_or(&inv.project.name);
+        let section = format!("Member: {member_name}");
+        out.push_str(&section);
+        out.push('\n');
+        for _ in 0..section.chars().count() {
+            out.push('-');
+        }
+        out.push('\n');
+        out.push_str(&render(inv, top_n));
+    }
+    out
+}
 
 /// Render the inventory as plain text using `top_n` for both the test and
 /// file suspicious sections. Returns the formatted string; the caller writes
@@ -657,6 +687,35 @@ mod tests {
         render_title(&mut out, &project);
         let first_line = out.lines().next().expect("title line present");
         assert_eq!(first_line, "pycoati audit — demo");
+    }
+
+    #[test]
+    fn render_workspace_emits_header_and_per_member_sections() {
+        use crate::{ToolInfo, WorkspaceInventory};
+
+        let mut a = empty_inv();
+        a.project = Project { path: PathBuf::from("/ws/pkg_a"), name: "pkg_a".to_string() };
+        let mut b = empty_inv();
+        b.project = Project { path: PathBuf::from("/ws/pkg_b"), name: "pkg_b".to_string() };
+
+        let ws = WorkspaceInventory {
+            schema_version: "2".to_string(),
+            workspace_root: PathBuf::from("/ws"),
+            members: vec![a, b],
+            tool: ToolInfo::with_runtime(false, false),
+        };
+        let out = render_workspace(&ws, 5);
+
+        assert!(
+            out.contains("pycoati workspace audit — ws (2 members)"),
+            "expected workspace header naming basename + count, got:\n{out}"
+        );
+        assert!(out.contains("Member: pkg_a"), "missing pkg_a section, got:\n{out}");
+        assert!(out.contains("Member: pkg_b"), "missing pkg_b section, got:\n{out}");
+        // Per-member content is the existing render — assert at least one
+        // recognisable substring shows up so we haven't accidentally
+        // bypassed the member renderer.
+        assert!(out.contains("Suite"), "expected per-member Suite section, got:\n{out}");
     }
 
     #[test]

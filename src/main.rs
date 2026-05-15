@@ -115,6 +115,33 @@ struct Cli {
     /// payload; `pretty` emits the aligned-column plain-text view.
     #[arg(long, value_enum, default_value_t = Format::Json)]
     format: Format,
+
+    /// Where to anchor pytest's subprocess cwd when auditing a uv
+    /// workspace. `root` (default) runs every member's pytest from the
+    /// workspace root and addresses tests via `<member>/tests`.
+    /// `member` runs each member's pytest with cwd set to the member
+    /// dir so member-local `conftest.py` / `pytest.ini` files apply.
+    ///
+    /// No-op outside workspace mode — accepted for ergonomic reasons
+    /// (so scripts can pass it unconditionally) but silently ignored.
+    #[arg(long, value_enum, default_value_t = MemberCwd::Root, value_name = "WHERE")]
+    member_cwd: MemberCwd,
+}
+
+/// `--member-cwd` selector. Mirrors `pycoati::MemberCwd` one-to-one.
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum MemberCwd {
+    Root,
+    Member,
+}
+
+impl From<MemberCwd> for pycoati::MemberCwd {
+    fn from(value: MemberCwd) -> Self {
+        match value {
+            MemberCwd::Root => Self::Root,
+            MemberCwd::Member => Self::Member,
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -146,8 +173,8 @@ fn main() -> ExitCode {
 fn run(cli: &Cli) -> Result<()> {
     let top_n = cli.top_suspicious.unwrap_or(pycoati::DEFAULT_TOP_SUSPICIOUS);
 
-    let inventory = if cli.static_only {
-        pycoati::run_static_with_top_n(
+    let result = if cli.static_only {
+        pycoati::run_audit_static(
             &cli.path,
             cli.tests_dir.as_deref(),
             cli.project_package.as_deref(),
@@ -158,7 +185,7 @@ fn run(cli: &Cli) -> Result<()> {
             cli.python.as_deref().map(|s| s.split_whitespace().map(str::to_string).collect());
         let pytest_args: Vec<String> =
             cli.pytest_args.split_whitespace().map(str::to_string).collect();
-        pycoati::run_with_pytest(
+        pycoati::run_audit_with_pytest(
             &cli.path,
             cli.tests_dir.as_deref(),
             python_cmd.as_deref(),
@@ -166,14 +193,21 @@ fn run(cli: &Cli) -> Result<()> {
             cli.no_coverage,
             cli.project_package.as_deref(),
             top_n,
+            cli.member_cwd.into(),
         )?
     };
 
-    let payload = match cli.format {
-        Format::Json => {
-            serde_json::to_string_pretty(&inventory).context("failed to serialize inventory")?
+    let payload = match (&result, cli.format) {
+        (pycoati::AuditResult::Single(inv), Format::Json) => {
+            serde_json::to_string_pretty(inv).context("failed to serialize inventory")?
         }
-        Format::Pretty => pycoati::render_pretty(&inventory, top_n),
+        (pycoati::AuditResult::Single(inv), Format::Pretty) => pycoati::render_pretty(inv, top_n),
+        (pycoati::AuditResult::Workspace(ws), Format::Json) => {
+            serde_json::to_string_pretty(ws).context("failed to serialize workspace inventory")?
+        }
+        (pycoati::AuditResult::Workspace(ws), Format::Pretty) => {
+            pycoati::render_pretty_workspace(ws, top_n)
+        }
     };
 
     if let Some(out_path) = cli.output.as_ref() {

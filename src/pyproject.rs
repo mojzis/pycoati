@@ -25,6 +25,22 @@ struct Project {
 struct Tool {
     hatch: Option<Hatch>,
     setuptools: Option<Setuptools>,
+    uv: Option<Uv>,
+}
+
+/// `[tool.uv]` table. Today we only consume the optional `workspace`
+/// subtable — every other key uv supports is ignored.
+#[derive(Debug, Default, Deserialize)]
+struct Uv {
+    workspace: Option<UvWorkspace>,
+}
+
+/// `[tool.uv.workspace]` table. `members` is optional so a declared-but-
+/// empty workspace (no key at all) is distinguishable from
+/// `members = []` by inspecting `Some(vec![])` vs `None`.
+#[derive(Debug, Default, Deserialize)]
+struct UvWorkspace {
+    members: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -166,6 +182,25 @@ pub fn read_project_packages(root: &Path) -> Result<Vec<String>> {
     packages.sort();
     packages.dedup();
     Ok(packages)
+}
+
+/// Read `<root>/pyproject.toml` and return the declared
+/// `[tool.uv.workspace].members` list, if any.
+///
+/// Distinguishes three cases:
+/// - No `pyproject.toml`, no `[tool.uv.workspace]` table, or malformed
+///   TOML → `None` (treat as "no workspace declared").
+/// - `[tool.uv.workspace]` declared with no `members` key → `Some(vec![])`.
+///   Equivalent to declaring an explicit empty list.
+/// - `[tool.uv.workspace].members = [...]` → `Some(<list>)` verbatim.
+///
+/// Mirrors the silent-parse pattern of [`read_project_name`]: every error
+/// mode is folded into `None`, but parse failures still log at `warn` for
+/// observability.
+pub fn read_uv_workspace_members(root: &Path) -> Option<Vec<String>> {
+    let parsed = read_pyproject_silent(root)?;
+    let workspace = parsed.tool?.uv?.workspace?;
+    Some(workspace.members.unwrap_or_default())
 }
 
 /// Read + parse `pyproject.toml` without surfacing errors. Used by the
@@ -357,6 +392,81 @@ mod tests {
             .expect("write fixture");
         let pkgs = read_project_packages(tmp.path()).expect("ok");
         assert_eq!(pkgs, vec!["my_pkg".to_string()]);
+    }
+
+    #[test]
+    fn read_uv_workspace_members_returns_declared_list() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("pyproject.toml"),
+            "[project]\nname = \"root\"\n\n[tool.uv.workspace]\nmembers = [\"packages/*\", \"crates/foo\"]\n",
+        )
+        .expect("write fixture");
+        let members = read_uv_workspace_members(tmp.path()).expect("members present");
+        assert_eq!(members, vec!["packages/*".to_string(), "crates/foo".to_string()]);
+    }
+
+    #[test]
+    fn read_uv_workspace_members_returns_none_when_pyproject_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert_eq!(read_uv_workspace_members(tmp.path()), None);
+    }
+
+    #[test]
+    fn read_uv_workspace_members_returns_none_when_workspace_section_absent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("pyproject.toml"), "[project]\nname = \"root\"\n")
+            .expect("write fixture");
+        assert_eq!(read_uv_workspace_members(tmp.path()), None);
+    }
+
+    #[test]
+    fn read_uv_workspace_members_returns_none_when_malformed_toml() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("pyproject.toml"), "this = is = not = valid [[[")
+            .expect("write fixture");
+        assert_eq!(read_uv_workspace_members(tmp.path()), None);
+    }
+
+    #[test]
+    fn read_uv_workspace_members_empty_list_is_some_empty() {
+        // `members = []` is a distinct case from "no workspace declared":
+        // it explicitly declares the workspace with zero members.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("pyproject.toml"),
+            "[project]\nname = \"root\"\n\n[tool.uv.workspace]\nmembers = []\n",
+        )
+        .expect("write fixture");
+        let members = read_uv_workspace_members(tmp.path()).expect("members key present");
+        assert!(members.is_empty(), "explicit empty list should round-trip as Some(empty)");
+    }
+
+    #[test]
+    fn read_uv_workspace_members_workspace_table_without_members_is_some_empty() {
+        // `[tool.uv.workspace]` declared but no `members` key → same as
+        // empty list: the workspace exists but has no declared members.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("pyproject.toml"),
+            "[project]\nname = \"root\"\n\n[tool.uv.workspace]\n",
+        )
+        .expect("write fixture");
+        let members = read_uv_workspace_members(tmp.path()).expect("workspace table present");
+        assert!(members.is_empty());
+    }
+
+    #[test]
+    fn read_uv_workspace_members_wrong_type_returns_none() {
+        // `members = "packages/*"` (string, not list) is a serde shape
+        // error: the whole file fails to parse → None.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("pyproject.toml"),
+            "[project]\nname = \"root\"\n[tool.uv.workspace]\nmembers = \"packages/*\"\n",
+        )
+        .expect("write fixture");
+        assert_eq!(read_uv_workspace_members(tmp.path()), None);
     }
 
     #[test]

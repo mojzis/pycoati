@@ -30,6 +30,42 @@ pub(crate) mod smells;
 pub(crate) mod suspicion;
 pub(crate) mod sut_calls;
 pub mod walker;
+pub mod workspace;
+
+/// Top-level audit result for a CLI invocation.
+///
+/// Single-project inputs serialize as a bare [`Inventory`]; workspace
+/// inputs serialize as a [`WorkspaceInventory`] wrapper carrying the
+/// workspace-root path plus one inner `Inventory` per resolved member.
+/// Downstream tooling discriminates by the presence of the
+/// `workspace_root` key (a single-project payload never carries it).
+// `AuditResult` is built once per CLI invocation, serialized, then dropped;
+// it never sits in a hot collection. The `Inventory` variant being larger
+// than the workspace wrapper is by design — boxing it would just trade a
+// heap allocation for a noisier consumer API. Suppress the lint at the
+// type definition rather than the call sites.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
+pub enum AuditResult {
+    Single(Inventory),
+    Workspace(WorkspaceInventory),
+}
+
+/// Workspace-mode wrapper around a list of per-member [`Inventory`]s.
+///
+/// `schema_version` stays at `"2"` — the new shape is discriminated by
+/// the presence of `workspace_root`, not by a version bump. `tool`
+/// mirrors the single-project [`ToolInfo`] so consumers can read the
+/// pycoati version and `ran_pytest` / `ran_coverage` flags off the
+/// wrapper without descending into every member.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkspaceInventory {
+    pub schema_version: String,
+    pub workspace_root: PathBuf,
+    pub members: Vec<Inventory>,
+    pub tool: ToolInfo,
+}
 
 /// Top-level audit result. Every field is always serialized (no
 /// `skip_serializing_if`) so the on-the-wire shape is stable across runs.
@@ -187,6 +223,12 @@ pub fn render_pretty(inv: &Inventory, top_n: usize) -> String {
     pretty::render(inv, top_n)
 }
 
+/// Render a workspace audit as plain text. Mirrors [`render_pretty`] but
+/// emits a workspace header followed by one per-member section.
+pub fn render_pretty_workspace(ws: &WorkspaceInventory, top_n: usize) -> String {
+    pretty::render_workspace(ws, top_n)
+}
+
 /// Build an empty file-record for a single .py file. Counts are filled in by
 /// the caller after parsing.
 fn empty_file_record(path: &Path) -> FileRecord {
@@ -262,6 +304,12 @@ pub fn run_static_with_options(
 ///
 /// Used by the CLI to honor `--top-suspicious N`; library callers normally
 /// use the default-N variant.
+///
+/// **Bails when pointed at a uv-workspace root.** Callers that want
+/// workspace-aware dispatch must go through [`run_audit_static`]; this
+/// signature is reserved for the single-project / single-file paths so
+/// existing library consumers (e.g. `tests/inventory_shape.rs`) keep
+/// their `Inventory`-shaped return.
 pub fn run_static_with_top_n(
     path: &Path,
     tests_dir_override: Option<&Path>,
@@ -272,7 +320,15 @@ pub fn run_static_with_top_n(
         anyhow::bail!("path does not exist: {}", path.display());
     }
     if path.is_dir() {
-        run_static_dir_with_options(path, tests_dir_override, project_package_override, top_n)
+        // Workspace roots are off-limits to this entry point — the
+        // return type can't represent a workspace wrapper.
+        if let Some(_ws) = workspace::detect(path)? {
+            anyhow::bail!(
+                "{} is a uv workspace root; use run_audit_static for workspace-aware dispatch",
+                path.display()
+            );
+        }
+        run_static_dir_with_options(path, tests_dir_override, project_package_override, top_n, true)
     } else {
         if tests_dir_override.is_some() {
             anyhow::bail!(
@@ -282,6 +338,87 @@ pub fn run_static_with_top_n(
         }
         run_static_file_with_options(path, project_package_override, top_n)
     }
+}
+
+/// Workspace-aware static entry point.
+///
+/// Dispatches on the input path:
+/// - File → `Single(<existing single-file inventory>)`.
+/// - Dir with `[tool.uv.workspace]` declared in its pyproject →
+///   `Workspace(<wrapper with one Inventory per member>)`.
+/// - Dir without `[tool.uv.workspace]` → `Single(<single-project inventory>)`,
+///   with `strict_missing_tests = true` so a missing `tests/` produces a
+///   hard error instead of a silent empty inventory.
+///
+/// `tests_dir_override` and `project_package_override` are incompatible
+/// with workspace mode — passing them while pointing at a workspace
+/// root surfaces a clear error before any work runs.
+pub fn run_audit_static(
+    path: &Path,
+    tests_dir_override: Option<&Path>,
+    project_package_override: Option<&str>,
+    top_n: usize,
+) -> Result<AuditResult> {
+    if !path.exists() {
+        anyhow::bail!("path does not exist: {}", path.display());
+    }
+    if !path.is_dir() {
+        // File input: there is no workspace concept; reuse the existing
+        // single-file path verbatim.
+        if tests_dir_override.is_some() {
+            anyhow::bail!(
+                "--tests-dir is only meaningful with a project-directory input (got file: {})",
+                path.display()
+            );
+        }
+        let inv = run_static_file_with_options(path, project_package_override, top_n)?;
+        return Ok(AuditResult::Single(inv));
+    }
+
+    if let Some(ws) = workspace::detect(path)? {
+        if tests_dir_override.is_some() {
+            anyhow::bail!(
+                "--tests-dir is incompatible with a uv-workspace root ({}); set it per-member instead",
+                path.display()
+            );
+        }
+        if project_package_override.is_some() {
+            anyhow::bail!(
+                "--project-package is incompatible with a uv-workspace root ({}); each member's pyproject declares its own package",
+                path.display()
+            );
+        }
+        let wsi = run_workspace_static(&ws, top_n)?;
+        return Ok(AuditResult::Workspace(wsi));
+    }
+
+    let inv = run_static_dir_with_options(
+        path,
+        tests_dir_override,
+        project_package_override,
+        top_n,
+        true,
+    )?;
+    Ok(AuditResult::Single(inv))
+}
+
+/// Static-mode pass for every workspace member. Per-member, runs the
+/// existing single-project pipeline with `strict_missing_tests = false`
+/// so a member without `tests/` skips with a `warn!` rather than aborting
+/// the whole workspace audit.
+fn run_workspace_static(ws: &workspace::Workspace, top_n: usize) -> Result<WorkspaceInventory> {
+    let mut members: Vec<Inventory> = Vec::with_capacity(ws.members.len());
+    for member in &ws.members {
+        let inv = run_static_dir_with_options(member, None, None, top_n, false)
+            .with_context(|| format!("auditing workspace member {}", member.display()))?;
+        members.push(inv);
+    }
+    Ok(WorkspaceInventory {
+        schema_version: "2".to_string(),
+        workspace_root: ws.root.clone(),
+        members,
+        tool: ToolInfo::without_runtime(),
+    })
 }
 
 /// Full-fat entry point.
@@ -317,6 +454,8 @@ pub fn run_with_pytest(
     project_package_override: Option<&str>,
     top_n: usize,
 ) -> Result<Inventory> {
+    // `run_static_with_top_n` already bails on workspace roots; this
+    // propagates that contract to the pytest path.
     let mut inv =
         run_static_with_top_n(project, tests_dir_override, project_package_override, top_n)?;
 
@@ -337,14 +476,51 @@ pub fn run_with_pytest(
     let tests_dir =
         tests_dir_override.map_or_else(|| inv.project.path.join("tests"), Path::to_path_buf);
     let project_root = inv.project.path.clone();
+    let pkg = project_package_override
+        .map_or_else(|| default_cov_package_for(&inv.project.name), str::to_string);
 
+    invoke_pytest_for_inventory(
+        &mut inv,
+        &program,
+        &extra_python_args,
+        &project_root,
+        &tests_dir,
+        &pkg,
+        pytest_args,
+        no_coverage,
+    );
+    Ok(inv)
+}
+
+/// Run the pytest collection/durations/coverage trio against an already-
+/// resolved interpreter + cwd + tests dir, mutating `inv` with the
+/// dynamic fields. Does NOT detect python — callers are expected to
+/// resolve `program` / `extra_python_args` themselves (the single-
+/// project path detects via `python_detect::detect_python_cmd`; the
+/// workspace path detects once at the workspace root and reuses).
+///
+/// `project_package` is passed verbatim to `--cov=`; an empty string
+/// suppresses the coverage subprocess with a `warn!`. Single-project
+/// callers normalize their own default via [`default_cov_package_for`];
+/// workspace callers read each member's pyproject.
+#[allow(clippy::too_many_arguments)]
+fn invoke_pytest_for_inventory(
+    inv: &mut Inventory,
+    program: &str,
+    extra_python_args: &[String],
+    subprocess_cwd: &Path,
+    tests_dir: &Path,
+    project_package: &str,
+    pytest_args: &[String],
+    no_coverage: bool,
+) {
     // Preflight: probe `import pytest` against the resolved interpreter
     // before firing the three pytest subprocesses. When the import fails
     // we emit a single WARN naming the interpreter + a recovery hint and
     // proceed: static analysis still runs, and the dynamic fields stay
     // null in the emitted JSON. This is purely advisory — we do **not**
     // abort, because the static portion of the inventory is still useful.
-    if !pytest::pytest_available(&program, &extra_python_args, &project_root) {
+    if !pytest::pytest_available(program, extra_python_args, subprocess_cwd) {
         let extras = extra_python_args.join(" ");
         let separator = if extras.is_empty() { "" } else { " " };
         tracing::warn!(
@@ -352,15 +528,10 @@ pub fn run_with_pytest(
         );
     }
 
-    let collection = pytest::run_collection(
-        &program,
-        &extra_python_args,
-        &project_root,
-        &tests_dir,
-        pytest_args,
-    );
+    let collection =
+        pytest::run_collection(program, extra_python_args, subprocess_cwd, tests_dir, pytest_args);
     let durations =
-        pytest::run_durations(&program, &extra_python_args, &project_root, &tests_dir, pytest_args);
+        pytest::run_durations(program, extra_python_args, subprocess_cwd, tests_dir, pytest_args);
 
     let ran_pytest = collection.test_count.is_some()
         || !durations.slowest_tests.is_empty()
@@ -372,18 +543,16 @@ pub fn run_with_pytest(
 
     let mut ran_coverage = false;
     if !no_coverage {
-        let pkg = project_package_override
-            .map_or_else(|| default_cov_package_for(&inv.project.name), str::to_string);
-        if pkg.is_empty() {
+        if project_package.is_empty() {
             tracing::warn!("no project package name available; skipping coverage");
         } else {
             let cov = coverage::run_coverage(
-                &program,
-                &extra_python_args,
-                &project_root,
-                &tests_dir,
+                program,
+                extra_python_args,
+                subprocess_cwd,
+                tests_dir,
                 pytest_args,
-                &pkg,
+                project_package,
             );
             inv.suite.line_coverage_pct = cov;
             ran_coverage = cov.is_some();
@@ -391,7 +560,189 @@ pub fn run_with_pytest(
     }
 
     inv.tool = ToolInfo::with_runtime(ran_pytest, ran_coverage);
-    Ok(inv)
+}
+
+/// Where to anchor pytest's subprocess cwd when auditing a uv workspace.
+///
+/// `Root` (the default) keeps cwd at the workspace root and passes the
+/// tests dir + `--cov=<pkg>` relative to it. This works well when the
+/// member packages are installed into the workspace's single `.venv`
+/// and importable by their distribution name.
+///
+/// `Member` runs each member's pytest with cwd set to the member dir.
+/// Use this when a member ships its own `conftest.py` / `pytest.ini`
+/// that only makes sense when pytest is invoked from inside the member.
+#[derive(Copy, Clone, Debug)]
+pub enum MemberCwd {
+    Root,
+    Member,
+}
+
+/// Workspace-aware full-fat entry point.
+///
+/// Mirrors [`run_audit_static`] for the pytest-enabled path: dispatches
+/// on file vs single-project-dir vs workspace-root, runs the three
+/// pytest subprocesses once per member, and wraps the results in an
+/// [`AuditResult`].
+///
+/// Python is detected **once** at the workspace root and reused for
+/// every member — uv workspaces always share a single `.venv` at the
+/// root, so per-member detection would waste work and risk picking up
+/// an unrelated nested venv.
+#[allow(clippy::too_many_arguments)]
+pub fn run_audit_with_pytest(
+    path: &Path,
+    tests_dir_override: Option<&Path>,
+    python_cmd: Option<&[String]>,
+    pytest_args: &[String],
+    no_coverage: bool,
+    project_package_override: Option<&str>,
+    top_n: usize,
+    member_cwd: MemberCwd,
+) -> Result<AuditResult> {
+    if !path.exists() {
+        anyhow::bail!("path does not exist: {}", path.display());
+    }
+
+    if !path.is_dir() {
+        // File input: identical to the single-file pytest path (which is
+        // a no-op past the static pass).
+        let inv = run_with_pytest(
+            path,
+            tests_dir_override,
+            python_cmd,
+            pytest_args,
+            no_coverage,
+            project_package_override,
+            top_n,
+        )?;
+        return Ok(AuditResult::Single(inv));
+    }
+
+    if let Some(ws) = workspace::detect(path)? {
+        if tests_dir_override.is_some() {
+            anyhow::bail!(
+                "--tests-dir is incompatible with a uv-workspace root ({}); set it per-member instead",
+                path.display()
+            );
+        }
+        if project_package_override.is_some() {
+            anyhow::bail!(
+                "--project-package is incompatible with a uv-workspace root ({}); each member's pyproject declares its own package",
+                path.display()
+            );
+        }
+        let wsi = run_workspace_with_pytest(
+            &ws,
+            python_cmd,
+            pytest_args,
+            no_coverage,
+            top_n,
+            member_cwd,
+        )?;
+        return Ok(AuditResult::Workspace(wsi));
+    }
+
+    let inv = run_with_pytest(
+        path,
+        tests_dir_override,
+        python_cmd,
+        pytest_args,
+        no_coverage,
+        project_package_override,
+        top_n,
+    )?;
+    Ok(AuditResult::Single(inv))
+}
+
+/// Run static + pytest for each workspace member, sharing one detected
+/// python across the lot.
+fn run_workspace_with_pytest(
+    ws: &workspace::Workspace,
+    python_cmd: Option<&[String]>,
+    pytest_args: &[String],
+    no_coverage: bool,
+    top_n: usize,
+    member_cwd: MemberCwd,
+) -> Result<WorkspaceInventory> {
+    // Detect python ONCE at the workspace root. The whole point of
+    // workspace mode is that all members share the same interpreter.
+    let detected;
+    let resolved_cmd: &[String] = if let Some(cmd) = python_cmd {
+        cmd
+    } else {
+        detected = python_detect::detect_python_cmd(&ws.root);
+        &detected
+    };
+    let (program, extra_python_args) = split_python_cmd(resolved_cmd);
+
+    let mut members: Vec<Inventory> = Vec::with_capacity(ws.members.len());
+    let mut any_ran_pytest = false;
+    let mut any_ran_coverage = false;
+    for member in &ws.members {
+        let mut inv = run_static_dir_with_options(member, None, None, top_n, false)
+            .with_context(|| format!("auditing workspace member {}", member.display()))?;
+
+        // Workspace member without a `tests/` dir was skipped with a warn
+        // and a zero-test inventory. Don't fire pytest at a member that
+        // has nothing to run.
+        if !member.join("tests").is_dir() {
+            members.push(inv);
+            continue;
+        }
+
+        // Per-member cwd is either the workspace root (default) or the
+        // member dir, per `--member-cwd`. The tests path is rendered
+        // relative to whichever cwd we picked so pytest's
+        // collection/durations/coverage all see the same paths.
+        let (subprocess_cwd, tests_dir) = match member_cwd {
+            MemberCwd::Root => (ws.root.clone(), member.join("tests")),
+            MemberCwd::Member => (member.clone(), PathBuf::from("tests")),
+        };
+
+        // Each member declares its own importable package via its
+        // pyproject; reuse the existing pyproject reader to find the
+        // first declared package name.
+        let pkg = member_cov_package(member);
+
+        invoke_pytest_for_inventory(
+            &mut inv,
+            &program,
+            &extra_python_args,
+            &subprocess_cwd,
+            &tests_dir,
+            &pkg,
+            pytest_args,
+            no_coverage,
+        );
+        if inv.tool.ran_pytest {
+            any_ran_pytest = true;
+        }
+        if inv.tool.ran_coverage {
+            any_ran_coverage = true;
+        }
+        members.push(inv);
+    }
+
+    Ok(WorkspaceInventory {
+        schema_version: "2".to_string(),
+        workspace_root: ws.root.clone(),
+        members,
+        tool: ToolInfo::with_runtime(any_ran_pytest, any_ran_coverage),
+    })
+}
+
+/// Pick the `--cov=<pkg>` argument for a workspace member from its
+/// pyproject. Falls back to the member directory's basename when no
+/// `[project].name` (or other declared package) is available, mirroring
+/// the single-project default-derivation pattern.
+fn member_cov_package(member: &Path) -> String {
+    let packages = pyproject::read_project_packages(member).unwrap_or_default();
+    if let Some(first) = packages.into_iter().next() {
+        first
+    } else {
+        member.file_name().and_then(|n| n.to_str()).map_or_else(String::new, str::to_string)
+    }
 }
 
 /// Split a whitespace-tokenised python command into program + extra args.
@@ -464,11 +815,20 @@ fn run_static_file_with_options(
 /// Directory path: discover tests, parse each, aggregate. Per-file parse
 /// failures are logged and the file is skipped — the run as a whole must
 /// not abort just because one fixture is malformed.
+///
+/// `strict_missing_tests` toggles the missing-`tests/` behaviour:
+/// - `true` (single-project default): a missing `tests_dir` is a hard
+///   error. This is the new Run-4 contract — silently emitting an empty
+///   inventory was masking misconfigured projects.
+/// - `false` (workspace per-member): a missing `tests_dir` warns and
+///   returns an empty inventory. The workspace wrapper still lists the
+///   member; just with zero discovered tests.
 fn run_static_dir_with_options(
     project_root: &Path,
     tests_dir_override: Option<&Path>,
     project_package_override: Option<&str>,
     top_n: usize,
+    strict_missing_tests: bool,
 ) -> Result<Inventory> {
     let project = project_from_root(project_root);
     let mut inv = empty_inventory(project);
@@ -477,6 +837,12 @@ fn run_static_dir_with_options(
         tests_dir_override.map_or_else(|| inv.project.path.join("tests"), Path::to_path_buf);
 
     if !tests_dir.exists() {
+        if strict_missing_tests {
+            anyhow::bail!(
+                "no tests directory at {}; not a workspace either (no [tool.uv.workspace] in pyproject.toml)",
+                tests_dir.display()
+            );
+        }
         tracing::warn!(
             tests_dir = %tests_dir.display(),
             "tests directory not found; emitting empty inventory"
