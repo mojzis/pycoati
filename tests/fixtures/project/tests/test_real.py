@@ -1,4 +1,4 @@
-# coati-expected: tests=1 asserts=2
+# pycoati-expected: tests=1 asserts=2
 import myproj
 
 

@@ -42,7 +42,7 @@ pub fn run_coverage(
     // override in `pytest::run_collection` for the rationale. The coverage
     // pass is especially sensitive to inherited addopts because the
     // project's own `--cov=…` would overwrite the `--cov-report=json:…`
-    // path that coati relies on for the report file.
+    // path that pycoati relies on for the report file.
     args.extend([
         "-m".into(),
         "pytest".into(),

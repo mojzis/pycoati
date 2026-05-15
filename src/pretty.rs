@@ -12,8 +12,8 @@
 //! differ):
 //!
 //! ```text
-//! coati audit — <basename>                       # when basename == project.name
-//! coati audit — <basename> (<project name>)      # when they differ
+//! pycoati audit — <basename>                       # when basename == project.name
+//! pycoati audit — <basename> (<project name>)      # when they differ
 //! ============================
 //!
 //! Suite
@@ -69,9 +69,9 @@ fn render_title(out: &mut String, project: &Project) {
     // filesystem root), fall back to the project name as the primary.
     let basename = project.path.file_name().and_then(|n| n.to_str()).unwrap_or(&project.name);
     let title = if basename == project.name {
-        format!("coati audit — {basename}")
+        format!("pycoati audit — {basename}")
     } else {
-        format!("coati audit — {basename} ({})", project.name)
+        format!("pycoati audit — {basename} ({})", project.name)
     };
     // The em-dash is a single Unicode char counted via `chars().count()` so
     // multi-byte chars do not over-extend the underline.
@@ -382,7 +382,7 @@ mod tests {
             schema_version: "2".to_string(),
             // Pick a path whose basename matches the project name so the
             // title-rendering helper produces the single-token form
-            // `coati audit — demo`. Tests that exercise the
+            // `pycoati audit — demo`. Tests that exercise the
             // basename-differs branch construct their own `Project`.
             project: Project { path: PathBuf::from("/demo"), name: "demo".to_string() },
             suite: Suite {
@@ -422,7 +422,7 @@ mod tests {
         let lines: Vec<&str> = out.lines().collect();
         // Title line + matching `=` underline. `chars().count()` matters
         // because the title contains the em-dash, which is multi-byte.
-        let title = "coati audit — demo";
+        let title = "pycoati audit — demo";
         assert_eq!(lines[0], title);
         let underline = lines[1];
         assert_eq!(underline.chars().count(), title.chars().count());
@@ -630,7 +630,7 @@ mod tests {
         let mut out = String::new();
         render_title(&mut out, &project);
         let first_line = out.lines().next().expect("title line present");
-        assert_eq!(first_line, "coati audit — widgets");
+        assert_eq!(first_line, "pycoati audit — widgets");
     }
 
     #[test]
@@ -643,7 +643,7 @@ mod tests {
         let mut out = String::new();
         render_title(&mut out, &project);
         let first_line = out.lines().next().expect("title line present");
-        assert_eq!(first_line, "coati audit — zazzy-thunder (thunder_pkg)");
+        assert_eq!(first_line, "pycoati audit — zazzy-thunder (thunder_pkg)");
         // Underline matches the title's char-count.
         let underline = out.lines().nth(1).expect("underline line present");
         assert_eq!(underline.chars().count(), first_line.chars().count());
@@ -656,7 +656,7 @@ mod tests {
         let mut out = String::new();
         render_title(&mut out, &project);
         let first_line = out.lines().next().expect("title line present");
-        assert_eq!(first_line, "coati audit — demo");
+        assert_eq!(first_line, "pycoati audit — demo");
     }
 
     #[test]

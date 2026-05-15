@@ -1,6 +1,6 @@
-# coati ↔ zorilla integration (deferred)
+# pycoati ↔ zorilla integration (deferred)
 
-> **Status:** undecided. Coati emits its own mock-related smells natively (see `coati-bootstrap.md` → "Native mock smells"). Zorilla is a separate Rust CLI shipping seven lint-style rules. It's not yet settled whether coati should ingest zorilla's findings or whether the Phase 2 LLM should just run zorilla itself.
+> **Status:** undecided. Coati emits its own mock-related smells natively (see `pycoati-bootstrap.md` → "Native mock smells"). Zorilla is a separate Rust CLI shipping seven lint-style rules. It's not yet settled whether pycoati should ingest zorilla's findings or whether the Phase 2 LLM should just run zorilla itself.
 
 ## What zorilla does (current, v0.1)
 
@@ -22,15 +22,15 @@ Zorilla does **not** emit raw counts. It does not catch over-mocking, only patch
 
 ## Boundary
 
-- **Coati owns**: `mock_only_assertions`, `mock_overuse` — derived from inventory counts, not parsed as separate lint rules. See `coati-bootstrap.md` → "Native mock smells".
-- **Zorilla owns**: ZR001–ZR007 above. If integration happens, those flow into coati's `smell_hits` from zorilla, not from coati's own predicates.
+- **Coati owns**: `mock_only_assertions`, `mock_overuse` — derived from inventory counts, not parsed as separate lint rules. See `pycoati-bootstrap.md` → "Native mock smells".
+- **Zorilla owns**: ZR001–ZR007 above. If integration happens, those flow into pycoati's `smell_hits` from zorilla, not from pycoati's own predicates.
 
 Coati should never reimplement a ZR-something. Conversely, zorilla should never grow inventory-style counters — they're different shapes of tool.
 
 ## Possible integration shapes
 
 ### A. Subprocess + JSON ingest
-Coati shells out to `zorilla check --format json <tests_dir>` and folds each finding into the relevant per-file / per-test `smell_hits` entry under `category: "zorilla:ZR00X"` (namespaced so they don't collide with coati's native categories).
+Coati shells out to `zorilla check --format json <tests_dir>` and folds each finding into the relevant per-file / per-test `smell_hits` entry under `category: "zorilla:ZR00X"` (namespaced so they don't collide with pycoati's native categories).
 
 - Pro: zero coupling, zorilla evolves independently, no shared tree-sitter state.
 - Con: a second process per run (~tens of ms on a normal repo), zorilla must be installed.
@@ -47,7 +47,7 @@ pub fn analyze_file(path: &Path, source: &str, tree: &tree_sitter::Tree) -> Vec<
 - Con: tighter coupling, version pinning matters, requires zorilla-core to expose a library API the CLI does not currently need.
 
 ### C. No integration; the LLM runs both
-Phase 2 LLM reads `inventory.json` from coati and runs `zorilla check` itself. Coati stays narrowly focused on counts + native mock smells.
+Phase 2 LLM reads `inventory.json` from pycoati and runs `zorilla check` itself. Coati stays narrowly focused on counts + native mock smells.
 
 - Pro: simplest, both tools stay self-contained.
 - Con: the LLM has to cross-reference findings to inventory entries by `(file, line)` itself.
@@ -56,5 +56,5 @@ Phase 2 LLM reads `inventory.json` from coati and runs `zorilla check` itself. C
 
 - Is option C good enough? The Phase 2 prompt is already going to read code; running zorilla in parallel is cheap.
 - If we do integrate, is the subprocess approach (A) fine forever, or does the per-process overhead become a problem on large suites?
-- Should coati's JSON namespace zorilla findings (`zorilla:ZR001`) or rebrand them as generic categories? Namespacing is honest; rebranding hides the provenance.
-- Does zorilla's `pyproject.toml` / `zorilla.toml` config get respected when invoked via subprocess from coati? (Yes by default — zorilla searches upward — but worth noting.)
+- Should pycoati's JSON namespace zorilla findings (`zorilla:ZR001`) or rebrand them as generic categories? Namespacing is honest; rebranding hides the provenance.
+- Does zorilla's `pyproject.toml` / `zorilla.toml` config get respected when invoked via subprocess from pycoati? (Yes by default — zorilla searches upward — but worth noting.)

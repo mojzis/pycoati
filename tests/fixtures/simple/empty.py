@@ -1,4 +1,4 @@
-# coati-expected: tests=0 asserts=0
+# pycoati-expected: tests=0 asserts=0
 # This file has no test functions.
 
 

@@ -1,4 +1,4 @@
-# coati-expected: tests=2 asserts=5
+# pycoati-expected: tests=2 asserts=5
 
 
 def helper():

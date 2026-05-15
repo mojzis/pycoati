@@ -1,4 +1,4 @@
-# coati-expected: tests=1 asserts=2 only_mock=test_repo_save_called
+# pycoati-expected: tests=1 asserts=2 only_mock=test_repo_save_called
 from unittest.mock import Mock
 
 

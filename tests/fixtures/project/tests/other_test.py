@@ -1,4 +1,4 @@
-# coati-expected: tests=1 asserts=1
+# pycoati-expected: tests=1 asserts=1
 
 
 def test_suffix_naming():

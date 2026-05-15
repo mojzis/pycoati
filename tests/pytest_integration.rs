@@ -1,5 +1,5 @@
 //! End-to-end test for the Run 2 pytest path: collection, durations, and
-//! coverage. Drives the `coati` binary against `tests/fixtures/project/`.
+//! coverage. Drives the `pycoati` binary against `tests/fixtures/project/`.
 //!
 //! Self-skips when pytest is not importable from the configured Python
 //! interpreter — we use `python -c 'import pytest, pytest_cov'` as the probe
@@ -10,7 +10,7 @@
 //!
 //! The failure-path test (`--python false`) is the regression guard against
 //! subprocess panics corrupting the JSON inventory: even when the pytest
-//! subprocess fails entirely, coati must still exit 0 with a valid JSON
+//! subprocess fails entirely, pycoati must still exit 0 with a valid JSON
 //! inventory on stdout and a warn-level log on stderr.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
@@ -48,7 +48,7 @@ fn copy_fixture_tree(src: &Path, dst: &Path) {
         let name = entry.file_name();
         // Skip artifacts a previous run may have left in the source tree.
         let name_str = name.to_string_lossy();
-        if matches!(name_str.as_ref(), ".coverage" | ".pytest_cache" | "__pycache__" | ".coati") {
+        if matches!(name_str.as_ref(), ".coverage" | ".pytest_cache" | "__pycache__" | ".pycoati") {
             continue;
         }
         let src_path = entry.path();
@@ -110,7 +110,7 @@ fn default_flags_populate_all_suite_fields() {
         return;
     }
 
-    let assert = Command::cargo_bin("coati")
+    let assert = Command::cargo_bin("pycoati")
         .expect("binary built")
         .arg(fixture_root())
         .arg("--python")
@@ -151,7 +151,7 @@ fn default_flags_populate_all_suite_fields() {
 
 #[test]
 fn static_only_skips_all_pytest_invocations() {
-    let assert = Command::cargo_bin("coati")
+    let assert = Command::cargo_bin("pycoati")
         .expect("binary built")
         .arg(fixture_root())
         .arg("--static-only")
@@ -177,7 +177,7 @@ fn no_coverage_skips_only_the_coverage_run() {
         return;
     }
 
-    let assert = Command::cargo_bin("coati")
+    let assert = Command::cargo_bin("pycoati")
         .expect("binary built")
         .arg(fixture_root())
         .arg("--python")
@@ -202,14 +202,14 @@ fn no_coverage_skips_only_the_coverage_run() {
 
 #[test]
 fn no_python_flag_uses_auto_detect_and_emits_valid_inventory() {
-    // Regression guard for the auto-detect default: running `coati <fixture>`
+    // Regression guard for the auto-detect default: running `pycoati <fixture>`
     // with no `--python` must produce a valid JSON inventory with the static
     // analysis intact, regardless of whether the auto-detected interpreter
     // can import pytest. The point of this test is the `Option<&[String]>`
     // plumbing — if it ever silently reverts to bare `python` (or worse,
     // panics on the None branch), this test catches it.
     let assert =
-        Command::cargo_bin("coati").expect("binary built").arg(fixture_root()).assert().success();
+        Command::cargo_bin("pycoati").expect("binary built").arg(fixture_root()).assert().success();
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf-8 stdout");
     let v: Value = serde_json::from_str(&stdout).expect("stdout must be valid JSON");
 
@@ -229,10 +229,10 @@ fn no_python_flag_uses_auto_detect_and_emits_valid_inventory() {
 #[test]
 fn broken_python_interpreter_does_not_crash_inventory() {
     // `false` is a real binary that exits non-zero and produces no output.
-    // It models any deliberately-broken interpreter command — coati must
+    // It models any deliberately-broken interpreter command — pycoati must
     // degrade gracefully, leave suite fields null, emit a warn on stderr,
     // and exit 0 with valid JSON on stdout.
-    let assert = Command::cargo_bin("coati")
+    let assert = Command::cargo_bin("pycoati")
         .expect("binary built")
         .arg(fixture_root())
         .arg("--python")
@@ -300,7 +300,7 @@ fn scaffold_pytest_project(project_root: &Path, addopts_value: &str) {
 #[test]
 fn collection_survives_repo_addopts_with_quiet_flag() {
     // A `pytest.ini` with `addopts = -q` is benign on its own, but it
-    // exercises the `-o addopts=` neutralisation path: coati should not
+    // exercises the `-o addopts=` neutralisation path: pycoati should not
     // reach into the project's `addopts`, and the collection count must
     // match the number of test functions the fixture declares.
     let python = integration_python();
@@ -311,7 +311,7 @@ fn collection_survives_repo_addopts_with_quiet_flag() {
     let tmp = tempfile::tempdir().expect("tempdir");
     scaffold_pytest_project(tmp.path(), "-q");
 
-    let assert = Command::cargo_bin("coati")
+    let assert = Command::cargo_bin("pycoati")
         .expect("binary built")
         .arg(tmp.path())
         .arg("--python")
@@ -364,7 +364,7 @@ fn preflight_warns_when_pytest_unavailable_but_static_still_runs() {
         return;
     };
 
-    let assert = Command::cargo_bin("coati")
+    let assert = Command::cargo_bin("pycoati")
         .expect("binary built")
         .arg(fixture_root())
         .arg("--python")
@@ -418,12 +418,12 @@ fn preflight_warns_when_pytest_unavailable_but_static_still_runs() {
 #[test]
 fn coverage_warn_names_pytest_exit_code_when_report_missing() {
     // When the coverage subprocess produces no JSON report (empty file or
-    // file written but empty), coati must surface a structured WARN
+    // file written but empty), pycoati must surface a structured WARN
     // containing the pytest exit code + a stderr tail — *not* the raw
     // serde "EOF while parsing" string. We trigger the empty-report path
     // by scaffolding a project whose package name doesn't match a real
     // module, then running coverage against it: pytest exits non-zero,
-    // writes nothing useful to the report path, and coati must degrade.
+    // writes nothing useful to the report path, and pycoati must degrade.
     let python = integration_python();
     if !pytest_available(&python) {
         eprintln!("SKIPPED: pytest not available via `{python}`");
@@ -431,7 +431,7 @@ fn coverage_warn_names_pytest_exit_code_when_report_missing() {
     }
     let tmp = tempfile::tempdir().expect("tempdir");
     // Scaffold a project with a `mini` package, but lie in pyproject.toml
-    // and claim the package name is `does_not_exist`. coati will pass
+    // and claim the package name is `does_not_exist`. pycoati will pass
     // `--cov=does_not_exist`, pytest will be unable to find anything to
     // measure, and the JSON report path will end up empty / malformed.
     std::fs::write(tmp.path().join("pyproject.toml"), "[project]\nname = \"does_not_exist\"\n")
@@ -449,7 +449,7 @@ fn coverage_warn_names_pytest_exit_code_when_report_missing() {
     )
     .expect("write test_greet.py");
 
-    let assert = Command::cargo_bin("coati")
+    let assert = Command::cargo_bin("pycoati")
         .expect("binary built")
         .arg(tmp.path())
         .arg("--python")
@@ -488,7 +488,7 @@ fn coverage_warn_names_pytest_exit_code_when_report_missing() {
 #[test]
 fn collection_survives_repo_addopts_with_cov_flag() {
     // A `pytest.ini` with `addopts = --cov=foo` is the adversarial case
-    // from the rollout report: when coati runs `pytest --collect-only`
+    // from the rollout report: when pycoati runs `pytest --collect-only`
     // without neutralising addopts, pytest tries to import the
     // `pytest-cov` plugin against a non-existent package and the
     // collection count comes back as `None`. With `-o addopts=` the
@@ -501,7 +501,7 @@ fn collection_survives_repo_addopts_with_cov_flag() {
     let tmp = tempfile::tempdir().expect("tempdir");
     scaffold_pytest_project(tmp.path(), "--cov=does_not_exist");
 
-    let assert = Command::cargo_bin("coati")
+    let assert = Command::cargo_bin("pycoati")
         .expect("binary built")
         .arg(tmp.path())
         .arg("--python")
@@ -544,7 +544,7 @@ fn hyphenated_pyproject_name_produces_non_zero_coverage_via_default() {
     // eliminates the race and keeps the source tree clean.
     let (_guard, fixture_root) = staged_hyphen_fixture();
 
-    let assert = Command::cargo_bin("coati")
+    let assert = Command::cargo_bin("pycoati")
         .expect("binary built")
         .arg(&fixture_root)
         .arg("--python")
@@ -605,7 +605,7 @@ fn cli_project_package_override_with_hyphen_is_passed_verbatim() {
     // leaked from the default test's `.coverage` write.
     let (_guard, fixture_root) = staged_hyphen_fixture();
 
-    let assert = Command::cargo_bin("coati")
+    let assert = Command::cargo_bin("pycoati")
         .expect("binary built")
         .arg(&fixture_root)
         .arg("--python")
@@ -627,14 +627,14 @@ fn cli_project_package_override_with_hyphen_is_passed_verbatim() {
     );
     assert_eq!(v["tool"]["ran_coverage"], Value::Bool(false));
 
-    // Direct assertion on coati's own contract: when coverage produces no
-    // data, coati emits a structured WARN naming the failure mode. This
+    // Direct assertion on pycoati's own contract: when coverage produces no
+    // data, pycoati emits a structured WARN naming the failure mode. This
     // tightens the test from "observe null coverage" (which depends on
     // pytest-cov's specific behaviour with an invalid `--cov=` value) to
-    // "coati surfaced the no-data path with a non-zero pytest exit",
-    // which is the message coati itself owns in `src/coverage.rs`.
+    // "pycoati surfaced the no-data path with a non-zero pytest exit",
+    // which is the message pycoati itself owns in `src/coverage.rs`.
     assert!(
         stderr.contains("no coverage data produced"),
-        "expected coati to emit its 'no coverage data produced' WARN when the verbatim hyphenated override fails to resolve to a module, stderr was: {stderr}"
+        "expected pycoati to emit its 'no coverage data produced' WARN when the verbatim hyphenated override fails to resolve to a module, stderr was: {stderr}"
     );
 }

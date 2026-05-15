@@ -1,8 +1,8 @@
-//! coati library crate.
+//! pycoati library crate.
 //!
 //! Audits Python test suites: counts test functions and assertions per file,
 //! and detects mock-API smells. This crate exposes the [`Inventory`] data
-//! model and the [`run_static`] entry point used by the `coati` binary and
+//! model and the [`run_static`] entry point used by the `pycoati` binary and
 //! by integration tests.
 //!
 //! The output schema is at `schema_version = "2"` — `"1"` was the initial
@@ -159,7 +159,7 @@ impl ToolInfo {
     /// `ran_pytest` / `ran_coverage` to `true` after a successful invocation.
     fn without_runtime() -> Self {
         Self {
-            name: "coati".to_string(),
+            name: "pycoati".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             ran_pytest: false,
             ran_coverage: false,
@@ -172,7 +172,7 @@ impl ToolInfo {
     /// `false` even when the user asked for the run.
     pub fn with_runtime(ran_pytest: bool, ran_coverage: bool) -> Self {
         Self {
-            name: "coati".to_string(),
+            name: "pycoati".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             ran_pytest,
             ran_coverage,
@@ -490,7 +490,7 @@ fn run_static_dir_with_options(
     // Symmetric counterpart to the "tests directory not found" WARN above:
     // when the dir exists but the walker returns zero `test_*.py` files,
     // emit a distinct WARN so the empty inventory is obviously a project
-    // configuration issue rather than a coati bug. The non-empty path
+    // configuration issue rather than a pycoati bug. The non-empty path
     // logs an info-level breadcrumb for the same reason.
     if files.is_empty() {
         tracing::warn!(

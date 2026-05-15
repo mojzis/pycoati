@@ -4,7 +4,7 @@ context: fork
 description: Deep Rust code quality review. Auto-invoke when finishing a task, before marking work complete, when the user asks to review code, or when preparing a PR. Covers error handling, async correctness, duplicated logic, test quality, performance patterns, idiomatic Rust, docs-code alignment, and API design beyond what clippy catches.
 ---
 
-# Deep Code Review for coati
+# Deep Code Review for pycoati
 
 Perform a thorough code quality review of the changes in this project. Go beyond what clippy and rustfmt catch. Focus on the areas below and report findings grouped by severity: Must Fix, Should Fix, Suggestion.
 

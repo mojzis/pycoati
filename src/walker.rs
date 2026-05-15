@@ -122,7 +122,7 @@ mod tests {
 
     #[test]
     fn missing_directory_is_an_error() {
-        let result = discover_test_files(Path::new("/definitely/does/not/exist/for/coati"));
+        let result = discover_test_files(Path::new("/definitely/does/not/exist/for/pycoati"));
         assert!(result.is_err());
     }
 }

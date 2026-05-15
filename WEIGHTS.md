@@ -1,11 +1,11 @@
 # Suspicion-score weights
 
-`coati`'s `suspicion_score` blends five static heuristics into a single
+`pycoati`'s `suspicion_score` blends five static heuristics into a single
 [0.0, ~0.9]-bounded number per test, plus a small `mock_construction`
 bonus per file. The values below are the v1 defaults that ship in
 `src/suspicion.rs::DEFAULT`; they are **heuristic starting points**, not
 empirically tuned constants. Treat the formula as the contract and the
-numbers as defaults you may want to revise after running coati on a real
+numbers as defaults you may want to revise after running pycoati on a real
 project (see [How to revise](#how-to-revise)).
 
 ## Formula
@@ -152,7 +152,7 @@ These are intentionally **not** implemented in Run 3 / v1.
 
 These weights are heuristic starting points. The intended workflow:
 
-1. Run `coati` on a real project.
+1. Run `pycoati` on a real project.
 2. Skim `top_suspicious.test_functions` (default 20 entries).
 3. For each entry, mentally label it useful / borderline / noise.
 4. If a category of test consistently appears as noise (or fails to

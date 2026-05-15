@@ -1,4 +1,4 @@
-# coati - measuring quality of pytest tests
+# pycoati - measuring quality of pytest tests
 
 
 ---
@@ -12,7 +12,7 @@ The tool answers exactly one question per run: **"What does this test suite look
 It does not form opinions. It does not propose changes. It does not edit files. It does not invoke an LLM. Those are explicitly other tools' jobs.
 
 
-`coati` is the **orchestration and aggregation** layer that turns per-test signals plus runtime signals (from pytest invocation) into a prioritized inventory.
+`pycoati` is the **orchestration and aggregation** layer that turns per-test signals plus runtime signals (from pytest invocation) into a prioritized inventory.
 
 ## Scope — what this tool does
 
@@ -74,7 +74,7 @@ For a single Python project (one `pyproject.toml`, one test directory), produce 
 ## CLI shape
 
 ```
-coati <project-path>
+pycoati <project-path>
   --tests-dir <path>            (default: discovered from pyproject.toml or "tests/")
   --project-package <name>      (override; default: discovered from pyproject.toml)
   --python <command>            (default: "python", e.g. "uv run python")
@@ -86,7 +86,7 @@ coati <project-path>
   --format json|pretty          (default: json)
 ```
 
-The default invocation `coati .` should do the right thing in a project root with a standard layout.
+The default invocation `pycoati .` should do the right thing in a project root with a standard layout.
 
 ## Output schema
 
@@ -151,7 +151,7 @@ This schema is the contract with the Phase 2 LLM and with the `test-quality-revi
     "files": ["tests/foo.py"]
   },
   "tool": {
-    "name": "coati",
+    "name": "pycoati",
     "version": "x.y.z",
     "ran_pytest": true,
     "ran_coverage": true
@@ -181,16 +181,16 @@ File-level suspicion is the mean of its tests' scores, plus a small bonus for hi
 
 ## Native mock smells
 
-Coati emits categorized findings for mock-related anti-patterns that the inventory counts can already see. These live in `coati` (not zorilla) because zorilla's rule set is line/structural and has no equivalent — see [`zorilla-integration.md`](./zorilla-integration.md) for the boundary.
+Coati emits categorized findings for mock-related anti-patterns that the inventory counts can already see. These live in `pycoati` (not zorilla) because zorilla's rule set is line/structural and has no equivalent — see [`zorilla-integration.md`](./zorilla-integration.md) for the boundary.
 
-Categories owned by coati:
+Categories owned by pycoati:
 
 - **`mock_only_assertions`** (per-test). Fires when `only_asserts_on_mock == true` AND `assertion_count > 0`. The test verifies the mock, not the SUT. Evidence: `"all N asserts on Mock API"`. (When `assertion_count == 0`, zorilla's `ZR003 no-assertion` handles it — do not double-fire.)
 - **`mock_overuse`** (per-test and per-file). Fires when `mock_construction_count + patch_decorator_count > max(assertion_count, mock_overuse_floor)` and the ratio exceeds `mock_overuse_ratio`. Evidence: `"N mocks, M assertions"`. Defaults: `mock_overuse_floor = 2`, `mock_overuse_ratio = 2.0`. Tunable via a `MockSmellConfig` struct, exposed later as TOML config; not as a CLI flag in v1.
 
-Both categories are derived from inventory counts coati already computes — no extra AST passes. Thresholds live in one place; do not sprinkle them through the codebase.
+Both categories are derived from inventory counts pycoati already computes — no extra AST passes. Thresholds live in one place; do not sprinkle them through the codebase.
 
-Categories **not** owned by coati (deferred to zorilla if integration happens): conditional logic in tests, `sleep` calls, mystery-guest path literals, patch-stack `>3` (overlaps with `mock_overuse` but zorilla owns the rule), empty tests, assertion-roulette. See [`zorilla-integration.md`](./zorilla-integration.md).
+Categories **not** owned by pycoati (deferred to zorilla if integration happens): conditional logic in tests, `sleep` calls, mystery-guest path literals, patch-stack `>3` (overlaps with `mock_overuse` but zorilla owns the rule), empty tests, assertion-roulette. See [`zorilla-integration.md`](./zorilla-integration.md).
 
 ## Implementation order
 
@@ -212,20 +212,20 @@ After step 4 you have a useful static-only tool. After step 7 you have the full 
 
 ## Zorilla integration (deferred)
 
-Zorilla covers lint-style test smells (ZR001–ZR007: conditional logic, `sleep`, no-assertion, assertion-roulette, mystery-guest, patch-stack, empty test). Whether to surface zorilla findings inside `coati`'s `inventory.json` — versus letting the Phase 2 LLM run zorilla itself — is undecided. See [`zorilla-integration.md`](./zorilla-integration.md). Do not wire it in as part of v1.
+Zorilla covers lint-style test smells (ZR001–ZR007: conditional logic, `sleep`, no-assertion, assertion-roulette, mystery-guest, patch-stack, empty test). Whether to surface zorilla findings inside `pycoati`'s `inventory.json` — versus letting the Phase 2 LLM run zorilla itself — is undecided. See [`zorilla-integration.md`](./zorilla-integration.md). Do not wire it in as part of v1.
 
 Coati's native mock smells (see above) are intentionally separate from zorilla — they're derived from inventory counts, not parsed as lint rules.
 
 ## Test the tool against itself
 
-A useful smoke target: run `coati` against the test suite of one of your own Python projects — `dh`, `ajina`, or the Prague commuter tool — and read the JSON. The first interesting bug surfaces within minutes. The threshold defaults are almost certainly wrong; the JSON shape is almost certainly missing a field you'll want.
+A useful smoke target: run `pycoati` against the test suite of one of your own Python projects — `dh`, `ajina`, or the Prague commuter tool — and read the JSON. The first interesting bug surfaces within minutes. The threshold defaults are almost certainly wrong; the JSON shape is almost certainly missing a field you'll want.
 
-Also useful: write a fixture project under `tests/fixtures/` in the `coati` repo itself, containing hand-crafted test files that exemplify each category (one mock-only test, one tautology, one setup-heavy test, one good test) and assert against the expected inventory. This is a small integration test set that catches regressions in the heuristics.
+Also useful: write a fixture project under `tests/fixtures/` in the `pycoati` repo itself, containing hand-crafted test files that exemplify each category (one mock-only test, one tautology, one setup-heavy test, one good test) and assert against the expected inventory. This is a small integration test set that catches regressions in the heuristics.
 
 ## Done criteria for v1
 
-- `coati .` on a real project completes in under 30 seconds for a suite of ~500 tests, including pytest invocations.
-- `coati . --static-only` completes in under 3 seconds for the same suite.
+- `pycoati .` on a real project completes in under 30 seconds for a suite of ~500 tests, including pytest invocations.
+- `pycoati . --static-only` completes in under 3 seconds for the same suite.
 - The emitted JSON validates against the schema above.
 - At least 70% of the entries in `top_suspicious.tests` are, on inspection, genuinely worth a human reviewer's attention.
 - The skill's Phase 2 prompt can consume `inventory.json` and produce a useful report without needing to re-derive any of the Phase 1 counts.
@@ -236,7 +236,7 @@ Also useful: write a fixture project under `tests/fixtures/` in the `coati` repo
 - **Symbol resolution for `called_names`** via tyf — replaces best-effort textual matching with real qualified names. Disambiguates `save` across multiple classes. Adds a runtime dep on tyf.
 - **Uncalled production functions** via ty-reach — the inverse signal: "this function in the SUT is not called by any test." Requires production-source walking and definition matching.
 - biston subprocess integration: ingest biston's structural-duplication JSON and merge "test A and test B are shape-duplicates" hits into the inventory as a separate smell category.
-- Trend tracking: timestamped inventories under `.coati/history/` so you can diff this run against last quarter's.
+- Trend tracking: timestamped inventories under `.pycoati/history/` so you can diff this run against last quarter's.
 - Watch mode for editor integration.
 - Caching of tree-sitter trees and pytest results.
 
@@ -246,4 +246,4 @@ Do not let any of these creep into v1. The Phase 1 / Phase 2 split exists precis
 
 ## First instruction to Claude Code
 
-Start by scaffolding the crate with `cargo new coati --bin`, add the workspace entry if relevant, set up the `Inventory` and `TestRecord` structs with `serde::Serialize`, wire up `clap`, and produce the trivial end-to-end run where every numeric field is zero and the JSON shape is correct. Stop there and show me the output before writing any tree-sitter code.
+Start by scaffolding the crate with `cargo new pycoati --bin`, add the workspace entry if relevant, set up the `Inventory` and `TestRecord` structs with `serde::Serialize`, wire up `clap`, and produce the trivial end-to-end run where every numeric field is zero and the JSON shape is correct. Stop there and show me the output before writing any tree-sitter code.

@@ -1,8 +1,8 @@
-//! `coati` binary: runs an audit of a Python project (or single file)
-//! and prints the resulting [`coati::Inventory`] as JSON or as an aligned-
+//! `pycoati` binary: runs an audit of a Python project (or single file)
+//! and prints the resulting [`pycoati::Inventory`] as JSON or as an aligned-
 //! column plain-text view (`--format pretty`).
 //!
-//! Run 2 makes `--static-only` load-bearing: by default `coati <path>`
+//! Run 2 makes `--static-only` load-bearing: by default `pycoati <path>`
 //! now invokes `python -m pytest` three times against the project root
 //! (collection, durations, coverage) and populates `suite.*`. Users opt
 //! out with `--static-only`; `--no-coverage` skips only the coverage run.
@@ -34,11 +34,11 @@ enum Format {
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "coati",
+    name = "pycoati",
     version,
     about,
     long_about = "Audit Python test suites for mock smells and suspicious tests.\n\n\
-        coati walks a Python project (or a single file), parses every test with \
+        pycoati walks a Python project (or a single file), parses every test with \
         tree-sitter, and — unless --static-only is passed — runs `python -m pytest` \
         three times to capture collection, durations, and coverage. By default the \
         Python interpreter is auto-detected: an ancestor `.venv/bin/python` wins, \
@@ -96,7 +96,7 @@ struct Cli {
     /// program + args. `--python "uv run python"` runs
     /// `uv run python -m pytest …` (no shell expansion).
     ///
-    /// When omitted, coati auto-detects: an ancestor `.venv/bin/python`
+    /// When omitted, pycoati auto-detects: an ancestor `.venv/bin/python`
     /// wins, then `uv run --no-sync python` if `uv --version` succeeds,
     /// else bare `python`.
     #[arg(long, value_name = "CMD")]
@@ -134,20 +134,20 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             // Intentionally bypass `tracing` for the user-facing failure
-            // line: a `coati: <error>` line on stderr plus a non-zero exit
+            // line: a `pycoati: <error>` line on stderr plus a non-zero exit
             // is the standard CLI contract and must not be affected by
             // `RUST_LOG` filtering.
-            eprintln!("coati: {err:#}");
+            eprintln!("pycoati: {err:#}");
             ExitCode::FAILURE
         }
     }
 }
 
 fn run(cli: &Cli) -> Result<()> {
-    let top_n = cli.top_suspicious.unwrap_or(coati::DEFAULT_TOP_SUSPICIOUS);
+    let top_n = cli.top_suspicious.unwrap_or(pycoati::DEFAULT_TOP_SUSPICIOUS);
 
     let inventory = if cli.static_only {
-        coati::run_static_with_top_n(
+        pycoati::run_static_with_top_n(
             &cli.path,
             cli.tests_dir.as_deref(),
             cli.project_package.as_deref(),
@@ -158,7 +158,7 @@ fn run(cli: &Cli) -> Result<()> {
             cli.python.as_deref().map(|s| s.split_whitespace().map(str::to_string).collect());
         let pytest_args: Vec<String> =
             cli.pytest_args.split_whitespace().map(str::to_string).collect();
-        coati::run_with_pytest(
+        pycoati::run_with_pytest(
             &cli.path,
             cli.tests_dir.as_deref(),
             python_cmd.as_deref(),
@@ -173,7 +173,7 @@ fn run(cli: &Cli) -> Result<()> {
         Format::Json => {
             serde_json::to_string_pretty(&inventory).context("failed to serialize inventory")?
         }
-        Format::Pretty => coati::render_pretty(&inventory, top_n),
+        Format::Pretty => pycoati::render_pretty(&inventory, top_n),
     };
 
     if let Some(out_path) = cli.output.as_ref() {

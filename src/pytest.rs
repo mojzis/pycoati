@@ -85,7 +85,7 @@ pub fn run_collection(
     // pytest.ini / pyproject.toml for this invocation. The repo's addopts
     // routinely include user-only flags (`-q -q`, `--cov=foo`, custom
     // plugins, etc.) that turn the collect-only pass into garbage or
-    // outright errors; coati owns its own argv and must not inherit those.
+    // outright errors; pycoati owns its own argv and must not inherit those.
     args.extend([
         "-m".into(),
         "pytest".into(),

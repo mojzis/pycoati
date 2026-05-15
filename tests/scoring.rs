@@ -14,8 +14,8 @@ fn fixture_root() -> PathBuf {
     p
 }
 
-fn run_coati_json(extra_args: &[&str]) -> Value {
-    let mut cmd = Command::cargo_bin("coati").expect("binary built");
+fn run_pycoati_json(extra_args: &[&str]) -> Value {
+    let mut cmd = Command::cargo_bin("pycoati").expect("binary built");
     cmd.arg(fixture_root()).arg("--static-only");
     for a in extra_args {
         cmd.arg(a);
@@ -25,8 +25,8 @@ fn run_coati_json(extra_args: &[&str]) -> Value {
     serde_json::from_str(&stdout).expect("stdout must be valid JSON")
 }
 
-fn run_coati_pretty(extra_args: &[&str]) -> String {
-    let mut cmd = Command::cargo_bin("coati").expect("binary built");
+fn run_pycoati_pretty(extra_args: &[&str]) -> String {
+    let mut cmd = Command::cargo_bin("pycoati").expect("binary built");
     cmd.arg(fixture_root()).arg("--static-only").arg("--format").arg("pretty");
     for a in extra_args {
         cmd.arg(a);
@@ -37,7 +37,7 @@ fn run_coati_pretty(extra_args: &[&str]) -> String {
 
 #[test]
 fn top_suspicious_contains_mock_only_test() {
-    let v = run_coati_json(&[]);
+    let v = run_pycoati_json(&[]);
     let nodeids: Vec<&str> = v["top_suspicious"]["test_functions"]
         .as_array()
         .expect("test_functions array")
@@ -52,7 +52,7 @@ fn top_suspicious_contains_mock_only_test() {
 
 #[test]
 fn top_suspicious_contains_overmocked_test() {
-    let v = run_coati_json(&[]);
+    let v = run_pycoati_json(&[]);
     let nodeids: Vec<&str> = v["top_suspicious"]["test_functions"]
         .as_array()
         .expect("test_functions array")
@@ -67,21 +67,21 @@ fn top_suspicious_contains_overmocked_test() {
 
 #[test]
 fn top_suspicious_caps_at_twenty_by_default() {
-    let v = run_coati_json(&[]);
+    let v = run_pycoati_json(&[]);
     let n = v["top_suspicious"]["test_functions"].as_array().expect("test_functions array").len();
     assert!(n <= 20, "expected at most 20 entries, got {n}");
 }
 
 #[test]
 fn top_suspicious_n_cli_override() {
-    let v = run_coati_json(&["--top-suspicious", "3"]);
+    let v = run_pycoati_json(&["--top-suspicious", "3"]);
     let n = v["top_suspicious"]["test_functions"].as_array().expect("test_functions array").len();
     assert!(n <= 3, "expected at most 3 entries, got {n}");
 }
 
 #[test]
 fn top_suspicious_files_also_populated() {
-    let v = run_coati_json(&[]);
+    let v = run_pycoati_json(&[]);
     let files: Vec<&str> = v["top_suspicious"]["files"]
         .as_array()
         .expect("files array")
@@ -99,7 +99,7 @@ fn top_suspicious_files_also_populated() {
 
 #[test]
 fn suspicion_score_max_above_threshold() {
-    let v = run_coati_json(&[]);
+    let v = run_pycoati_json(&[]);
     let tfs = v["test_functions"].as_array().expect("test_functions array");
     let max = tfs.iter().filter_map(|t| t["suspicion_score"].as_f64()).fold(0.0_f64, f64::max);
     assert!(max > 0.4, "expected max suspicion_score > 0.4, got {max}");
@@ -107,7 +107,7 @@ fn suspicion_score_max_above_threshold() {
 
 #[test]
 fn suspicion_scores_written_back_to_test_records() {
-    let v = run_coati_json(&[]);
+    let v = run_pycoati_json(&[]);
     let tfs = v["test_functions"].as_array().expect("test_functions array");
     // Every test must carry a numeric suspicion_score (never null).
     for t in tfs {
@@ -118,8 +118,8 @@ fn suspicion_scores_written_back_to_test_records() {
 
 #[test]
 fn format_pretty_writes_aligned_columns_no_markdown() {
-    let out = run_coati_pretty(&[]);
-    assert!(out.starts_with("coati audit"), "pretty output must start with title, got:\n{out}");
+    let out = run_pycoati_pretty(&[]);
+    assert!(out.starts_with("pycoati audit"), "pretty output must start with title, got:\n{out}");
     assert!(out.contains("Suite\n-----"), "must contain Suite header, got:\n{out}");
     assert!(
         out.contains("Top suspicious tests\n--------------------"),
@@ -131,14 +131,14 @@ fn format_pretty_writes_aligned_columns_no_markdown() {
 #[test]
 fn format_pretty_and_json_agree_on_top_suspicious() {
     // Same invocation arguments. Compare top-1 nodeid.
-    let v = run_coati_json(&[]);
+    let v = run_pycoati_json(&[]);
     let top_json = v["top_suspicious"]["test_functions"]
         .as_array()
         .and_then(|a| a.first())
         .and_then(Value::as_str)
         .expect("top_suspicious.test_functions[0] string")
         .to_string();
-    let pretty = run_coati_pretty(&[]);
+    let pretty = run_pycoati_pretty(&[]);
     assert!(
         pretty.contains(&top_json),
         "pretty output must mention top-1 nodeid {top_json:?}, got:\n{pretty}"

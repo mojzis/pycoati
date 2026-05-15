@@ -1,4 +1,4 @@
-# coati
+# pycoati
 
 A new tool.
 
@@ -15,7 +15,7 @@ maturin develop
 ## Usage
 
 ```bash
-coati --help
+pycoati --help
 ```
 
 ## Development

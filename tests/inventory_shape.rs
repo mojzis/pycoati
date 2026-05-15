@@ -1,6 +1,6 @@
 //! Schema-shape integration test for the Inventory output.
 //!
-//! Verifies that `coati::run_static` produces JSON whose top-level structure
+//! Verifies that `pycoati::run_static` produces JSON whose top-level structure
 //! exactly matches the `schema_version` "2" contract. Key-set equality is
 //! asserted on `serde_json::Value` so cosmetic struct-field reordering does
 //! not break the test.
@@ -25,7 +25,7 @@ fn keys(v: &Value) -> BTreeSet<String> {
 #[test]
 fn inventory_top_level_keys_match_schema_v2() {
     let path = fixture_path("tests/fixtures/simple/empty.py");
-    let inv = coati::run_static(&path).expect("run_static on empty.py");
+    let inv = pycoati::run_static(&path).expect("run_static on empty.py");
     let v = serde_json::to_value(&inv).expect("serialize inventory");
 
     let expected: BTreeSet<String> = [
@@ -48,7 +48,7 @@ fn inventory_top_level_keys_match_schema_v2() {
 #[test]
 fn inventory_schema_version_is_string_two() {
     let path = fixture_path("tests/fixtures/simple/empty.py");
-    let inv = coati::run_static(&path).expect("run_static on empty.py");
+    let inv = pycoati::run_static(&path).expect("run_static on empty.py");
     let v = serde_json::to_value(&inv).expect("serialize inventory");
     assert_eq!(v["schema_version"], Value::String("2".to_string()));
 }
@@ -56,7 +56,7 @@ fn inventory_schema_version_is_string_two() {
 #[test]
 fn inventory_suite_fields_are_null_in_static_only_mode() {
     let path = fixture_path("tests/fixtures/simple/empty.py");
-    let inv = coati::run_static(&path).expect("run_static on empty.py");
+    let inv = pycoati::run_static(&path).expect("run_static on empty.py");
     let v = serde_json::to_value(&inv).expect("serialize inventory");
 
     let suite_keys: BTreeSet<String> =
@@ -75,7 +75,7 @@ fn inventory_suite_fields_are_null_in_static_only_mode() {
 #[test]
 fn inventory_tool_fields_are_static_only_defaults() {
     let path = fixture_path("tests/fixtures/simple/empty.py");
-    let inv = coati::run_static(&path).expect("run_static on empty.py");
+    let inv = pycoati::run_static(&path).expect("run_static on empty.py");
     let v = serde_json::to_value(&inv).expect("serialize inventory");
 
     let tool_keys: BTreeSet<String> = ["name", "version", "ran_pytest", "ran_coverage"]
@@ -84,7 +84,7 @@ fn inventory_tool_fields_are_static_only_defaults() {
         .collect();
     assert_eq!(keys(&v["tool"]), tool_keys);
 
-    assert_eq!(v["tool"]["name"], Value::String("coati".to_string()));
+    assert_eq!(v["tool"]["name"], Value::String("pycoati".to_string()));
     assert_eq!(v["tool"]["ran_pytest"], Value::Bool(false));
     assert_eq!(v["tool"]["ran_coverage"], Value::Bool(false));
     assert_eq!(v["tool"]["version"], Value::String(env!("CARGO_PKG_VERSION").to_string()));
@@ -93,7 +93,7 @@ fn inventory_tool_fields_are_static_only_defaults() {
 #[test]
 fn inventory_project_fields_present() {
     let path = fixture_path("tests/fixtures/simple/empty.py");
-    let inv = coati::run_static(&path).expect("run_static on empty.py");
+    let inv = pycoati::run_static(&path).expect("run_static on empty.py");
     let v = serde_json::to_value(&inv).expect("serialize inventory");
 
     let project_keys: BTreeSet<String> =
@@ -114,7 +114,7 @@ fn inventory_project_fields_present() {
 #[test]
 fn inventory_sut_calls_and_top_suspicious_shape() {
     let path = fixture_path("tests/fixtures/simple/empty.py");
-    let inv = coati::run_static(&path).expect("run_static on empty.py");
+    let inv = pycoati::run_static(&path).expect("run_static on empty.py");
     let v = serde_json::to_value(&inv).expect("serialize inventory");
 
     let sut_keys: BTreeSet<String> =
@@ -133,7 +133,7 @@ fn inventory_sut_calls_and_top_suspicious_shape() {
 #[test]
 fn inventory_files_and_test_functions_are_arrays() {
     let path = fixture_path("tests/fixtures/simple/empty.py");
-    let inv = coati::run_static(&path).expect("run_static on empty.py");
+    let inv = pycoati::run_static(&path).expect("run_static on empty.py");
     let v = serde_json::to_value(&inv).expect("serialize inventory");
 
     assert!(v["files"].is_array(), "files must be array");

@@ -3,7 +3,7 @@ requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "coati"
+name = "pycoati"
 description = "Audit Python test suites for mock smells and suspicious tests"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -27,9 +27,9 @@ dynamic = ["version"]
 dependencies = []
 
 [project.urls]
-homepage = "https://github.com/mojzis/coati"
-repository = "https://github.com/mojzis/coati"
-documentation = "https://github.com/mojzis/coati#readme"
+homepage = "https://github.com/mojzis/pycoati"
+repository = "https://github.com/mojzis/pycoati"
+documentation = "https://github.com/mojzis/pycoati#readme"
 
 [project.optional-dependencies]
 dev = [

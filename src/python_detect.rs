@@ -9,12 +9,12 @@
 //! 3. Bare `python` on `PATH`.
 //!
 //! `--no-sync` is important: it tells `uv` not to mutate the project's lock
-//! or env as a side effect of running pytest — coati is a read-only audit
+//! or env as a side effect of running pytest — pycoati is a read-only audit
 //! tool and must not nudge the user's dependencies.
 //!
 //! The user can always bypass this with `--python <cmd>`. Detection logs the
 //! chosen interpreter at `debug` (not `info`) so the default-verbosity run
-//! stays quiet on the happy path. Run with `RUST_LOG=coati::python_detect=debug`
+//! stays quiet on the happy path. Run with `RUST_LOG=pycoati::python_detect=debug`
 //! to see which interpreter was picked.
 
 use std::path::{Path, PathBuf};

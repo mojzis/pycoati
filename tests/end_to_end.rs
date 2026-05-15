@@ -1,8 +1,8 @@
 //! End-to-end test for Phase 2 deliverables: file walker, project-name
 //! discovery via `pyproject.toml`, and the `only_asserts_on_mock` predicate.
 //!
-//! Runs the `coati` binary against `tests/fixtures/project/` and verifies the
-//! emitted inventory against the `# coati-expected: ...` annotations in each
+//! Runs the `pycoati` binary against `tests/fixtures/project/` and verifies the
+//! emitted inventory against the `# pycoati-expected: ...` annotations in each
 //! fixture test file.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
@@ -19,7 +19,7 @@ fn fixture_root() -> PathBuf {
     p
 }
 
-/// Per-file expectations extracted from a `# coati-expected: ...` header.
+/// Per-file expectations extracted from a `# pycoati-expected: ...` header.
 #[derive(Debug, Default, Clone)]
 struct FileExpectations {
     tests: u64,
@@ -32,8 +32,8 @@ struct FileExpectations {
 fn parse_expectations(source: &str) -> FileExpectations {
     let header = source
         .lines()
-        .find_map(|l| l.trim_start_matches('#').trim().strip_prefix("coati-expected:"))
-        .expect("fixture must declare a `# coati-expected:` header");
+        .find_map(|l| l.trim_start_matches('#').trim().strip_prefix("pycoati-expected:"))
+        .expect("fixture must declare a `# pycoati-expected:` header");
     let mut exp = FileExpectations::default();
     for kv in header.split_whitespace() {
         let (k, v) = kv.split_once('=').expect("token must be key=value");
@@ -41,7 +41,7 @@ fn parse_expectations(source: &str) -> FileExpectations {
             "tests" => exp.tests = v.parse().expect("tests= must be a u64"),
             "asserts" => exp.asserts = v.parse().expect("asserts= must be a u64"),
             "only_mock" => exp.only_mock = Some(v.to_string()),
-            _ => panic!("unknown coati-expected key: {k}"),
+            _ => panic!("unknown pycoati-expected key: {k}"),
         }
     }
     exp
@@ -53,7 +53,7 @@ fn read_fixture(rel: &str) -> String {
     std::fs::read_to_string(&p).expect("read fixture")
 }
 
-fn run_coati() -> Value {
+fn run_pycoati() -> Value {
     // `--static-only` pins these end-to-end tests to walker mode. Without it,
     // python auto-detection finds the repo's own `.venv` (or `uv run`)
     // walking up from the fixture path, fires the pytest subprocesses, and
@@ -61,7 +61,7 @@ fn run_coati() -> Value {
     // `suite.test_count = Null` flips depending on whether pytest is
     // importable in that interpreter. Pytest integration is exercised
     // separately in `tests/pytest_integration.rs`.
-    let assert = Command::cargo_bin("coati")
+    let assert = Command::cargo_bin("pycoati")
         .expect("binary built")
         .arg(fixture_root())
         .arg("--static-only")
@@ -73,13 +73,13 @@ fn run_coati() -> Value {
 
 #[test]
 fn inventory_reports_project_name_from_pyproject() {
-    let v = run_coati();
+    let v = run_pycoati();
     assert_eq!(v["project"]["name"], Value::String("myproj".to_string()));
 }
 
 #[test]
 fn walker_discovers_test_files_and_ignores_helpers() {
-    let v = run_coati();
+    let v = run_pycoati();
     let files = v["files"].as_array().expect("files must be array");
     let names: Vec<String> = files
         .iter()
@@ -116,7 +116,7 @@ fn walker_discovers_test_files_and_ignores_helpers() {
 
 #[test]
 fn per_file_assertion_counts_match_annotations() {
-    let v = run_coati();
+    let v = run_pycoati();
     let files = v["files"].as_array().expect("files must be array");
 
     let by_basename: BTreeMap<String, &Value> = files
@@ -153,7 +153,7 @@ fn per_file_assertion_counts_match_annotations() {
 
 #[test]
 fn only_asserts_on_mock_predicate_matches_annotations() {
-    let v = run_coati();
+    let v = run_pycoati();
     let test_functions = v["test_functions"].as_array().expect("test_functions must be array");
 
     let by_test_name: BTreeMap<String, &Value> = test_functions
@@ -183,7 +183,7 @@ fn only_asserts_on_mock_predicate_matches_annotations() {
 
 #[test]
 fn nodeids_are_relative_to_project_root() {
-    let v = run_coati();
+    let v = run_pycoati();
     let test_functions = v["test_functions"].as_array().expect("test_functions must be array");
     for t in test_functions {
         let nodeid = t["nodeid"].as_str().expect("nodeid string");
@@ -197,7 +197,7 @@ fn nodeids_are_relative_to_project_root() {
 
 #[test]
 fn schema_invariants_preserved_under_walker_mode() {
-    let v = run_coati();
+    let v = run_pycoati();
     assert_eq!(v["schema_version"], Value::String("2".to_string()));
     assert_eq!(v["tool"]["ran_pytest"], Value::Bool(false));
     assert_eq!(v["tool"]["ran_coverage"], Value::Bool(false));
@@ -210,7 +210,7 @@ fn schema_invariants_preserved_under_walker_mode() {
 #[test]
 fn tests_dir_override_flag_accepts_path() {
     let root = fixture_root();
-    let assert = Command::cargo_bin("coati")
+    let assert = Command::cargo_bin("pycoati")
         .expect("binary built")
         .arg(&root)
         .arg("--tests-dir")
@@ -224,7 +224,7 @@ fn tests_dir_override_flag_accepts_path() {
 
 #[test]
 fn project_package_flag_is_accepted_as_no_op() {
-    let assert = Command::cargo_bin("coati")
+    let assert = Command::cargo_bin("pycoati")
         .expect("binary built")
         .arg(fixture_root())
         .arg("--project-package")
@@ -257,7 +257,8 @@ fn malformed_python_file_is_skipped_with_warning_not_aborted() {
     std::fs::write(tests_dir.join("test_bad.py"), b"\xff\xfe not valid utf-8")
         .expect("write bad fixture");
 
-    let assert = Command::cargo_bin("coati").expect("binary built").arg(project).assert().success();
+    let assert =
+        Command::cargo_bin("pycoati").expect("binary built").arg(project).assert().success();
     let stderr = String::from_utf8(assert.get_output().stderr.clone()).expect("utf-8 stderr");
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf-8 stdout");
     let v: Value = serde_json::from_str(&stdout).expect("stdout is valid JSON");
@@ -285,7 +286,7 @@ fn malformed_python_file_is_skipped_with_warning_not_aborted() {
 /// An empty `tests/` directory must emit a distinct WARN (separate from the
 /// existing "tests directory not found" branch) and produce a valid, empty
 /// JSON inventory. Without the WARN it's painfully easy to interpret a
-/// zero-test inventory as a coati bug rather than a misconfigured project.
+/// zero-test inventory as a pycoati bug rather than a misconfigured project.
 #[test]
 fn empty_tests_directory_emits_warn_and_clean_inventory() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -296,7 +297,8 @@ fn empty_tests_directory_emits_warn_and_clean_inventory() {
     std::fs::create_dir(&tests_dir).expect("mkdir tests");
     // No files at all under tests/.
 
-    let assert = Command::cargo_bin("coati").expect("binary built").arg(project).assert().success();
+    let assert =
+        Command::cargo_bin("pycoati").expect("binary built").arg(project).assert().success();
     let stderr = String::from_utf8(assert.get_output().stderr.clone()).expect("utf-8 stderr");
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf-8 stdout");
     let v: Value = serde_json::from_str(&stdout).expect("stdout must be valid JSON");
@@ -342,7 +344,7 @@ fn empty_tests_directory_emits_warn_and_clean_inventory() {
 /// not project-internally resolvable from static analysis alone.)
 #[test]
 fn sut_calls_resolves_repository_save_in_test_uses_repo() {
-    let v = run_coati();
+    let v = run_pycoati();
     let by_name = v["sut_calls"]["by_name"].as_array().expect("by_name array");
     let names: Vec<&str> = by_name.iter().filter_map(|e| e["name"].as_str()).collect();
     assert!(
@@ -353,14 +355,14 @@ fn sut_calls_resolves_repository_save_in_test_uses_repo() {
 
 #[test]
 fn sut_calls_top_called_non_empty_for_fixture_project() {
-    let v = run_coati();
+    let v = run_pycoati();
     let top = v["sut_calls"]["top_called"].as_array().expect("top_called array");
     assert!(!top.is_empty(), "expected at least one entry in top_called");
 }
 
 #[test]
 fn test_overmocked_fires_mock_overuse_smell() {
-    let v = run_coati();
+    let v = run_pycoati();
     let test_functions = v["test_functions"].as_array().expect("test_functions array");
     let nodeid = "tests/test_overmocked.py::test_three_mocks_one_assert";
     let rec = test_functions
@@ -389,7 +391,7 @@ fn test_overmocked_fires_mock_overuse_smell() {
 
 #[test]
 fn test_mock_only_fires_mock_only_assertions_smell() {
-    let v = run_coati();
+    let v = run_pycoati();
     let test_functions = v["test_functions"].as_array().expect("test_functions array");
     let nodeid = "tests/test_mock_only.py::test_repo_save_called";
     let rec = test_functions
@@ -406,7 +408,7 @@ fn test_mock_only_fires_mock_only_assertions_smell() {
 
 #[test]
 fn file_overmocked_has_file_level_mock_overuse_smell() {
-    let v = run_coati();
+    let v = run_pycoati();
     let files = v["files"].as_array().expect("files array");
     let file = files
         .iter()
@@ -422,7 +424,7 @@ fn file_overmocked_has_file_level_mock_overuse_smell() {
 
 #[test]
 fn pyproject_project_package_detected_from_fixture() {
-    let pkgs = coati::pyproject::read_project_packages(&fixture_root()).expect("read packages");
+    let pkgs = pycoati::pyproject::read_project_packages(&fixture_root()).expect("read packages");
     assert!(pkgs.contains(&"myproj".to_string()), "expected myproj in {pkgs:?}");
 }
 
@@ -437,7 +439,7 @@ fn pyproject_project_package_detected_from_fixture() {
 fn sut_calls_resolves_my_pkg_greet_in_hyphenated_project() {
     let mut hyphen_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     hyphen_root.push("tests/fixtures/hyphen_project");
-    let assert = Command::cargo_bin("coati")
+    let assert = Command::cargo_bin("pycoati")
         .expect("binary built")
         .arg(&hyphen_root)
         .arg("--static-only")
@@ -459,7 +461,7 @@ fn cli_project_package_override_replaces_detection() {
     // with `--project-package foo` should drop the myproj-resolved entries
     // from sut_calls. Since the fixture project's only resolved entries
     // come from myproj, the resulting by_name list should be empty.
-    let assert = Command::cargo_bin("coati")
+    let assert = Command::cargo_bin("pycoati")
         .expect("binary built")
         .arg(fixture_root())
         .arg("--static-only")

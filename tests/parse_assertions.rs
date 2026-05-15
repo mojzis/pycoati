@@ -14,7 +14,7 @@ fn fixture_path(rel: &str) -> PathBuf {
 #[test]
 fn counts_two_tests_with_five_total_asserts() {
     let path = fixture_path("tests/fixtures/simple/test_basic.py");
-    let inv = coati::run_static(&path).expect("run_static on test_basic.py");
+    let inv = pycoati::run_static(&path).expect("run_static on test_basic.py");
 
     assert_eq!(
         inv.test_functions.len(),
@@ -38,7 +38,7 @@ fn counts_two_tests_with_five_total_asserts() {
 #[test]
 fn only_asserts_on_mock_is_false_for_every_phase_1_test() {
     let path = fixture_path("tests/fixtures/simple/test_basic.py");
-    let inv = coati::run_static(&path).expect("run_static on test_basic.py");
+    let inv = pycoati::run_static(&path).expect("run_static on test_basic.py");
     for t in &inv.test_functions {
         assert!(
             !t.only_asserts_on_mock,
@@ -51,7 +51,7 @@ fn only_asserts_on_mock_is_false_for_every_phase_1_test() {
 #[test]
 fn empty_file_yields_no_tests_and_no_file_record() {
     let path = fixture_path("tests/fixtures/simple/empty.py");
-    let inv = coati::run_static(&path).expect("run_static on empty.py");
+    let inv = pycoati::run_static(&path).expect("run_static on empty.py");
     assert!(inv.test_functions.is_empty(), "empty.py should produce no test functions");
     assert!(inv.files.is_empty(), "empty.py should produce no file records");
 }
@@ -59,7 +59,7 @@ fn empty_file_yields_no_tests_and_no_file_record() {
 #[test]
 fn file_record_aggregates_match_per_test_totals() {
     let path = fixture_path("tests/fixtures/simple/test_basic.py");
-    let inv = coati::run_static(&path).expect("run_static on test_basic.py");
+    let inv = pycoati::run_static(&path).expect("run_static on test_basic.py");
     assert_eq!(inv.files.len(), 1);
     let file = &inv.files[0];
     assert_eq!(file.test_function_count, inv.test_functions.len() as u64);
@@ -73,9 +73,9 @@ fn unittest_self_assert_methods_count_as_assertions() {
     // plus one `self.assertRaises` block; the parser must count all three
     // method calls as effective assertions.
     let path = fixture_path("tests/fixtures/unittest_style/test_unittest.py");
-    let inv = coati::run_static(&path).expect("run_static on unittest fixture");
+    let inv = pycoati::run_static(&path).expect("run_static on unittest fixture");
 
-    let by_name: std::collections::BTreeMap<&str, &coati::TestRecord> = inv
+    let by_name: std::collections::BTreeMap<&str, &pycoati::TestRecord> = inv
         .test_functions
         .iter()
         .filter_map(|t| t.nodeid.split("::").last().map(|n| (n, t)))
@@ -96,7 +96,7 @@ fn unittest_test_with_real_assertions_is_not_only_mock() {
     // values (self.assertEqual(x, 2), etc.). It must NOT be flagged as
     // `only_asserts_on_mock`.
     let path = fixture_path("tests/fixtures/unittest_style/test_unittest.py");
-    let inv = coati::run_static(&path).expect("run_static on unittest fixture");
+    let inv = pycoati::run_static(&path).expect("run_static on unittest fixture");
 
     let asserts_test = inv
         .test_functions
@@ -116,7 +116,7 @@ fn unittest_assert_raises_block_counts_as_assertion() {
     // raises-block branch is restricted to `pytest.raises(...)`/`raises(...)`,
     // but the unittest collector should still catch this call site.
     let path = fixture_path("tests/fixtures/unittest_style/test_unittest.py");
-    let inv = coati::run_static(&path).expect("run_static on unittest fixture");
+    let inv = pycoati::run_static(&path).expect("run_static on unittest fixture");
     let raises_test = inv
         .test_functions
         .iter()
@@ -134,7 +134,7 @@ fn unittest_class_nodeids_include_class_segment() {
     // Sanity check the existing class-prefix nodeid plumbing for the new
     // unittest fixture — every method should appear under `TestThing::`.
     let path = fixture_path("tests/fixtures/unittest_style/test_unittest.py");
-    let inv = coati::run_static(&path).expect("run_static on unittest fixture");
+    let inv = pycoati::run_static(&path).expect("run_static on unittest fixture");
     let nodeids: Vec<&str> = inv.test_functions.iter().map(|t| t.nodeid.as_str()).collect();
     assert_eq!(
         inv.test_functions.len(),
@@ -155,7 +155,7 @@ fn unittest_assert_predicate_rejects_snake_case_and_prefix_collisions() {
     //   - `self.assert_logged`      (user helper, snake_case after `assert`)
     // Only the real assertion must count.
     let path = fixture_path("tests/fixtures/unittest_style/test_unittest.py");
-    let inv = coati::run_static(&path).expect("run_static on unittest fixture");
+    let inv = pycoati::run_static(&path).expect("run_static on unittest fixture");
     let strict_test = inv
         .test_functions
         .iter()

@@ -1,6 +1,6 @@
 //! Phase 2 — `stubs_count` integration tests.
 //!
-//! Runs the `coati` binary against `tests/fixtures/stubs_style/` and
+//! Runs the `pycoati` binary against `tests/fixtures/stubs_style/` and
 //! verifies that fixture-driven patching (`monkeypatch.*`, `mocker.*`) is
 //! detected, aggregated to `stubs_count` at both per-test and per-file
 //! scope, fires `mock_overuse`, serializes through the JSON output, and
@@ -19,8 +19,8 @@ fn fixture_root() -> PathBuf {
     p
 }
 
-fn run_coati_json() -> Value {
-    let assert = Command::cargo_bin("coati")
+fn run_pycoati_json() -> Value {
+    let assert = Command::cargo_bin("pycoati")
         .expect("binary built")
         .arg(fixture_root())
         .arg("--tests-dir")
@@ -32,8 +32,8 @@ fn run_coati_json() -> Value {
     serde_json::from_str(&stdout).expect("stdout must be valid JSON")
 }
 
-fn run_coati_pretty() -> String {
-    let assert = Command::cargo_bin("coati")
+fn run_pycoati_pretty() -> String {
+    let assert = Command::cargo_bin("pycoati")
         .expect("binary built")
         .arg(fixture_root())
         .arg("--tests-dir")
@@ -48,7 +48,7 @@ fn run_coati_pretty() -> String {
 
 #[test]
 fn stubs_count_populated_on_test_records() {
-    let v = run_coati_json();
+    let v = run_pycoati_json();
     let tfs = v["test_functions"].as_array().expect("test_functions array");
     let by_name: std::collections::BTreeMap<&str, u64> = tfs
         .iter()
@@ -65,7 +65,7 @@ fn stubs_count_populated_on_test_records() {
 
 #[test]
 fn stubs_count_aggregated_on_file_record() {
-    let v = run_coati_json();
+    let v = run_pycoati_json();
     let files = v["files"].as_array().expect("files array");
     let file = files
         .iter()
@@ -77,7 +77,7 @@ fn stubs_count_aggregated_on_file_record() {
 
 #[test]
 fn stub_heavy_test_fires_mock_overuse_smell() {
-    let v = run_coati_json();
+    let v = run_pycoati_json();
     let tfs = v["test_functions"].as_array().expect("test_functions array");
     let rec = tfs
         .iter()
@@ -97,7 +97,7 @@ fn stub_heavy_test_fires_mock_overuse_smell() {
 
 #[test]
 fn file_level_mock_overuse_fires_on_stub_heavy_file() {
-    let v = run_coati_json();
+    let v = run_pycoati_json();
     let files = v["files"].as_array().expect("files array");
     let file = files
         .iter()
@@ -120,7 +120,7 @@ fn file_level_mock_overuse_fires_on_stub_heavy_file() {
 fn stubs_count_serializes_in_json_output() {
     // Tighten the JSON contract: every TestRecord and FileRecord must
     // expose `stubs_count` as a u64 (never null, never absent).
-    let v = run_coati_json();
+    let v = run_pycoati_json();
     for t in v["test_functions"].as_array().expect("test_functions array") {
         assert!(
             t["stubs_count"].is_u64(),
@@ -140,7 +140,7 @@ fn stubs_count_serializes_in_json_output() {
 
 #[test]
 fn pretty_output_contains_stubs_column() {
-    let out = run_coati_pretty();
+    let out = run_pycoati_pretty();
     // Both the tests and files headers expose a `stubs` column.
     let header_lines: Vec<&str> =
         out.lines().filter(|l| l.contains("score") && l.contains("stubs")).collect();

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-coati audits Python test suites for mock smells and suspicious tests. Hybrid Rust/Python project: builds a Rust binary (`coati`) and packages it as a Python package via maturin for distribution through pip/uv.
+pycoati audits Python test suites for mock smells and suspicious tests. Hybrid Rust/Python project: builds a Rust binary (`pycoati`) and packages it as a Python package via maturin for distribution through pip/uv.
 
 ## Common Commands
 
@@ -15,7 +15,7 @@ cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings &&
 # Run tests
 cargo test
 
-# Build and install locally for testing (puts `coati` on PATH at ~/.cargo/bin)
+# Build and install locally for testing (puts `pycoati` on PATH at ~/.cargo/bin)
 cargo install --path . --force
 
 # Build a Python wheel (only needed when packaging for pip/uv distribution)
