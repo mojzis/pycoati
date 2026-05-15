@@ -54,8 +54,19 @@ fn read_fixture(rel: &str) -> String {
 }
 
 fn run_coati() -> Value {
-    let assert =
-        Command::cargo_bin("coati").expect("binary built").arg(fixture_root()).assert().success();
+    // `--static-only` pins these end-to-end tests to walker mode. Without it,
+    // python auto-detection finds the repo's own `.venv` (or `uv run`)
+    // walking up from the fixture path, fires the pytest subprocesses, and
+    // every assertion that pins `tool.ran_pytest = false` or
+    // `suite.test_count = Null` flips depending on whether pytest is
+    // importable in that interpreter. Pytest integration is exercised
+    // separately in `tests/pytest_integration.rs`.
+    let assert = Command::cargo_bin("coati")
+        .expect("binary built")
+        .arg(fixture_root())
+        .arg("--static-only")
+        .assert()
+        .success();
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf-8 stdout");
     serde_json::from_str(&stdout).expect("stdout must be valid JSON")
 }
@@ -413,6 +424,33 @@ fn file_overmocked_has_file_level_mock_overuse_smell() {
 fn pyproject_project_package_detected_from_fixture() {
     let pkgs = coati::pyproject::read_project_packages(&fixture_root()).expect("read packages");
     assert!(pkgs.contains(&"myproj".to_string()), "expected myproj in {pkgs:?}");
+}
+
+/// `tests/fixtures/hyphen_project/pyproject.toml` declares `name = "my-pkg"`,
+/// but the importable module is `my_pkg` and `tests/test_greet.py` calls
+/// `my_pkg.greet(...)`. SUT-call resolution compares the import head
+/// (`my_pkg`) against the project-package set; without hyphen-to-underscore
+/// normalization the set holds `my-pkg`, the head never matches, and the
+/// call is silently dropped from `sut_calls.by_name`. This is the same
+/// blindspot that `default_cov_package_for` already fixes for `--cov=`.
+#[test]
+fn sut_calls_resolves_my_pkg_greet_in_hyphenated_project() {
+    let mut hyphen_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    hyphen_root.push("tests/fixtures/hyphen_project");
+    let assert = Command::cargo_bin("coati")
+        .expect("binary built")
+        .arg(&hyphen_root)
+        .arg("--static-only")
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("utf-8");
+    let v: Value = serde_json::from_str(&stdout).expect("valid json");
+    let by_name = v["sut_calls"]["by_name"].as_array().expect("by_name array");
+    let names: Vec<&str> = by_name.iter().filter_map(|e| e["name"].as_str()).collect();
+    assert!(
+        names.contains(&"my_pkg.greet"),
+        "expected my_pkg.greet in sut_calls.by_name (hyphenated [project].name must normalize), got {names:?}"
+    );
 }
 
 #[test]

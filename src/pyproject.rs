@@ -101,6 +101,12 @@ pub fn read_project_name(project_root: &Path) -> Option<String> {
 ///   harmless.
 /// - `[tool.setuptools].packages` (legacy explicit list)
 ///
+/// Hyphens in each collected name are converted to underscores: import
+/// heads (the values this set is matched against in `sut_calls::resolve_*`)
+/// can never contain hyphens, so a hyphenated `[project].name = "my-pkg"`
+/// would otherwise silently miss every `my_pkg.*` call. Same one-way
+/// transform as [`crate::default_cov_package_for`].
+///
 /// If none of the above produces any entries (e.g. no `pyproject.toml`,
 /// or the file declares nothing useful), falls back to the project root's
 /// directory basename.
@@ -152,6 +158,11 @@ pub fn read_project_packages(root: &Path) -> Result<Vec<String>> {
         }
     }
 
+    for pkg in &mut packages {
+        if pkg.contains('-') {
+            *pkg = pkg.replace('-', "_");
+        }
+    }
     packages.sort();
     packages.dedup();
     Ok(packages)
@@ -332,6 +343,20 @@ mod tests {
         // The whole file fails to parse → no packages extracted → basename
         // fallback (NOT "a", since the file failed to parse as a whole).
         assert_eq!(pkgs, vec![expected]);
+    }
+
+    #[test]
+    fn read_project_packages_normalizes_hyphens_in_project_name_to_underscores() {
+        // `[project].name = "my-pkg"` is a hyphenated distribution name; the
+        // importable Python module is conventionally `my_pkg` (hyphens are
+        // never valid in identifiers). Downstream sut-call resolution
+        // compares against import heads, which can only ever be underscored,
+        // so the auto-derived package list must normalize on the way out.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("pyproject.toml"), "[project]\nname = \"my-pkg\"\n")
+            .expect("write fixture");
+        let pkgs = read_project_packages(tmp.path()).expect("ok");
+        assert_eq!(pkgs, vec!["my_pkg".to_string()]);
     }
 
     #[test]
