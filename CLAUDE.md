@@ -15,7 +15,10 @@ cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings &&
 # Run tests
 cargo test
 
-# Build and install locally for testing
+# Build and install locally for testing (puts `coati` on PATH at ~/.cargo/bin)
+cargo install --path . --force
+
+# Build a Python wheel (only needed when packaging for pip/uv distribution)
 maturin develop
 
 # Full review (fmt, clippy, tests, audit, deny)
