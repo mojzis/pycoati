@@ -129,19 +129,21 @@ fn reject_unsupported_glob(pattern: &str) -> Result<()> {
             "unsupported glob in [tool.uv.workspace].members: `{pattern}` (character classes are not supported)"
         );
     }
-    // A bare `*` anywhere other than a trailing segment is also
-    // unsupported. `packages/*` is fine; `packages*/foo` is not.
-    if let Some(idx) = pattern.find('*') {
-        let trailing_segment = pattern.rsplit('/').next().unwrap_or(pattern);
-        if trailing_segment != "*" {
-            anyhow::bail!(
-                "unsupported glob in [tool.uv.workspace].members: `{pattern}` (only a single trailing `*` segment is supported)"
-            );
+    // A bare `*` anywhere other than as the entire trailing segment is
+    // unsupported. `packages/*` is fine; `packages*/foo`, `pat*tern/*`,
+    // and `foo*` are not — they would silently produce zero members
+    // because `read_dir` is called on a literal prefix, so reject them
+    // loudly here instead.
+    if pattern.contains('*') {
+        let mut segments = pattern.split('/').peekable();
+        while let Some(segment) = segments.next() {
+            let is_trailing = segments.peek().is_none();
+            if segment.contains('*') && !(is_trailing && segment == "*") {
+                anyhow::bail!(
+                    "unsupported glob in [tool.uv.workspace].members: `{pattern}` (only a single trailing `*` segment is supported)"
+                );
+            }
         }
-        // `*` itself must be the entire trailing segment (we already
-        // confirmed that). Defensive guard: also reject leading `*`
-        // followed by anything other than `/`.
-        let _ = idx; // silence unused — `idx` was only a presence probe.
     }
     Ok(())
 }
@@ -342,6 +344,37 @@ mod tests {
         write_workspace_root(tmp.path(), "[]");
         let ws = detect(tmp.path()).expect("detect ok").expect("workspace present");
         assert!(ws.members.is_empty(), "empty list yields zero members but still some(workspace)");
+    }
+
+    #[test]
+    fn detect_rejects_star_in_non_trailing_segment() {
+        // Regression: a `*` outside the trailing segment used to slip past
+        // `reject_unsupported_glob` and silently expand to zero members
+        // (the prefix passed to `read_dir` was treated literally). The
+        // contract is "single trailing `*` only" — anything else must
+        // fail loudly so the user notices the misconfiguration.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_workspace_root(tmp.path(), "[\"pat*tern/*\"]");
+        let err = detect(tmp.path())
+            .expect_err("must reject `*` in non-trailing segment, not silently match zero");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("trailing"),
+            "error must explain single-trailing-`*` rule, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn detect_rejects_trailing_star_with_extra_chars() {
+        // `packages*` (no slash, star not the whole segment) should also
+        // be rejected loudly. The previous logic let `foo*` slip through
+        // when there was no `/` because `rsplit` returned the whole
+        // pattern; the rewritten check now segments on `/` first.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_workspace_root(tmp.path(), "[\"packages*\"]");
+        let err = detect(tmp.path()).expect_err("must reject bare `packages*`");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("trailing"), "unexpected message: {msg}");
     }
 
     #[test]
