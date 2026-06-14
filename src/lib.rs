@@ -476,8 +476,10 @@ pub fn run_with_pytest(
     let tests_dir =
         tests_dir_override.map_or_else(|| inv.project.path.join("tests"), Path::to_path_buf);
     let project_root = inv.project.path.clone();
-    let pkg = project_package_override
-        .map_or_else(|| default_cov_package_for(&inv.project.name), str::to_string);
+    let pkg = project_package_override.map_or_else(
+        || single_project_cov_package(&inv.project.path, &inv.project.name),
+        str::to_string,
+    );
 
     invoke_pytest_for_inventory(
         &mut inv,
@@ -1065,9 +1067,46 @@ fn default_cov_package_for(project_name: &str) -> String {
     project_name.replace('-', "_")
 }
 
+/// Pick the `--cov=<pkg>` argument for a single-project run. Prefers an
+/// importable package declared in the project's `pyproject.toml` (the same
+/// source [`member_cov_package`] uses for workspace members), falling back to
+/// the normalized `[project].name` only when none is declared. This stops
+/// pytest from receiving a non-importable `--cov` target whenever the
+/// distribution name differs from the importable package (e.g. dist
+/// `introspy` → package `introspect`), which silently zeroed coverage.
+fn single_project_cov_package(root: &Path, project_name: &str) -> String {
+    pyproject::read_project_packages(root)
+        .ok()
+        .and_then(|pkgs| pkgs.into_iter().next())
+        .unwrap_or_else(|| default_cov_package_for(project_name))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::default_cov_package_for;
+    use super::{default_cov_package_for, single_project_cov_package};
+
+    #[test]
+    fn single_project_cov_package_prefers_declared_importable_package() {
+        // Distribution name differs from the importable package: pytest must
+        // get the importable one (`introspect`), not the normalized dist name.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("pyproject.toml"),
+            "[project]\nname = \"introspy\"\n\n[tool.hatch.build.targets.wheel]\npackages = [\"src/introspect\"]\n",
+        )
+        .expect("write fixture");
+        assert_eq!(single_project_cov_package(tmp.path(), "introspy"), "introspect");
+    }
+
+    #[test]
+    fn single_project_cov_package_uses_normalized_project_name_when_no_wheel_packages() {
+        // Only `[project].name` declared (hyphenated, no wheel/setuptools
+        // packages): the normalized name is the importable package.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("pyproject.toml"), "[project]\nname = \"b3d-validate\"\n")
+            .expect("write fixture");
+        assert_eq!(single_project_cov_package(tmp.path(), "b3d-validate"), "b3d_validate");
+    }
 
     #[test]
     fn default_cov_package_for_replaces_hyphens_with_underscores() {
