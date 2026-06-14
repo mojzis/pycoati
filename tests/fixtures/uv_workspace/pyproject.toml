@@ -4,3 +4,12 @@ version = "0.0.0"
 
 [tool.uv.workspace]
 members = ["packages/*"]
+
+# A real uv workspace makes each member importable via `uv sync` (editable
+# installs). The fixture isn't installed, so we mirror that state declaratively:
+# put each member's source root on sys.path. This is what lets `--member-cwd=root`
+# collect a member's tests (`python -m pytest` from the root puts only the root on
+# sys.path, not the members). `-o addopts=` in pycoati's invocation clears addopts
+# but leaves this pythonpath intact.
+[tool.pytest.ini_options]
+pythonpath = ["packages/pkg_a", "packages/pkg_b"]
