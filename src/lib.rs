@@ -20,6 +20,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 pub mod coverage;
+pub mod guide;
 pub mod mock_api;
 pub(crate) mod parser;
 pub(crate) mod pretty;

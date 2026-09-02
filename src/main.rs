@@ -9,6 +9,11 @@
 //!
 //! Run 3 adds `--format <json|pretty>` (default `json`). `pretty` writes the
 //! human-readable view; `json` is the structured `Inventory` payload.
+//!
+//! Run 4 adds `pycoati guide [PAGE]`, which prints the workflow instructions
+//! embedded in the binary (see [`pycoati::guide`]). The audit itself keeps its
+//! bare-positional form — `pycoati <path>` is unchanged — so the subcommand is
+//! declared alongside the scan arguments rather than replacing them.
 
 use std::fs;
 use std::io::{self, Write};
@@ -16,7 +21,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 
 /// Output format selector for `--format`.
 ///
@@ -37,6 +42,7 @@ enum Format {
     name = "pycoati",
     version,
     about,
+    args_conflicts_with_subcommands = true,
     long_about = "Audit Python test suites for mock smells and suspicious tests.\n\n\
         pycoati walks a Python project (or a single file), parses every test with \
         tree-sitter, and — unless --static-only is passed — runs `python -m pytest` \
@@ -47,12 +53,18 @@ enum Format {
         It emits an Inventory describing test functions, assertion counts, mock-API \
         smells, and a per-test suspicion score that flags tests likely exercising \
         mocks instead of production code. Output is JSON by default; use \
-        --format pretty for an aligned terminal view."
+        --format pretty for an aligned terminal view.\n\n\
+        `pycoati guide` prints the workflow instructions that ship with this \
+        binary; they describe the inventory schema this exact version emits."
 )]
 struct Cli {
+    /// Subcommand. When absent, pycoati runs an audit of `<PATH>`.
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Path to a Python project root (directory) or, for single-file mode,
-    /// a `.py` file.
-    path: PathBuf,
+    /// a `.py` file. Required unless a subcommand is given.
+    path: Option<PathBuf>,
 
     /// Write the output to this file instead of stdout. The format is
     /// determined by `--format`.
@@ -128,6 +140,46 @@ struct Cli {
     member_cwd: MemberCwd,
 }
 
+/// Subcommands. Deliberately kept to one: everything else pycoati does is
+/// the bare-positional audit, and moving that behind a `scan` verb would be a
+/// breaking change to every existing invocation for no gain.
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Print the workflow guide that ships with this binary.
+    ///
+    /// With a page argument, prints that page. Without one, picks the page
+    /// from the state of the current directory: `analyze` when an
+    /// `inventory.json` is present there, otherwise `setup`.
+    Guide {
+        /// Page to print. Omit to select by filesystem state: `analyze` when
+        /// an `inventory.json` is present, otherwise `setup`. `remediate` is
+        /// never auto-selected — ask for it by name.
+        #[arg(value_enum)]
+        page: Option<GuidePage>,
+    },
+}
+
+/// `pycoati guide <PAGE>` selector. Mirrors `pycoati::guide::Page` one-to-one.
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum GuidePage {
+    /// Configure pycoati and produce `inventory.json`.
+    Setup,
+    /// Inventory field reference and the anti-pattern taxonomy.
+    Analyze,
+    /// The remedy ladder and the human-approval gate.
+    Remediate,
+}
+
+impl From<GuidePage> for pycoati::guide::Page {
+    fn from(value: GuidePage) -> Self {
+        match value {
+            GuidePage::Setup => Self::Setup,
+            GuidePage::Analyze => Self::Analyze,
+            GuidePage::Remediate => Self::Remediate,
+        }
+    }
+}
+
 /// `--member-cwd` selector. Mirrors `pycoati::MemberCwd` one-to-one.
 #[derive(Copy, Clone, Debug, ValueEnum)]
 enum MemberCwd {
@@ -171,11 +223,38 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: &Cli) -> Result<()> {
+    if let Some(Command::Guide { page }) = &cli.command {
+        return run_guide(page.map(Into::into));
+    }
+    run_audit(cli)
+}
+
+/// Print one guide page to stdout, verbatim and unadorned.
+///
+/// `page` is `None` for the bare `pycoati guide`, in which case the page is
+/// chosen from the current directory's state. Detection is infallible by
+/// design — an unreadable cwd yields the `setup` page rather than an error.
+fn run_guide(page: Option<pycoati::guide::Page>) -> Result<()> {
+    let page = page.unwrap_or_else(|| {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        pycoati::guide::detect_page(&cwd)
+    });
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(page.text().as_bytes()).context("failed to write guide page to stdout")?;
+    Ok(())
+}
+
+fn run_audit(cli: &Cli) -> Result<()> {
+    let Some(path) = cli.path.as_deref() else {
+        anyhow::bail!(
+            "a PATH is required (run `pycoati --help` for usage, or `pycoati guide` for the workflow)"
+        );
+    };
     let top_n = cli.top_suspicious.unwrap_or(pycoati::DEFAULT_TOP_SUSPICIOUS);
 
     let result = if cli.static_only {
         pycoati::run_audit_static(
-            &cli.path,
+            path,
             cli.tests_dir.as_deref(),
             cli.project_package.as_deref(),
             top_n,
@@ -186,7 +265,7 @@ fn run(cli: &Cli) -> Result<()> {
         let pytest_args: Vec<String> =
             cli.pytest_args.split_whitespace().map(str::to_string).collect();
         pycoati::run_audit_with_pytest(
-            &cli.path,
+            path,
             cli.tests_dir.as_deref(),
             python_cmd.as_deref(),
             &pytest_args,
@@ -197,7 +276,7 @@ fn run(cli: &Cli) -> Result<()> {
         )?
     };
 
-    let payload = match (&result, cli.format) {
+    let mut payload = match (&result, cli.format) {
         (pycoati::AuditResult::Single(inv), Format::Json) => {
             serde_json::to_string_pretty(inv).context("failed to serialize inventory")?
         }
@@ -210,6 +289,14 @@ fn run(cli: &Cli) -> Result<()> {
         }
     };
 
+    // Guide footer. Gated on `Format::Pretty` before anything else, so the
+    // JSON payload — stdout or `--output` file — stays byte-identical to a
+    // build without this feature. `pretty` is a human view by construction,
+    // so the footer rides along with it wherever it is written.
+    if matches!(cli.format, Format::Pretty) && reports_candidates(&result) {
+        payload.push_str(SCAN_FOOTER);
+    }
+
     if let Some(out_path) = cli.output.as_ref() {
         // File output: no trailing newline (matches the Run-2 contract — the
         // file contents round-trip cleanly through `serde_json::from_str`).
@@ -221,4 +308,25 @@ fn run(cli: &Cli) -> Result<()> {
         stdout.write_all(b"\n").context("failed to write trailing newline")?;
     }
     Ok(())
+}
+
+/// Breadcrumb appended to human-format output that has candidates to inspect.
+///
+/// The leading newline separates it from the last rendered section; the
+/// caller supplies any trailing newline, matching how the payload itself is
+/// written.
+const SCAN_FOOTER: &str = "\nnext: run `pycoati guide analyze`";
+
+/// Whether this audit surfaced anything worth pointing the reader at.
+///
+/// `top_suspicious.test_functions` is the shortlist the `analyze` page tells
+/// an agent to start from, so an empty one means there is nothing to send it
+/// to. A workspace qualifies when any member does.
+fn reports_candidates(result: &pycoati::AuditResult) -> bool {
+    match result {
+        pycoati::AuditResult::Single(inv) => !inv.top_suspicious.test_functions.is_empty(),
+        pycoati::AuditResult::Workspace(ws) => {
+            ws.members.iter().any(|m| !m.top_suspicious.test_functions.is_empty())
+        }
+    }
 }
