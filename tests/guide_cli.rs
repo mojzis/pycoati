@@ -181,6 +181,18 @@ fn setup_page_says_it_is_periodic_and_names_the_per_commit_gate() {
     assert!(text.contains("madoqua"), "setup should name the hook runner it is not for");
 }
 
+/// Braindump todo 140: a repo with pytest but no pytest-cov gets `pytest exit
+/// 4`, null coverage, and a guide whose preconditions never said why.
+#[test]
+fn setup_page_names_pytest_cov_as_a_precondition() {
+    let text = setup_page();
+    let start = text.find("## Preconditions").expect("setup keeps its preconditions");
+    let end = text[start..].find("\n## ").map_or(text.len(), |i| start + i);
+    let section = &text[start..end];
+    assert!(section.contains("pytest-cov"), "preconditions should name the plugin: {section}");
+    assert!(section.contains("--no-coverage"), "and the flag that makes it optional: {section}");
+}
+
 #[test]
 fn analyze_page_names_every_anti_pattern() {
     // Match the heading, not a passing mention: the sweep list in the taxonomy

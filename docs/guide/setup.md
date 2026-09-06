@@ -23,9 +23,12 @@ smell as it is written, pycoati finds the ones already in the suite.
 
 - `pycoati` is on PATH. Check with `pycoati --version`.
 - The project has a test directory. The default is `<path>/tests`.
-- For runtime metrics (test count, runtime, coverage), `pytest` must be
-  importable by the interpreter pycoati picks. Without it the scan still
-  succeeds and every `suite.*` field is `null`.
+- For runtime metrics (test count, runtime, coverage), `pytest` and
+  `pytest-cov` must be importable by the interpreter pycoati picks:
+  `uv add --dev pytest pytest-cov`. Without pytest the scan still succeeds
+  and every `suite.*` field is `null`. Without pytest-cov the coverage pass
+  fails with `pytest exit=4`, `line_coverage_pct` is `null`, and stderr says
+  so; pass `--no-coverage` if coverage is not wanted.
 
 ## There is no config file
 

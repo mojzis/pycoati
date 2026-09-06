@@ -57,13 +57,14 @@ pub fn run_coverage(
 
     let output = Command::new(program).args(&args).current_dir(project_root).output();
 
-    // Hoist exit code + stderr tail out of the debug-only branch so the
+    // Hoist exit code + stderr out of the debug-only branch so the
     // post-parse WARNs can name *why* coverage failed. Without this, the
     // user sees only `serde_json: EOF while parsing` and has no thread to
     // pull on; the pytest stderr is where the actionable error lives
     // (`coverage.py warning: No data was collected`, `ModuleNotFoundError`,
-    // `pytest: error: argument --cov ...`, etc).
-    let (exit_code, stderr_tail) = match output {
+    // `pytest: error: unrecognized arguments: --cov ...`, etc). The full
+    // stderr goes to the debug log; the WARN gets one line of it.
+    let (exit_code, stderr) = match output {
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
             let code = o.status.code().unwrap_or(-1);
@@ -75,7 +76,7 @@ pub fn run_coverage(
                     "pytest coverage subprocess stderr"
                 );
             }
-            (code, tail_of_stderr(&stderr))
+            (code, stderr.into_owned())
         }
         Err(err) => {
             tracing::warn!(error = %err, "failed to launch pytest for coverage");
@@ -95,30 +96,21 @@ pub fn run_coverage(
         ReportOutcome::Empty => {
             // pytest didn't write anything to the report path (the most
             // common shape: coverage.py refused to write because no data
-            // was collected, or pytest blew up before the cov plugin's
-            // session-finish hook ran). Surface the exit code + stderr
-            // tail directly; do **not** let serde_json speak first with
-            // "EOF while parsing".
-            tracing::warn!(
-                pytest_exit_code = exit_code,
-                stderr_tail = %stderr_tail,
-                "no coverage data produced (pytest exit={exit_code}, stderr: {stderr_tail})"
-            );
+            // was collected, pytest-cov is not installed, or pytest blew up
+            // before the cov plugin's session-finish hook ran). Surface the
+            // exit code + one line of stderr; do **not** let serde_json
+            // speak first with "EOF while parsing".
+            tracing::warn!("{}", coverage_failure_line(exit_code, &stderr));
             return None;
         }
         ReportOutcome::Malformed(err) => {
             // The report file existed and had bytes, but those bytes were
             // not valid JSON — same root cause for the user (pytest /
             // coverage misconfiguration) but a different proximate cause.
-            // Surface the exit code + stderr tail as the headline; ship
-            // the serde error as a `caused_by` field so we don't lose it,
-            // but never as the primary message.
-            tracing::warn!(
-                pytest_exit_code = exit_code,
-                stderr_tail = %stderr_tail,
-                caused_by = %err,
-                "no coverage data produced (pytest exit={exit_code}, stderr: {stderr_tail})"
-            );
+            // Surface the exit code + one line of stderr as the headline;
+            // ship the serde error as a `caused_by` field so we don't lose
+            // it, but never as the primary message.
+            tracing::warn!(caused_by = %err, "{}", coverage_failure_line(exit_code, &stderr));
             return None;
         }
     };
@@ -162,30 +154,33 @@ fn classify_raw_report(raw: &str) -> ReportOutcome {
     }
 }
 
-/// Truncate `stderr` to the trailing 8 lines or 800 chars (whichever bound
-/// trims more aggressively), preserving the **most recent** output — that's
-/// where pytest/coverage.py print the actionable error. Returns an empty
-/// string for empty input. Bytes-vs-chars: this works on UTF-8 chars,
-/// not raw bytes, so the result is never split mid-codepoint.
-fn tail_of_stderr(stderr: &str) -> String {
-    let trimmed = stderr.trim_end();
-    if trimmed.is_empty() {
-        return String::new();
+/// The one WARN line for a coverage pass that produced no report.
+///
+/// One line, because this fires on every scan of a repo without the plugin
+/// and a multi-line argparse dump repeated per run trains people to stop
+/// reading stderr. The full pytest stderr is already on the debug log.
+/// The missing-plugin case is the one a reader can act on immediately, so
+/// it gets its own wording rather than argparse's.
+fn coverage_failure_line(exit_code: i32, stderr: &str) -> String {
+    if stderr.contains("unrecognized arguments") && stderr.contains("--cov") {
+        return format!(
+            "no coverage data produced (pytest exit={exit_code}): pytest does not recognise \
+             --cov; install pytest-cov (`uv add --dev pytest-cov`) or pass --no-coverage"
+        );
     }
-    // Last-8-lines bound.
-    let by_lines: String = {
-        let lines: Vec<&str> = trimmed.lines().collect();
-        let start = lines.len().saturating_sub(8);
-        lines[start..].join("\n")
-    };
-    // Last-800-chars bound, applied to the line-trimmed text so we never
-    // re-expand past the line budget.
-    let by_chars: String = if by_lines.chars().count() <= 800 {
-        by_lines
-    } else {
-        by_lines.chars().rev().take(800).collect::<Vec<_>>().into_iter().rev().collect()
-    };
-    by_chars
+    match last_stderr_line(stderr) {
+        Some(line) => format!("no coverage data produced (pytest exit={exit_code}): {line}"),
+        None => format!("no coverage data produced (pytest exit={exit_code})"),
+    }
+}
+
+/// The last non-blank line of `stderr`, clipped to 300 chars — that is where
+/// pytest and coverage.py put the actionable error. `None` when there is
+/// nothing to show.
+fn last_stderr_line(stderr: &str) -> Option<String> {
+    let line = stderr.lines().rev().map(str::trim).find(|l| !l.is_empty())?;
+    let clipped: String = line.chars().take(300).collect();
+    Some(clipped)
 }
 
 /// Defensively pull the top-level coverage % out of a coverage.py JSON
@@ -297,27 +292,38 @@ mod tests {
     }
 
     #[test]
-    fn tail_of_stderr_returns_empty_for_empty_input() {
-        assert_eq!(tail_of_stderr(""), "");
-        assert_eq!(tail_of_stderr("\n\n  \n"), "");
+    fn missing_cov_plugin_is_named_in_one_line() {
+        let stderr = "ERROR: usage: python -m pytest [options] [file_or_dir] [...]\n\
+            python -m pytest: error: unrecognized arguments: --cov=demo --cov-report=json:/tmp/x\n\
+            \x20 inifile: /p/pyproject.toml\n  rootdir: /p";
+        let line = coverage_failure_line(4, stderr);
+        assert_eq!(line.lines().count(), 1, "one line, got: {line}");
+        assert!(line.contains("pytest-cov"), "should name the plugin to install: {line}");
+        assert!(line.contains("--no-coverage"), "and the flag that skips coverage: {line}");
+        assert!(!line.contains("inifile"), "no argparse dump: {line}");
     }
 
     #[test]
-    fn tail_of_stderr_keeps_last_eight_lines() {
-        let stderr = (1..=20).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
-        let tail = tail_of_stderr(&stderr);
-        let kept: Vec<&str> = tail.lines().collect();
-        assert_eq!(kept.len(), 8, "expected last 8 lines, got {kept:?}");
-        assert_eq!(kept[0], "line 13");
-        assert_eq!(kept[7], "line 20");
+    fn other_failures_keep_the_exit_code_and_the_last_stderr_line() {
+        let stderr = "some earlier noise\ncoverage.py warning: No data was collected\n\n";
+        let line = coverage_failure_line(1, stderr);
+        assert_eq!(line.lines().count(), 1, "one line, got: {line}");
+        assert!(line.contains("no coverage data produced"), "keeps the headline: {line}");
+        assert!(line.contains("pytest exit=1"), "names the exit code: {line}");
+        assert!(line.contains("No data was collected"), "ends with the last line: {line}");
+        assert!(!line.contains("earlier noise"), "only the last line: {line}");
     }
 
     #[test]
-    fn tail_of_stderr_caps_at_800_chars_even_within_eight_lines() {
-        // One enormous line; the char-budget must clip it.
-        let line: String = "x".repeat(2_000);
-        let tail = tail_of_stderr(&line);
-        assert!(tail.chars().count() <= 800, "tail must not exceed 800 chars");
-        assert!(tail.ends_with('x'));
+    fn empty_stderr_gives_just_the_headline() {
+        let line = coverage_failure_line(2, "\n  \n");
+        assert_eq!(line, "no coverage data produced (pytest exit=2)");
+    }
+
+    #[test]
+    fn a_long_last_line_is_clipped() {
+        let stderr = "x".repeat(2_000);
+        let line = coverage_failure_line(1, &stderr);
+        assert!(line.chars().count() <= 400, "must be clipped: {}", line.len());
     }
 }
