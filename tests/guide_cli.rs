@@ -168,6 +168,19 @@ fn every_page_ends_with_a_single_next_line() {
     }
 }
 
+/// Braindump todo 133: readers wired pycoati into the commit hook next to
+/// zorilla. The setup page has to say which of the two is the gate.
+#[test]
+fn setup_page_says_it_is_periodic_and_names_the_per_commit_gate() {
+    let text = setup_page();
+    let fits = text.find("## Where this fits").expect("setup should have the section");
+    let preconditions = text.find("## Preconditions").expect("setup keeps its preconditions");
+    assert!(fits < preconditions, "the placement note comes before the mechanics");
+    assert!(text.contains("not a commit hook"), "setup should rule out the hook");
+    assert!(text.contains("uvx zorilla guide"), "setup should point at zorilla's guide");
+    assert!(text.contains("madoqua"), "setup should name the hook runner it is not for");
+}
+
 #[test]
 fn analyze_page_names_every_anti_pattern() {
     // Match the heading, not a passing mention: the sweep list in the taxonomy

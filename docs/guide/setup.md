@@ -6,6 +6,19 @@ edits your code and never mutates your environment.
 
 You are here to produce `inventory.json`. Do that, then move to the next page.
 
+## Where this fits
+
+pycoati is a periodic audit, not a commit hook. A scan runs the suite under
+pytest for durations and coverage, so it is minutes, not milliseconds, and its
+verdict is a ranked list to work through, not a pass/fail. Run it on a
+schedule, before a refactor of the tests, or when the suite feels slow or
+untrustworthy. Do not wire it into a pre-commit gate such as madoqua.
+
+The per-commit gate for test quality is zorilla, which lints the changed test
+files in milliseconds and exits non-zero on findings; `uvx zorilla guide`
+explains how to wire it in. The two overlap on purpose: zorilla catches the
+smell as it is written, pycoati finds the ones already in the suite.
+
 ## Preconditions
 
 - `pycoati` is on PATH. Check with `pycoati --version`.
