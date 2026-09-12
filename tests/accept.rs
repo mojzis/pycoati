@@ -11,8 +11,22 @@
 //! | `test_mock_only_assertion`    | `mock_only_assertions`             |
 //! | `test_clean`                  | none                               |
 //!
-//! Every test here stages its own tempdir copy: the baseline file is written
-//! into the project root, and several tests edit the fixture's source.
+//! Two fixtures, deliberately paired:
+//!
+//! - `accept_project` ships **no** `.pycoati-accept.toml`. Tests that need
+//!   one write it into a staged tempdir copy, so each can craft the exact
+//!   entry it is about. `the_no_baseline_fixture_ships_no_baseline` guards
+//!   the "no file" half, since every other test built on it assumes it.
+//! - `accept_with_baseline` ships a committed `.pycoati-accept.toml` next to
+//!   its `pyproject.toml`, with comments, a multi-signal entry, a pinned
+//!   fingerprint, and one flagged test left deliberately unreviewed. That is
+//!   the end-to-end case: a real file on disk in a real project layout,
+//!   discovered by the binary with no flags.
+//!
+//! Tests that write a baseline or edit Python source stage their own tempdir
+//! copy. `--static-only` runs write nothing, so those may read the source
+//! fixture directly; anything invoking pytest must stage (pytest-cov drops
+//! `.coverage` into the project root).
 //!
 //! Staging and the pytest probe live in `tests/common/mod.rs`, shared with
 //! `pytest_integration.rs`.
@@ -534,6 +548,138 @@ fn accept_file_is_rejected_against_a_workspace_root() {
     assert!(stderr.contains("--accept-file is incompatible"), "stderr: {stderr}");
 }
 
+// --- the committed baseline ------------------------------------------------
+
+const REVIEWED_SMOKE: &str = "tests/test_reviewed.py::test_cli_entry_point_installs";
+const REVIEWED_IMPORT: &str = "tests/test_reviewed.py::test_import_does_not_raise";
+const REVIEWED_MOCK: &str = "tests/test_reviewed.py::test_retry_reports_through_the_mock";
+const REVIEWED_CLEAN: &str = "tests/test_reviewed.py::test_normalize_strips_and_lowercases";
+
+/// Scan the committed-baseline fixture in place. Safe without staging: a
+/// `--static-only` run reads and writes nothing in the project.
+fn scan_committed() -> Value {
+    scan(&fixture_path("tests/fixtures/accept_with_baseline"), &[])
+}
+
+#[test]
+fn a_committed_baseline_is_found_and_applied_with_no_flags() {
+    let v = scan_committed();
+
+    assert!(
+        v["accepted"]["path"].as_str().expect("path").ends_with(".pycoati-accept.toml"),
+        "the committed baseline must be discovered without --accept-file: {:?}",
+        v["accepted"]["path"]
+    );
+
+    // The multi-signal entry and the single-signal one, reasons verbatim.
+    assert_eq!(
+        signals(&v, REVIEWED_SMOKE),
+        vec!["high_setup_ratio".to_string(), "zero_asserts".to_string()]
+    );
+    assert_eq!(signals(&v, REVIEWED_IMPORT), vec!["zero_asserts".to_string()]);
+
+    let findings = v["accepted"]["findings"].as_array().expect("findings array");
+    assert_eq!(findings.len(), 3, "two signals on one test plus one on another");
+    let reason_for = |nodeid: &str, signal: &str| -> String {
+        findings
+            .iter()
+            .find(|f| f["test"] == nodeid && f["signal"] == signal)
+            .unwrap_or_else(|| panic!("no finding for {nodeid} / {signal}"))["reason"]
+            .as_str()
+            .expect("reason string")
+            .to_string()
+    };
+    assert_eq!(
+        reason_for(REVIEWED_SMOKE, "zero_asserts"),
+        "assertions run in a child interpreter; the parent propagates failure via subprocess.run(check=True)"
+    );
+    assert_eq!(
+        reason_for(REVIEWED_IMPORT, "zero_asserts"),
+        "smoke contract: importing and calling must not raise"
+    );
+    // Provenance survives the round trip through the file.
+    let smoke = findings
+        .iter()
+        .find(|f| f["test"] == REVIEWED_SMOKE && f["signal"] == "zero_asserts")
+        .expect("smoke finding");
+    assert_eq!(smoke["reviewed"], "2026-09-12 / packaging review");
+    assert_eq!(smoke["fingerprint"], "f4e02e3172e2c958");
+
+    let list = shortlist(&v);
+    assert!(!list.contains(&REVIEWED_SMOKE.to_string()), "{list:?}");
+    assert!(!list.contains(&REVIEWED_IMPORT.to_string()), "{list:?}");
+}
+
+#[test]
+fn the_committed_baseline_leaves_the_unreviewed_finding_on_the_shortlist() {
+    // Nothing in the committed file accepts this test's
+    // `mock_only_assertions` hit. A project having a baseline at all must not
+    // make its unreviewed findings quieter.
+    let v = scan_committed();
+
+    assert!(signals(&v, REVIEWED_MOCK).is_empty());
+    assert_eq!(
+        shortlist(&v),
+        vec![REVIEWED_MOCK.to_string(), REVIEWED_CLEAN.to_string()],
+        "only the two tests nobody signed off on remain, in score order"
+    );
+}
+
+#[test]
+fn the_committed_baseline_has_no_stale_entries() {
+    // A health check on the checked-in file itself: rename a fixture test
+    // without touching the baseline and this fails, which is the same signal
+    // a real project gets on its own baseline.
+    let v = scan_committed();
+    let stale = v["accepted"]["stale"].as_array().expect("stale array");
+    assert!(
+        stale.is_empty(),
+        "tests/fixtures/accept_with_baseline/.pycoati-accept.toml has entries that no longer \
+         apply: {stale:#?}"
+    );
+}
+
+#[test]
+fn the_committed_fingerprint_still_matches_its_test() {
+    // The committed baseline pins a fingerprint, so the TOML and the Python
+    // beside it have to stay in sync. This asserts the documented workflow —
+    // copy `test_functions[].fingerprint` into the entry — actually round
+    // trips, and that the hash is stable across runs and platforms.
+    let v = scan_committed();
+    let current = record(&v, REVIEWED_SMOKE)["fingerprint"].as_str().expect("fingerprint");
+    assert_eq!(
+        current, "f4e02e3172e2c958",
+        "the fingerprint of {REVIEWED_SMOKE} changed. If you edited that test on purpose, \
+         put {current} in the `fingerprint` key of \
+         tests/fixtures/accept_with_baseline/.pycoati-accept.toml and in this assertion."
+    );
+}
+
+#[test]
+fn the_no_baseline_fixture_ships_no_baseline() {
+    // Every other test in this file writes its own baseline into a staged
+    // copy of `accept_project` and assumes the fixture starts clean.
+    // Committing a `.pycoati-accept.toml` there would silently change what
+    // all of them mean.
+    let stray = fixture_path("tests/fixtures/accept_project/.pycoati-accept.toml");
+    assert!(
+        !stray.exists(),
+        "{} must not exist — accept_project is the no-baseline fixture; \
+         accept_with_baseline is the one that ships a file",
+        stray.display()
+    );
+    // And the binary agrees, unprompted.
+    let v = scan(&fixture_path("tests/fixtures/accept_project"), &[]);
+    assert_eq!(v["accepted"]["path"], Value::Null);
+    assert_eq!(v["accepted"]["findings"], Value::Array(vec![]));
+    assert_eq!(v["accepted"]["stale"], Value::Array(vec![]));
+    assert!(v["test_functions"]
+        .as_array()
+        .expect("tests")
+        .iter()
+        .all(|t| { t["accepted_signals"].as_array().expect("accepted_signals array").is_empty() }));
+}
+
 // --- single-file mode ------------------------------------------------------
 
 /// Single-file scans have no project root of their own, so the baseline is
@@ -616,6 +762,56 @@ fn pretty_output_omits_the_sections_when_nothing_was_accepted() {
 }
 
 // --- runtime metrics -------------------------------------------------------
+
+/// The committed baseline, end to end through a real pytest run: the two
+/// accepted tests are held back from the shortlist and still collected, run
+/// and counted. Compares against `--no-accept` on the same staged copy, so
+/// the only variable is whether the file was read.
+#[test]
+fn a_committed_baseline_does_not_change_what_pytest_runs() {
+    let python = integration_python();
+    if !pytest_available(&python) {
+        eprintln!("SKIPPED: pytest not available via `{python}`");
+        return;
+    }
+
+    let (_tmp, root) = stage_fixture("accept_with_baseline");
+    assert!(
+        root.join(".pycoati-accept.toml").is_file(),
+        "staging must carry the committed baseline across"
+    );
+
+    let run = |extra: &[&str]| -> Value {
+        let mut cmd = Command::cargo_bin("pycoati").expect("binary built");
+        cmd.arg(&root).args(["--python", &python]);
+        for arg in extra {
+            cmd.arg(arg);
+        }
+        let assert = cmd.assert().success();
+        serde_json::from_str(
+            &String::from_utf8(assert.get_output().stdout.clone()).expect("utf-8 stdout"),
+        )
+        .expect("stdout is valid JSON")
+    };
+
+    let with_baseline = run(&[]);
+    let without = run(&["--no-accept"]);
+
+    assert_eq!(with_baseline["tool"]["ran_pytest"], Value::Bool(true));
+    assert_eq!(with_baseline["accepted"]["findings"].as_array().expect("findings").len(), 3);
+    assert_eq!(without["accepted"]["path"], Value::Null);
+
+    // The shortlist is the only thing the baseline moved…
+    assert!(!shortlist(&with_baseline).contains(&REVIEWED_SMOKE.to_string()));
+    assert!(shortlist(&without).contains(&REVIEWED_SMOKE.to_string()));
+
+    // …and pytest saw exactly the same suite either way.
+    assert_eq!(with_baseline["suite"]["test_count"], without["suite"]["test_count"]);
+    assert_eq!(with_baseline["suite"]["test_count"].as_u64(), Some(4));
+    assert_eq!(with_baseline["suite"]["line_coverage_pct"], without["suite"]["line_coverage_pct"]);
+    assert!(with_baseline["suite"]["line_coverage_pct"].as_f64().expect("coverage") > 0.0);
+    assert_eq!(with_baseline["files"], without["files"]);
+}
 
 /// The load-bearing guarantee: acceptance is an analysis decision, so the
 /// test still runs and still counts. Self-skips when pytest is unavailable,

@@ -6,6 +6,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
 
@@ -334,4 +335,89 @@ fn every_breadcrumb_points_at_a_real_page() {
         }
     }
     assert!(found >= 3, "expected the pages to cross-reference each other, found {found}");
+}
+
+// --- flag drift -------------------------------------------------------------
+
+/// Long flags the `setup` page is deliberately silent about: clap's built-ins
+/// are not part of the workflow the guide describes.
+const NOT_IN_THE_GUIDE: [&str; 2] = ["--help", "--version"];
+
+/// Every long flag `pycoati --help` advertises.
+///
+/// Parsed from the rendered help rather than from the `Cli` struct, which
+/// lives in the binary crate and is not importable here. Flag lines are
+/// indented at most 8 spaces (`  -o, --output` / `      --no-accept`) while
+/// wrapped description lines sit at 10, so the indent bound is what keeps a
+/// description that mentions a flag out of the set.
+fn cli_long_flags() -> BTreeSet<String> {
+    let assert =
+        Command::cargo_bin("pycoati").expect("binary built").arg("--help").assert().success();
+    let help = String::from_utf8(assert.get_output().stdout.clone()).expect("utf-8 stdout");
+
+    help.lines()
+        .filter_map(|line| {
+            let indent = line.len() - line.trim_start().len();
+            if !(2..=8).contains(&indent) {
+                return None;
+            }
+            let mut rest = line.trim_start();
+            // Skip an optional short form, e.g. `-o, --output`.
+            if rest.starts_with('-') && !rest.starts_with("--") {
+                rest = rest.split_once(", ")?.1;
+            }
+            if !rest.starts_with("--") {
+                return None;
+            }
+            let flag: String =
+                rest.chars().take_while(|c| c.is_ascii_lowercase() || *c == '-').collect();
+            (flag.len() > 2).then_some(flag)
+        })
+        .filter(|flag| !NOT_IN_THE_GUIDE.contains(&flag.as_str()))
+        .collect()
+}
+
+/// Flags the `setup` page documents: the backtick-quoted token opening a
+/// bullet in the Flags section.
+fn flags_documented_on_the_setup_page() -> BTreeSet<String> {
+    pycoati::guide::SETUP
+        .lines()
+        .filter_map(|line| line.strip_prefix("- `--"))
+        .map(|rest| {
+            let name: String =
+                rest.chars().take_while(|c| c.is_ascii_lowercase() || *c == '-').collect();
+            format!("--{name}")
+        })
+        .collect()
+}
+
+#[test]
+fn every_cli_flag_is_documented_on_the_setup_page() {
+    let advertised = cli_long_flags();
+    assert!(advertised.len() > 5, "help parsing found almost nothing: {advertised:?}");
+
+    let documented = flags_documented_on_the_setup_page();
+    let missing: Vec<&String> = advertised.difference(&documented).collect();
+
+    assert!(
+        missing.is_empty(),
+        "docs/guide/setup.md is out of date with the CLI.\n\
+         These flags have no `- `<flag>` — …` bullet in its Flags section: {missing:?}\n\
+         Add one bullet per flag, then re-run this test."
+    );
+}
+
+#[test]
+fn the_setup_page_documents_no_flag_the_cli_dropped() {
+    // The reverse guard. Without it, removing a flag leaves its bullet on the
+    // page forever and the guide starts describing a CLI that no longer
+    // exists — the same failure mode the schema drift test prevents.
+    let documented = flags_documented_on_the_setup_page();
+    let advertised = cli_long_flags();
+    let stale: Vec<&String> = documented.difference(&advertised).collect();
+
+    assert!(
+        stale.is_empty(),
+        "docs/guide/setup.md documents flags the CLI no longer accepts: {stale:?}"
+    );
 }

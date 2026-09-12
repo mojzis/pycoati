@@ -321,6 +321,11 @@ An acceptance is a **review decision recorded once**, not a rule change and
 not a threshold. Read it as: a human looked at this exact test, agreed the
 signal fires, and wrote down why it is correct anyway.
 
+They live in `.pycoati-accept.toml` at the project root, one `[[accept]]`
+block per (test, signal) pair, each with a required `reason`. `accepted.path`
+names the file this run actually read. Run `pycoati guide setup` for the full
+format — you do not need it to read an inventory, only to propose an entry.
+
 Three consequences for how you read an inventory:
 
 - **Do not re-litigate an accepted finding.** If `accepted.findings` covers a
@@ -335,8 +340,9 @@ Three consequences for how you read an inventory:
 If you cannot confirm a finding by reading the test, and the reason it looks
 suspicious is genuinely project context the AST cannot see, the right output
 is a proposed accept entry in your report — test nodeid, signal, reason,
-fingerprint — for a human to add. Not a threshold change, and not a deleted
-test.
+fingerprint — for a human to add to `.pycoati-accept.toml`. Not a threshold
+change, and not a deleted test. The remediate page gives the exact block to
+put in the report, and the rule that you propose it rather than write it.
 
 ---
 
