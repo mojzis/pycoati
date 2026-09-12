@@ -30,6 +30,7 @@ pub mod python_detect;
 pub(crate) mod smells;
 pub(crate) mod suspicion;
 pub(crate) mod sut_calls;
+pub(crate) mod verification;
 pub mod walker;
 pub mod workspace;
 
@@ -147,6 +148,20 @@ pub struct TestRecord {
     /// constructions remain a file-scope signal only.
     pub stubs_count: u64,
     pub setup_to_assertion_ratio: f64,
+    /// Call sites in this test's body that verify an outcome the test body
+    /// cannot see: today, a child process whose non-zero exit status is
+    /// checked (`subprocess.run(..., check=True)`, `check_call`,
+    /// `check_output`, `CompletedProcess.check_returncode()`).
+    ///
+    /// Kept separate from `assertion_count`, which stays a syntactic count
+    /// of `assert`-shaped constructs. A non-zero value means a failure
+    /// raised outside this process still fails the test, so zero assertions
+    /// is not the absence of verification.
+    ///
+    /// The inference is narrow: a checked call against a name the test
+    /// replaced with a double, or one nested in a `def` the test may never
+    /// invoke, does not count.
+    pub external_verification_count: u64,
     pub called_names: Vec<String>,
     pub smell_hits: Vec<SmellHit>,
     pub suspicion_score: f64,

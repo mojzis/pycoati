@@ -32,7 +32,13 @@
 //!   row deltas. When the body contains no `assert_statement`, the
 //!   numerator becomes `last_body_line - def_line` and the denominator is
 //!   `1`, so zero-assert setup-heavy tests naturally rank high on the
-//!   suspicion-score axis.
+//!   suspicion-score axis — unless the body carries external verification,
+//!   in which case the first verification call site plays the assertion's
+//!   role.
+//! * `external_verification_count` — call sites that check a child
+//!   process's exit status, so that a failure outside this process still
+//!   fails the test. See [`crate::verification`] for the matched shapes and
+//!   for why the inference stops where it does.
 //! * `called_names` — raw, sorted, deduped dot-joined attribute chain at
 //!   the `function` child of every `call_expression` in the test body,
 //!   minus calls whose head chain starts with `self.`. Phase 2 resolves
@@ -56,8 +62,14 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use tree_sitter::{Node, Parser};
 
-use crate::mock_api::{is_mock_api_attribute, is_mock_constructor, is_stub_call_head};
-use crate::sut_calls::{dotted_head, ImportMap};
+use crate::mock_api::{
+    chain_constructs_a_mock, is_mock_api_attribute, is_mock_constructor, is_stub_call_head,
+};
+use crate::sut_calls::{canonicalize_called_name, dotted_head, is_at_or_under, ImportMap};
+use crate::verification::{
+    is_checkable_subprocess_call, is_checked_subprocess_call, is_returncode_check,
+    is_subprocess_name, is_suppress_context_manager, CHECK_KEYWORD, TRUE_LITERAL,
+};
 use crate::TestRecord;
 
 /// What [`parse_python_file`] returns: the per-test records plus per-file
@@ -106,23 +118,59 @@ pub fn parse_python_file(source: &str, file_path: &Path) -> Result<ParsedFile> {
     let root = tree.root_node();
     let bytes = source.as_bytes();
 
+    // The import map is built before the tests are walked: resolving a call
+    // head against it (`sp.run` → `subprocess.run`) is part of building each
+    // record, not a later pass.
+    let import_map = build_import_map(root, bytes);
+
     let mut parsed = ParsedFile::default();
-    collect_module_tests(root, bytes, file_path, &mut parsed);
+    collect_module_tests(root, bytes, file_path, &import_map, &mut parsed);
     parsed.fixture_count = count_fixture_decorators(root, bytes);
-    parsed.import_map = build_import_map(root, bytes);
+    parsed.import_map = import_map;
     Ok(parsed)
+}
+
+/// What an enclosing `class` contributes to one of its test methods:
+/// pytest's nodeid prefix, plus the names the class replaced with a test
+/// double for every method in it — a class-level `@patch`, or a `setUp`
+/// that starts a patcher. Module-level tests carry [`ClassContext::NONE`].
+#[derive(Clone, Copy)]
+struct ClassContext<'a> {
+    prefix: Option<&'a str>,
+    /// Dotted names the class installed doubles for. Borrowed because the
+    /// set is computed once per class and shared by every method in it.
+    shadows: &'a BTreeSet<String>,
+}
+
+impl ClassContext<'_> {
+    /// A module-level test: no nodeid prefix, no class-installed doubles.
+    const NONE: Self = Self { prefix: None, shadows: &BTreeSet::new() };
 }
 
 /// Iterate the immediate children of the module and dispatch on node kind:
 /// bare `function_definition`s (top-level tests), `decorated_definition`s
 /// (wrapping a function or a class), and `class_definition`s (pytest test
 /// containers when named `Test*`).
-fn collect_module_tests(module: Node<'_>, source: &[u8], file_path: &Path, out: &mut ParsedFile) {
+fn collect_module_tests(
+    module: Node<'_>,
+    source: &[u8],
+    file_path: &Path,
+    imports: &ImportMap,
+    out: &mut ParsedFile,
+) {
     let mut cursor = module.walk();
     for child in module.children(&mut cursor) {
         match child.kind() {
             "function_definition" => {
-                try_collect_test_function(child, None, source, file_path, None, out);
+                try_collect_test_function(
+                    child,
+                    None,
+                    source,
+                    file_path,
+                    ClassContext::NONE,
+                    imports,
+                    out,
+                );
             }
             "decorated_definition" => {
                 if let Some(inner) = child.child_by_field_name("definition") {
@@ -133,19 +181,27 @@ fn collect_module_tests(module: Node<'_>, source: &[u8], file_path: &Path, out: 
                                 Some(child),
                                 source,
                                 file_path,
-                                None,
+                                ClassContext::NONE,
+                                imports,
                                 out,
                             );
                         }
                         "class_definition" => {
-                            collect_class_tests(inner, source, file_path, out);
+                            collect_class_tests(
+                                inner,
+                                Some(child),
+                                source,
+                                file_path,
+                                imports,
+                                out,
+                            );
                         }
                         _ => {}
                     }
                 }
             }
             "class_definition" => {
-                collect_class_tests(child, source, file_path, out);
+                collect_class_tests(child, None, source, file_path, imports, out);
             }
             _ => {}
         }
@@ -159,8 +215,10 @@ fn collect_module_tests(module: Node<'_>, source: &[u8], file_path: &Path, out: 
 /// from pytest's nodeid shape.
 fn collect_class_tests(
     class_node: Node<'_>,
+    class_decorated: Option<Node<'_>>,
     source: &[u8],
     file_path: &Path,
+    imports: &ImportMap,
     out: &mut ParsedFile,
 ) {
     let Some(class_name) = node_name(class_node, source) else {
@@ -172,11 +230,13 @@ fn collect_class_tests(
     let Some(body) = class_node.child_by_field_name("body") else {
         return;
     };
+    let shadows = class_installed_doubles(body, class_decorated, source, imports);
+    let class = ClassContext { prefix: Some(class_name), shadows: &shadows };
     let mut cursor = body.walk();
     for child in body.children(&mut cursor) {
         match child.kind() {
             "function_definition" => {
-                try_collect_test_function(child, None, source, file_path, Some(class_name), out);
+                try_collect_test_function(child, None, source, file_path, class, imports, out);
             }
             "decorated_definition" => {
                 if let Some(inner) = child.child_by_field_name("definition") {
@@ -186,7 +246,8 @@ fn collect_class_tests(
                             Some(child),
                             source,
                             file_path,
-                            Some(class_name),
+                            class,
+                            imports,
                             out,
                         );
                     }
@@ -197,6 +258,57 @@ fn collect_class_tests(
     }
 }
 
+/// Lifecycle hooks that run before a test method and therefore install
+/// doubles on its behalf. `unittest`'s `setUp` / `setUpClass` and pytest's
+/// xunit-style `setup_method` / `setup_class`; `conftest.py` fixtures are
+/// out of reach of a single-file parser.
+const SETUP_METHODS: &[&str] = &["setUp", "setUpClass", "setup_method", "setup_class"];
+
+/// Names a class replaced with a test double for all of its methods: the
+/// targets of a class-level `@patch`, and of any patch-shaped call in a
+/// setup hook (`self.patcher = patch("a.b"); self.patcher.start()`).
+fn class_installed_doubles(
+    class_body: Node<'_>,
+    class_decorated: Option<Node<'_>>,
+    source: &[u8],
+    imports: &ImportMap,
+) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+
+    if let Some(decorated) = class_decorated {
+        names.extend(decorator_patch_targets(decorated, source, imports));
+    }
+
+    let mut cursor = class_body.walk();
+    for child in class_body.children(&mut cursor) {
+        let Some(func) = setup_method(child, source) else {
+            continue;
+        };
+        let Some(hook_body) = func.child_by_field_name("body") else {
+            continue;
+        };
+        let mut calls: Vec<Node<'_>> = Vec::new();
+        collect_calls(hook_body, &mut calls);
+        names.extend(patch_call_targets(&calls, source, imports));
+    }
+
+    names
+}
+
+/// The `function_definition` behind a class-body child when it is a setup
+/// hook, unwrapping a `decorated_definition` first.
+fn setup_method<'a>(child: Node<'a>, source: &[u8]) -> Option<Node<'a>> {
+    let func = match child.kind() {
+        "function_definition" => child,
+        "decorated_definition" => child
+            .child_by_field_name("definition")
+            .filter(|inner| inner.kind() == "function_definition")?,
+        _ => return None,
+    };
+    let name = node_name(func, source)?;
+    SETUP_METHODS.contains(&name).then_some(func)
+}
+
 /// Push one record if the `function_definition` is a `test_*`. When the
 /// function is wrapped by a `decorated_definition`, `decorated` carries
 /// that wrapper so decorator counts can be extracted.
@@ -205,13 +317,14 @@ fn try_collect_test_function(
     decorated: Option<Node<'_>>,
     source: &[u8],
     file_path: &Path,
-    class_prefix: Option<&str>,
+    class: ClassContext<'_>,
+    imports: &ImportMap,
     out: &mut ParsedFile,
 ) {
     if let Some(name) = node_name(func, source) {
         if name.starts_with("test_") {
             let (record, mock_constructions) =
-                build_record(func, decorated, name, source, file_path, class_prefix);
+                build_record(func, decorated, name, source, file_path, class, imports);
             out.mock_construction_count =
                 out.mock_construction_count.saturating_add(mock_constructions);
             out.patch_decorator_count =
@@ -244,7 +357,8 @@ fn build_record(
     name: &str,
     source: &[u8],
     file_path: &Path,
-    class_prefix: Option<&str>,
+    class: ClassContext<'_>,
+    imports: &ImportMap,
 ) -> (TestRecord, u64) {
     // tree-sitter rows are zero-indexed `usize`. On every supported target
     // `usize` is at most 64 bits, so the cast is exact; `saturating_add`
@@ -265,7 +379,7 @@ fn build_record(
         collect_raises_blocks(body_node, source, &mut raises_blocks);
         // Reuse the `calls` vector already walked above instead of rewalking
         // the body — keeps the parse pass single-walk per node kind.
-        collect_unittest_asserts(&calls, class_prefix, source, &mut unittest_asserts);
+        collect_unittest_asserts(&calls, class.prefix, source, &mut unittest_asserts);
     }
 
     // `with pytest.raises(...)` blocks are non-mock effective assertions: they
@@ -291,12 +405,20 @@ fn build_record(
 
     let called_names = called_names_for_test(&calls, source);
 
+    // Verification the body performs outside this process. Walks the same
+    // `calls` vector as the counts above — no extra tree walk. Names the
+    // test replaced with a double are excluded: checking a double's exit
+    // status is not evidence.
+    let shadowed = shadowed_names(func, decorated, &calls, source, imports, class.shadows);
+    let verification_sites = external_verification_sites(&calls, body, source, imports, &shadowed);
+    let external_verification_count = verification_sites.len() as u64;
+
     let patch_decorator_count = decorated.map_or(0, |d| count_patch_decorators(d, source));
 
     let setup_to_assertion_ratio =
-        compute_setup_to_assertion_ratio(func, body, &asserts, &raises_blocks);
+        compute_setup_to_assertion_ratio(func, body, &asserts, &raises_blocks, &verification_sites);
 
-    let nodeid = match class_prefix {
+    let nodeid = match class.prefix {
         Some(cls) => format!("{}::{}::{}", file_path.display(), cls, name),
         None => format!("{}::{}", file_path.display(), name),
     };
@@ -310,6 +432,7 @@ fn build_record(
         patch_decorator_count,
         stubs_count,
         setup_to_assertion_ratio,
+        external_verification_count,
         called_names,
         smell_hits: Vec::new(),
         suspicion_score: 0.0,
@@ -323,7 +446,12 @@ fn build_record(
 /// With at least one effective assertion (assert statement or raises block):
 ///   `(first_effective_row - def_row) / effective_count`
 ///
-/// With zero effective assertions:
+/// With zero effective assertions but at least one external-verification
+/// call site (see [`crate::verification`]), that call site takes the place
+/// of the first assertion:
+///   `(first_verification_row - def_row) / verification_count`
+///
+/// With neither:
 ///   `(last_body_row - def_row) / 1`
 ///
 /// Row deltas are taken from tree-sitter `start_position().row` (0-indexed);
@@ -333,6 +461,7 @@ fn compute_setup_to_assertion_ratio(
     body: Option<Node<'_>>,
     asserts: &[Node<'_>],
     raises_blocks: &[Node<'_>],
+    verification_sites: &[Node<'_>],
 ) -> f64 {
     let def_row = func.start_position().row;
     let effective_count = asserts.len() + raises_blocks.len();
@@ -343,6 +472,16 @@ fn compute_setup_to_assertion_ratio(
         let denom = effective_count.max(1) as f64;
         return delta / denom;
     }
+    // No local assertion, but the body checks a child process: the body is
+    // not "all setup and no verification", so the body-height fallback below
+    // would overstate it. Measure to the first verification call site
+    // instead, exactly as the assert branch does.
+    let first_verification = verification_sites.iter().map(|n| n.start_position().row).min();
+    if let Some(first) = first_verification {
+        let delta = first.saturating_sub(def_row) as f64;
+        let denom = verification_sites.len().max(1) as f64;
+        return delta / denom;
+    }
     // Zero-assert fallback: body height, divided by 1. "Last body row" is
     // the start row of the body's last named statement — this is the row
     // index a human would point at as "the last line of the function body".
@@ -351,6 +490,478 @@ fn compute_setup_to_assertion_ratio(
     };
     let last_body_row = last_named_child_row(body_node).unwrap_or(def_row);
     last_body_row.saturating_sub(def_row) as f64
+}
+
+/// Select the call sites in `calls` that verify an outcome outside this
+/// process, in source order.
+///
+/// Three shapes qualify, and only these (see [`crate::verification`] for
+/// why the inference stops here):
+///
+/// * a call canonicalizing to `subprocess.check_call` / `check_output`,
+///   which raise on a non-zero exit status unconditionally;
+/// * a call canonicalizing to `subprocess.run` that passes `check=True`;
+/// * `<receiver>.check_returncode()`, the explicit check on a
+///   `CompletedProcess`.
+///
+/// Call heads are canonicalized through the file's import map first, so
+/// aliases (`import subprocess as sp`, `from subprocess import run as r`)
+/// resolve. Three things are rejected, all so the count never credits
+/// evidence the test manufactured or never runs:
+///
+/// * a call whose name the test replaced with a double (`@patch`,
+///   `monkeypatch.setattr`, a fixture parameter shadowing the module) —
+///   a double never exits non-zero, so checking it proves nothing;
+/// * a call nested inside a `def` or `lambda` in the body, which the test
+///   may never invoke;
+/// * a head that does not resolve (`from subprocess import *`), matched as
+///   written and therefore missed.
+///
+/// The last two are silent under-counts, which is the safe direction for a
+/// signal that suppresses another one.
+fn external_verification_sites<'a>(
+    calls: &[Node<'a>],
+    body: Option<Node<'_>>,
+    source: &[u8],
+    imports: &ImportMap,
+    shadowed: &BTreeSet<String>,
+) -> Vec<Node<'a>> {
+    calls
+        .iter()
+        .copied()
+        .filter(|call| {
+            let Some(chain) = call_head_chain(*call, source) else {
+                return false;
+            };
+            if verification_is_unreliable(*call, body, source, imports)
+                || head_is_shadowed(&chain, shadowed)
+            {
+                return false;
+            }
+            if is_returncode_check(&chain) {
+                // A `CompletedProcess` can only come from a subprocess call,
+                // so if the test replaced that boundary the receiver is a
+                // double and checking it is vacuous. The receiver itself is
+                // a local name, which `head_is_shadowed` above only catches
+                // when it was assigned from something the test replaced.
+                return !subprocess_boundary_shadowed(shadowed);
+            }
+            let canonical = canonicalize_called_name(&chain, imports);
+            if is_shadowed(&canonical, shadowed) {
+                return false;
+            }
+            is_checked_subprocess_call(&canonical)
+                || (is_checkable_subprocess_call(&canonical)
+                    && call_passes_check_true(*call, source))
+        })
+        .collect()
+}
+
+/// True iff `name` is, or lives under, a name the test replaced.
+/// `subprocess` shadows `subprocess.run`; `subprocess.run` shadows itself.
+fn is_shadowed(name: &str, shadowed: &BTreeSet<String>) -> bool {
+    shadowed.iter().any(|s| is_at_or_under(name, s))
+}
+
+/// True iff the test replaced the `subprocess` module or any name under it.
+fn subprocess_boundary_shadowed(shadowed: &BTreeSet<String>) -> bool {
+    shadowed.iter().any(|s| is_subprocess_name(s))
+}
+
+/// True iff the head segment of a raw call chain is a shadowed name. Checked
+/// before canonicalization so a parameter binding (`def test(subprocess)`)
+/// wins over the module the file imported under the same name.
+fn head_is_shadowed(chain: &str, shadowed: &BTreeSet<String>) -> bool {
+    shadowed.contains(dotted_head(chain))
+}
+
+/// True iff `call` sits somewhere the test cannot rely on its failure:
+///
+/// * inside a `def`, `lambda` or generator expression nested in the body,
+///   which the test may define and never invoke;
+/// * inside a `try` block that has an `except` clause, which may swallow
+///   the `CalledProcessError` the whole signal rests on — or inside the
+///   `except` clause itself, which only runs on the error path;
+/// * inside `with contextlib.suppress(...)`, which discards it outright.
+///
+/// One ancestor scan up to `body`; a missing body is treated as reliable,
+/// matching how the other per-test counts degrade on a bodyless function.
+fn verification_is_unreliable(
+    call: Node<'_>,
+    body: Option<Node<'_>>,
+    source: &[u8],
+    imports: &ImportMap,
+) -> bool {
+    let Some(body_node) = body else {
+        return false;
+    };
+    let mut current = call;
+    while let Some(parent) = current.parent() {
+        if parent.id() == body_node.id() {
+            return false;
+        }
+        if matches!(
+            parent.kind(),
+            "function_definition" | "lambda" | "generator_expression" | "except_clause"
+        ) {
+            return true;
+        }
+        if parent.kind() == "try_statement" && try_guards_child(parent, current) {
+            return true;
+        }
+        if parent.kind() == "with_statement" && with_suppresses_errors(parent, source, imports) {
+            return true;
+        }
+        current = parent;
+    }
+    false
+}
+
+/// True iff a `with_statement` opens `contextlib.suppress(...)` on one of
+/// its own items.
+///
+/// Scoped to the statement's single `with_clause`, never a subtree walk: an
+/// unrelated `with contextlib.suppress(...)` further down the same block
+/// must not disarm evidence that sits above it.
+fn with_suppresses_errors(with_stmt: Node<'_>, source: &[u8], imports: &ImportMap) -> bool {
+    let mut cursor = with_stmt.walk();
+    let Some(clause) = with_stmt.children(&mut cursor).find(|c| c.kind() == "with_clause") else {
+        return false;
+    };
+    let mut item_cursor = clause.walk();
+    let suppresses = clause
+        .named_children(&mut item_cursor)
+        .filter(|item| item.kind() == "with_item")
+        .any(|item| {
+            item.child_by_field_name("value")
+                .filter(|value| value.kind() == "call")
+                .and_then(|value| call_head_chain(value, source))
+                .is_some_and(|chain| {
+                    is_suppress_context_manager(&canonicalize_called_name(&chain, imports))
+                })
+        });
+    // Bound rather than returned directly: the iterator borrows `item_cursor`.
+    suppresses
+}
+
+/// True iff `child` is the guarded block of a `try_statement` that has an
+/// `except` clause. A `try`/`finally` with no `except` swallows nothing, so
+/// verification inside it still propagates.
+fn try_guards_child(try_stmt: Node<'_>, child: Node<'_>) -> bool {
+    if try_stmt.child_by_field_name("body").is_none_or(|b| b.id() != child.id()) {
+        return false;
+    }
+    let mut cursor = try_stmt.walk();
+    let has_except = try_stmt
+        .children(&mut cursor)
+        .any(|n| matches!(n.kind(), "except_clause" | "except_group_clause"));
+    // Bound rather than returned directly: the iterator borrows `cursor`.
+    has_except
+}
+
+/// Names this test replaced with a test double, canonicalized through the
+/// import map where they are dotted.
+///
+/// Three sources, matching how a pytest test installs a double:
+///
+/// * the target of a `@patch`-shaped decorator — `@patch("subprocess.run")`;
+/// * the target of a patch-shaped call in the body — `patch("a.b")` as a
+///   context manager, `mocker.patch("a.b")`, and the two-argument form
+///   `patch.object(mod, "attr")` / `monkeypatch.setattr(mod, "attr", …)`;
+/// * the test's own parameter names, which shadow anything the module
+///   imported under the same name (a `subprocess` fixture, say).
+fn shadowed_names(
+    func: Node<'_>,
+    decorated: Option<Node<'_>>,
+    calls: &[Node<'_>],
+    source: &[u8],
+    imports: &ImportMap,
+    class_shadows: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    // Seeded with what the enclosing class installed for every method: a
+    // class-level `@patch`, or a patcher started in `setUp`.
+    let mut names = class_shadows.clone();
+
+    if let Some(params) = func.child_by_field_name("parameters") {
+        let mut cursor = params.walk();
+        for param in params.named_children(&mut cursor) {
+            if let Some(name) = parameter_name(param, source) {
+                // `self` binds the test instance, never a double, and every
+                // other consumer of a call chain already special-cases it.
+                if name == "self" {
+                    continue;
+                }
+                names.insert(name.to_string());
+            }
+        }
+    }
+
+    if let Some(decorated_node) = decorated {
+        names.extend(decorator_patch_targets(decorated_node, source, imports));
+    }
+
+    names.extend(patch_call_targets(calls, source, imports));
+
+    // Last, because it reads the set built above: a local bound to a mock
+    // constructor — or to anything already shadowed — is itself a double.
+    // This is what disqualifies `completed = MagicMock()` followed by
+    // `completed.check_returncode()`.
+    if let Some(body) = func.child_by_field_name("body") {
+        for (target, value) in double_bindings(body) {
+            if binds_a_double(value, source, imports, &names) {
+                if let Ok(name) = target.utf8_text(source) {
+                    names.insert(name.to_string());
+                }
+            }
+        }
+    }
+
+    names
+}
+
+/// Every `(bound_identifier, call_expression)` pair in a test body, across
+/// the binding forms that can put a test double in a local:
+/// `m = Mock()`, `with patch(...) as m:`, and `(m := Mock())`. Tuple
+/// assignments are zipped positionally when both sides have equal arity.
+fn double_bindings<'a>(body: Node<'a>) -> Vec<(Node<'a>, Node<'a>)> {
+    let mut pairs = Vec::new();
+
+    let mut assignments: Vec<Node<'a>> = Vec::new();
+    collect_descendants(body, "assignment", &mut assignments);
+    for assignment in assignments {
+        let (Some(target), Some(value)) =
+            (assignment.child_by_field_name("left"), assignment.child_by_field_name("right"))
+        else {
+            continue;
+        };
+        if target.kind() == "identifier" {
+            if value.kind() == "call" {
+                pairs.push((target, value));
+            }
+            continue;
+        }
+        pairs.extend(zip_tuple_binding(target, value));
+    }
+
+    let mut named: Vec<Node<'a>> = Vec::new();
+    collect_descendants(body, "named_expression", &mut named);
+    for expr in named {
+        if let (Some(target), Some(value)) =
+            (expr.child_by_field_name("name"), expr.child_by_field_name("value"))
+        {
+            if target.kind() == "identifier" && value.kind() == "call" {
+                pairs.push((target, value));
+            }
+        }
+    }
+
+    let mut items: Vec<Node<'a>> = Vec::new();
+    collect_descendants(body, "with_item", &mut items);
+    for item in items {
+        // `with patch(...) as m:` parses the item value as an `as_pattern`
+        // whose first child is the call and whose `alias` field is the name.
+        let Some(pattern) = item.named_child(0).filter(|v| v.kind() == "as_pattern") else {
+            continue;
+        };
+        let (Some(value), Some(alias)) =
+            (pattern.named_child(0), pattern.child_by_field_name("alias"))
+        else {
+            continue;
+        };
+        let target = if alias.kind() == "identifier" { Some(alias) } else { alias.named_child(0) };
+        if let Some(target) = target.filter(|t| t.kind() == "identifier") {
+            if value.kind() == "call" {
+                pairs.push((target, value));
+            }
+        }
+    }
+
+    pairs
+}
+
+/// Zip a tuple assignment positionally: `a, m = 1, Mock()` binds `m` to the
+/// second value. Mismatched arities bind nothing — a starred target or an
+/// unpacked call makes the correspondence unknowable.
+fn zip_tuple_binding<'a>(target: Node<'a>, value: Node<'a>) -> Vec<(Node<'a>, Node<'a>)> {
+    if !matches!(target.kind(), "pattern_list" | "tuple_pattern")
+        || !matches!(value.kind(), "expression_list" | "tuple")
+    {
+        return Vec::new();
+    }
+    let mut target_cursor = target.walk();
+    let targets: Vec<Node<'a>> = target.named_children(&mut target_cursor).collect();
+    let mut value_cursor = value.walk();
+    let values: Vec<Node<'a>> = value.named_children(&mut value_cursor).collect();
+    if targets.len() != values.len() {
+        return Vec::new();
+    }
+    targets
+        .into_iter()
+        .zip(values)
+        .filter(|(t, v)| t.kind() == "identifier" && v.kind() == "call")
+        .collect()
+}
+
+/// Targets of every `@patch`-shaped decorator on a `decorated_definition`.
+///
+/// Matched with the same predicate as [`patch_call_targets`], which is
+/// broader than the one `count_patch_decorators` uses: it also catches
+/// `@unittest.mock.patch.object(...)`, which that counter misses (a
+/// pre-existing gap in a scored field, left alone here). Deliberate — a
+/// shadow that is too wide costs a missed piece of evidence, while one that
+/// is too narrow credits a test double.
+fn decorator_patch_targets(decorated: Node<'_>, source: &[u8], imports: &ImportMap) -> Vec<String> {
+    let mut targets = Vec::new();
+    for decorator in decorator_nodes(decorated) {
+        let Some(target) = decorator_target(decorator) else {
+            continue;
+        };
+        if !attribute_chain_text(target, source).is_some_and(|c| head_patches_a_name(&c)) {
+            continue;
+        }
+        // `decorator_target` unwraps `@patch("a.b")` to the `patch`
+        // expression; the arguments hang off its parent call node.
+        if let Some(call) = target.parent().filter(|p| p.kind() == "call") {
+            targets.extend(patched_target(call, source, imports));
+        }
+    }
+    targets
+}
+
+/// Targets of every patch-shaped call in `calls`.
+fn patch_call_targets(calls: &[Node<'_>], source: &[u8], imports: &ImportMap) -> Vec<String> {
+    calls
+        .iter()
+        .filter(|call| call_head_chain(**call, source).is_some_and(|h| head_patches_a_name(&h)))
+        .flat_map(|call| patched_target(*call, source, imports))
+        .collect()
+}
+
+/// True iff the call on the right-hand side of an assignment yields a test
+/// double: a Mock-API constructor, or a call to a name the test replaced.
+fn binds_a_double(
+    call: Node<'_>,
+    source: &[u8],
+    imports: &ImportMap,
+    shadowed: &BTreeSet<String>,
+) -> bool {
+    call_head_chain(call, source).is_some_and(|chain| {
+        // `chain_constructs_a_mock`, not `call_head_is_mock_constructor`:
+        // `mock.MagicMock()` must count here even though it deliberately
+        // does not count toward `mock_construction_count`.
+        chain_constructs_a_mock(&chain)
+            || head_is_shadowed(&chain, shadowed)
+            || is_shadowed(&canonicalize_called_name(&chain, imports), shadowed)
+    })
+}
+
+/// Every `decorator` child of a `decorated_definition`, in source order.
+/// Shared by the two predicates that classify decorators.
+fn decorator_nodes(decorated: Node<'_>) -> Vec<Node<'_>> {
+    let mut cursor = decorated.walk();
+    decorated.children(&mut cursor).filter(|c| c.kind() == "decorator").collect()
+}
+
+/// Extract the identifier bound by one parameter node, across the shapes
+/// tree-sitter emits (`x`, `x: T`, `x=1`, `*args`, `**kwargs`).
+fn parameter_name<'a>(param: Node<'_>, source: &'a [u8]) -> Option<&'a str> {
+    match param.kind() {
+        "identifier" => param.utf8_text(source).ok(),
+        "typed_parameter" | "list_splat_pattern" | "dictionary_splat_pattern" => {
+            param.named_child(0).and_then(|n| parameter_name(n, source))
+        }
+        "default_parameter" | "typed_default_parameter" => {
+            param.child_by_field_name("name").and_then(|n| parameter_name(n, source))
+        }
+        _ => None,
+    }
+}
+
+/// True iff a dotted call-head installs a double at a named target: any
+/// chain carrying a whole `patch` segment (`patch`, `mock.patch`,
+/// `patch.object`, `mocker.patch.dict`), or `monkeypatch.setattr`.
+///
+/// Segment equality, not a substring match: `helpers.patch_config` binds
+/// nothing and must not shadow anything. An unrelated `.patch` — an HTTP
+/// client's `requests.patch(url)` — is indistinguishable from `mock.patch`
+/// by shape and does contribute its first argument to the shadow set; that
+/// entry is inert, since nothing it can name is at or under `subprocess`.
+fn head_patches_a_name(head: &str) -> bool {
+    head == "monkeypatch.setattr" || head.split('.').any(|segment| segment == "patch")
+}
+
+/// Read the target name(s) out of a patch-shaped call.
+///
+/// `patch("a.b")` names `a.b` directly. `patch.object(mod, "attr")` and
+/// `monkeypatch.setattr(mod, "attr", …)` name the attribute relative to a
+/// first argument that is itself a dotted name. A first argument that is
+/// neither — `patch(some_variable)` — is treated as a receiver expression
+/// and shadows the variable's own name, which is usually nothing useful: a
+/// computed target is a known miss, and the call site keeps whatever
+/// evidence it had.
+fn patched_target(call: Node<'_>, source: &[u8], imports: &ImportMap) -> Vec<String> {
+    let Some(args) = call.child_by_field_name("arguments") else {
+        return Vec::new();
+    };
+    let positional: Vec<Node<'_>> = {
+        let mut cursor = args.walk();
+        args.named_children(&mut cursor).filter(|a| a.kind() != "keyword_argument").collect()
+    };
+    let Some(first) = positional.first() else {
+        return Vec::new();
+    };
+    if let Some(literal) = string_literal_text(*first, source) {
+        return vec![canonicalize_called_name(literal, imports)];
+    }
+    let Some(receiver) = attribute_chain_text(*first, source) else {
+        return Vec::new();
+    };
+    let attr = positional.get(1).and_then(|n| string_literal_text(*n, source));
+    let canonical_receiver = canonicalize_called_name(&receiver, imports);
+    match attr {
+        Some(name) => vec![format!("{canonical_receiver}.{name}")],
+        // `patch.object(mod)` is not a shape that patches one attribute;
+        // shadow the whole receiver rather than guess.
+        None => vec![canonical_receiver],
+    }
+}
+
+/// Text inside a Python string literal, without its quotes. Returns `None`
+/// for f-strings and any other non-plain string node.
+fn string_literal_text<'a>(node: Node<'_>, source: &'a [u8]) -> Option<&'a str> {
+    if node.kind() != "string" {
+        return None;
+    }
+    let mut cursor = node.walk();
+    let content: Vec<Node<'_>> =
+        node.named_children(&mut cursor).filter(|c| c.kind() == "string_content").collect();
+    match content.as_slice() {
+        [single] => single.utf8_text(source).ok(),
+        _ => None,
+    }
+}
+
+/// True iff the call passes the literal `check=True` keyword argument.
+///
+/// Only the `True` literal counts: `check=strict` may well be true at
+/// runtime, but a static reader cannot know that, and the whole point of
+/// the signal is that the failure path is provable from the source.
+fn call_passes_check_true(call: Node<'_>, source: &[u8]) -> bool {
+    let Some(args) = call.child_by_field_name("arguments") else {
+        return false;
+    };
+    let mut cursor = args.walk();
+    let found = args.named_children(&mut cursor).any(|arg| {
+        if arg.kind() != "keyword_argument" {
+            return false;
+        }
+        let name = arg.child_by_field_name("name").and_then(|n| n.utf8_text(source).ok());
+        let value = arg.child_by_field_name("value").and_then(|n| n.utf8_text(source).ok());
+        name == Some(CHECK_KEYWORD) && value == Some(TRUE_LITERAL)
+    });
+    // Bound rather than returned directly: the iterator borrows `cursor`,
+    // which must outlive it.
+    found
 }
 
 /// Return the `start_position().row` of the last named child of `node`,
@@ -456,9 +1067,8 @@ fn called_names_for_test(calls: &[Node<'_>], source: &[u8]) -> Vec<String> {
 ///   `@mock.patch('a')`, `@patch.object(SomeClass, 'method')`.
 fn count_patch_decorators(decorated: Node<'_>, source: &[u8]) -> u64 {
     let mut count: u64 = 0;
-    let mut cursor = decorated.walk();
-    for child in decorated.children(&mut cursor) {
-        if child.kind() == "decorator" && decorator_is_patch(child, source) {
+    for decorator in decorator_nodes(decorated) {
+        if decorator_is_patch(decorator, source) {
             count = count.saturating_add(1);
         }
     }
@@ -928,6 +1538,337 @@ mod tests {
 
     fn parse_full(src: &str) -> ParsedFile {
         parse_python_file(src, &PathBuf::from("synthetic.py")).expect("parse")
+    }
+
+    /// A checked subprocess call is verification evidence: the child's
+    /// non-zero exit status raises `CalledProcessError` in the parent.
+    #[test]
+    fn checked_subprocess_run_is_external_verification() {
+        let src = "\
+import subprocess
+
+def test_a():
+    subprocess.run([\"prog\"], check=True)
+";
+        let recs = parse(src);
+        assert_eq!(recs[0].assertion_count, 0, "assertion_count stays syntactic");
+        assert_eq!(recs[0].external_verification_count, 1);
+    }
+
+    #[test]
+    fn unchecked_subprocess_run_is_not_verification() {
+        let src = "\
+import subprocess
+
+def test_a():
+    subprocess.run([\"prog\"])
+";
+        let recs = parse(src);
+        assert_eq!(recs[0].external_verification_count, 0);
+    }
+
+    #[test]
+    fn check_false_is_not_verification() {
+        let src = "\
+import subprocess
+
+def test_a():
+    subprocess.run([\"prog\"], check=False)
+";
+        let recs = parse(src);
+        assert_eq!(recs[0].external_verification_count, 0);
+    }
+
+    #[test]
+    fn non_literal_check_value_is_not_verification() {
+        // `check=strict` may be true at runtime; the source does not say so,
+        // and the signal has to be provable from the source.
+        let src = "\
+import subprocess
+
+def test_a(strict):
+    subprocess.run([\"prog\"], check=strict)
+";
+        let recs = parse(src);
+        assert_eq!(recs[0].external_verification_count, 0);
+    }
+
+    #[test]
+    fn check_call_and_check_output_need_no_keyword() {
+        let src = "\
+import subprocess
+
+def test_a():
+    subprocess.check_call([\"prog\"])
+    subprocess.check_output([\"prog\"])
+";
+        let recs = parse(src);
+        assert_eq!(recs[0].external_verification_count, 2);
+    }
+
+    #[test]
+    fn completed_process_check_returncode_is_verification() {
+        let src = "\
+import subprocess
+
+def test_a():
+    completed = subprocess.run([\"prog\"])
+    completed.check_returncode()
+";
+        let recs = parse(src);
+        assert_eq!(
+            recs[0].external_verification_count, 1,
+            "the unchecked run is not evidence; the explicit check is"
+        );
+    }
+
+    #[test]
+    fn aliased_subprocess_names_resolve_through_the_import_map() {
+        let src = "\
+import subprocess as sp
+from subprocess import check_call
+from subprocess import run as run_child
+
+def test_module_alias():
+    sp.run([\"prog\"], check=True)
+
+def test_function_alias():
+    run_child([\"prog\"], check=True)
+
+def test_direct_import():
+    check_call([\"prog\"])
+";
+        let recs = parse(src);
+        assert_eq!(recs.len(), 3);
+        for r in &recs {
+            assert_eq!(r.external_verification_count, 1, "{} did not resolve", r.nodeid);
+        }
+    }
+
+    #[test]
+    fn check_hidden_in_a_kwargs_splat_is_not_matched() {
+        // `**kwargs` may or may not carry `check=True`; the source does not
+        // say. Pinned as a deliberate under-count, like the star import.
+        let src = "\
+import subprocess
+
+def test_a(kwargs):
+    subprocess.run([\"prog\"], **kwargs)
+";
+        let recs = parse(src);
+        assert_eq!(recs[0].external_verification_count, 0);
+    }
+
+    #[test]
+    fn a_real_assertion_wins_the_ratio_but_keeps_the_evidence() {
+        let src = "\
+import subprocess
+
+def test_a():
+    completed = subprocess.run([\"prog\"], check=True)
+    assert completed.stdout == \"ok\"
+";
+        let recs = parse(src);
+        assert_eq!(recs[0].assertion_count, 1);
+        assert_eq!(recs[0].external_verification_count, 1);
+        assert!(
+            (recs[0].setup_to_assertion_ratio - 2.0).abs() < f64::EPSILON,
+            "the assert branch owns the ratio, got {}",
+            recs[0].setup_to_assertion_ratio
+        );
+    }
+
+    #[test]
+    fn a_suppress_elsewhere_in_the_block_does_not_disarm_the_evidence() {
+        // Only the `with` that opens `suppress` disarms what it wraps; a
+        // later cleanup block in the same body must not reach backwards.
+        let src = "\
+import contextlib
+import subprocess
+
+def test_a():
+    with open(\"f\") as fh:
+        subprocess.check_call([\"prog\"])
+        with contextlib.suppress(ValueError):
+            pass
+";
+        let recs = parse(src);
+        assert_eq!(recs[0].external_verification_count, 1);
+    }
+
+    #[test]
+    fn a_call_inside_suppress_is_disarmed() {
+        let src = "\
+import contextlib
+import subprocess
+
+def test_a():
+    with contextlib.suppress(subprocess.CalledProcessError):
+        subprocess.check_call([\"prog\"])
+";
+        let recs = parse(src);
+        assert_eq!(recs[0].external_verification_count, 0);
+    }
+
+    #[test]
+    fn star_imported_run_is_not_matched() {
+        // `from subprocess import *` binds an unknown set of names, so the
+        // head does not canonicalize and the evidence is missed. Pinned
+        // because under-counting here is a deliberate choice, not an
+        // oversight — see the `verification` module docs.
+        let src = "\
+from subprocess import *
+
+def test_a():
+    run([\"prog\"], check=True)
+";
+        let recs = parse(src);
+        assert_eq!(recs[0].external_verification_count, 0);
+    }
+
+    #[test]
+    fn patched_subprocess_is_not_verification() {
+        let src = "\
+import subprocess
+from unittest.mock import patch
+
+@patch(\"subprocess.run\")
+def test_a(run):
+    subprocess.run([\"prog\"], check=True)
+";
+        let recs = parse(src);
+        assert_eq!(
+            recs[0].external_verification_count, 0,
+            "a double never exits non-zero, so checking it is not evidence"
+        );
+    }
+
+    #[test]
+    fn monkeypatched_attribute_is_not_verification() {
+        let src = "\
+import subprocess as sp
+
+def test_a(monkeypatch):
+    monkeypatch.setattr(sp, \"check_call\", lambda *a: None)
+    sp.check_call([\"prog\"])
+";
+        let recs = parse(src);
+        assert_eq!(recs[0].external_verification_count, 0, "the patch target canonicalizes too");
+    }
+
+    #[test]
+    fn context_manager_patch_shadows_the_target() {
+        let src = "\
+import subprocess
+from unittest.mock import patch
+
+def test_a():
+    with patch(\"subprocess.check_call\"):
+        subprocess.check_call([\"prog\"])
+";
+        let recs = parse(src);
+        assert_eq!(recs[0].external_verification_count, 0);
+    }
+
+    #[test]
+    fn parameter_shadowing_beats_the_module_import() {
+        let src = "\
+import subprocess
+
+def test_a(subprocess):
+    subprocess.run([\"prog\"], check=True)
+";
+        let recs = parse(src);
+        assert_eq!(recs[0].external_verification_count, 0);
+    }
+
+    #[test]
+    fn verification_in_an_uncalled_nested_def_is_not_counted() {
+        let src = "\
+import subprocess
+
+def test_a():
+    def helper():
+        subprocess.check_call([\"prog\"])
+";
+        let recs = parse(src);
+        assert_eq!(recs[0].external_verification_count, 0);
+    }
+
+    #[test]
+    fn patching_something_else_leaves_the_evidence_alone() {
+        let src = "\
+import subprocess
+from unittest.mock import patch
+
+@patch(\"myproj.thing\")
+def test_a(thing):
+    subprocess.run([\"prog\"], check=True)
+";
+        let recs = parse(src);
+        assert_eq!(recs[0].external_verification_count, 1);
+    }
+
+    #[test]
+    fn unrelated_run_with_check_true_is_not_verification() {
+        // A local collaborator that happens to expose `run(check=...)` is
+        // not a subprocess: the head does not canonicalize to `subprocess`.
+        let src = "\
+def test_a(runner):
+    runner.run([\"prog\"], check=True)
+";
+        let recs = parse(src);
+        assert_eq!(recs[0].external_verification_count, 0);
+    }
+
+    #[test]
+    fn verification_is_counted_inside_test_classes() {
+        let src = "\
+import subprocess
+
+class TestThing:
+    def test_a(self):
+        subprocess.check_call([\"prog\"])
+";
+        let recs = parse(src);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].external_verification_count, 1);
+    }
+
+    #[test]
+    fn verification_site_replaces_the_body_height_in_the_setup_ratio() {
+        // Same body twice; only the `check=True` differs. The unchecked one
+        // falls back to the body height (4 rows below the `def`), the checked
+        // one measures to its verification call site (row 1 below the `def`).
+        let src = "\
+import subprocess
+
+def test_checked():
+    cmd = [\"prog\"]
+    subprocess.run(cmd, check=True)
+    cleanup = True
+    del cleanup
+
+def test_unchecked():
+    cmd = [\"prog\"]
+    subprocess.run(cmd)
+    cleanup = True
+    del cleanup
+";
+        let recs = parse(src);
+        let checked = recs.iter().find(|r| r.nodeid.ends_with("test_checked")).expect("checked");
+        let unchecked =
+            recs.iter().find(|r| r.nodeid.ends_with("test_unchecked")).expect("unchecked");
+        assert!(
+            (checked.setup_to_assertion_ratio - 2.0).abs() < f64::EPSILON,
+            "expected the rows up to the verification call site, got {}",
+            checked.setup_to_assertion_ratio
+        );
+        assert!(
+            (unchecked.setup_to_assertion_ratio - 4.0).abs() < f64::EPSILON,
+            "expected the body height, got {}",
+            unchecked.setup_to_assertion_ratio
+        );
     }
 
     #[test]

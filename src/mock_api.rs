@@ -74,6 +74,20 @@ pub fn is_mock_api_attribute(name: &str) -> bool {
     MOCK_API_ATTRIBUTES.contains(&name)
 }
 
+/// True iff the **last segment** of a dotted call-head names a Mock-API
+/// constructor: `MagicMock`, `mock.MagicMock`, `unittest.mock.MagicMock`.
+///
+/// Deliberately broader than [`is_mock_constructor`], which matches the
+/// head segment only so that `mock_construction_count` — a published
+/// count — cannot be inflated by an unrelated `x.Mock()`. This one feeds
+/// the parser's test-double detection, where the unsafe direction is
+/// inverted: missing a constructor there credits a double with being real
+/// verification.
+#[inline]
+pub(crate) fn chain_constructs_a_mock(chain: &str) -> bool {
+    chain.rsplit('.').next().is_some_and(is_mock_constructor)
+}
+
 /// True iff `name` matches a Mock-API constructor (exact, case-sensitive).
 #[inline]
 pub fn is_mock_constructor(name: &str) -> bool {

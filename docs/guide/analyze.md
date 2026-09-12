@@ -20,6 +20,9 @@ the test wins — drop the candidate.
 # Part 1 — field reference
 
 Every field is always present. `null` never means zero; it means not measured.
+`"2"` is additive: a counter this page documents may be absent from a payload
+written by an older binary, and an absent counter means `0`. Check
+`tool.version` when a field you expect is missing.
 The payload has two shapes, discriminated by one key.
 
 ## Top level, single project
@@ -134,12 +137,40 @@ analysis reads from here.
 - `stubs_count` — fixture-driven patch call sites in this test's body, from the
   closed list given under `files[].stubs_count`.
 - `setup_to_assertion_ratio` — lines of setup per assertion, as a float.
-  Computed as `(first_effective_assertion_line - def_line) / assertion_count`.
-  When the body has no effective assertion, it degrades to
-  `(last_body_line - def_line) / 1`, i.e. the height of the whole body — so a
-  long assertionless test scores high here by design. Units are source lines.
-  `0.0` means the first assertion is on the `def` line itself, which in practice
-  means a one-line body.
+  Computed as
+  `(first_effective_assertion_line - def_line) / effective_assertion_count`,
+  where an effective assertion is an `assert` statement or a
+  `with pytest.raises(...)` block. `self.assertXxx(...)` calls raise
+  `assertion_count` without feeding this denominator.
+  When the body has no effective assertion but does carry external
+  verification, the first such call site stands in for the first assertion:
+  `(first_verification_line - def_line) / external_verification_count`. When it
+  has neither, it degrades to `(last_body_line - def_line) / 1`, i.e. the height
+  of the whole body — so a long unverified test scores high here by design.
+  Units are source lines. `0.0` means the first assertion is on the `def` line
+  itself, which in practice means a one-line body.
+- `external_verification_count` — call sites in this test body that verify an
+  outcome the body itself cannot see, because a failure raised outside this
+  process still fails the test. The matched set is closed and exact: a call
+  resolving to `subprocess.check_call` or `subprocess.check_output`; a call
+  resolving to `subprocess.run` that passes the literal `check=True`; and
+  `<receiver>.check_returncode()`. Import aliases are resolved first, so
+  `import subprocess as sp` and `from subprocess import run as r` both match.
+  **This is not part of `assertion_count`**, which stays a syntactic count of
+  `assert`-shaped constructs — read the two together. A non-zero value means
+  zero assertions is not the absence of verification; it does **not** mean the
+  child process checks anything worth checking. See `dead-test` below.
+
+  Four shapes are deliberately **not** counted, so a `0` here is sometimes a
+  known miss rather than a verdict: a call against a name the test replaced
+  with a double (`@patch` on the test or its class, `monkeypatch.setattr`, a
+  patcher started in `setUp`, a fixture of the same name, a local assigned
+  from a `Mock()`); a call whose failure may never reach pytest — inside a
+  nested `def`/`lambda` or a generator expression, inside a `try` that has an
+  `except`, or inside `with contextlib.suppress(...)`; a call under
+  `from subprocess import *`, which binds an unknown set of names; and every
+  `check_returncode()` in a test that patched any `subprocess` name at all,
+  including one on a real `CompletedProcess`.
 - `called_names` — sorted, deduplicated, dot-joined names of calls in this test
   body, **filtered to project-internal names only**. Calls into the standard
   library, into third-party packages, and `self.*` calls are all excluded. An
@@ -207,8 +238,10 @@ no information that is not already in `test_functions` and `files`.
 suspicion_score = 0.35 * (only_asserts_on_mock ? 1 : 0)
                 + 0.20 * min(patch_decorator_count / 5, 1)
                 + 0.15 * sigmoid((setup_to_assertion_ratio - 8) / 4)
-                + 0.20 * (assertion_count == 0 ? 1 : 0)
+                + 0.20 * (unverified ? 1 : 0)
                 + 0.10 * min(len(smell_hits) / 3, 1)
+
+unverified = assertion_count == 0 and external_verification_count == 0
 ```
 
 `sigmoid(x) = 1 / (1 + e^-x)`. Weights sum to `1.00`.
@@ -226,11 +259,20 @@ Consequences you need when reading scores:
   exceeds `1.0`, capped at `0.10`. File scores are therefore not directly
   comparable to test scores.
 
-Two of the five terms fire on assertionless tests (`w_zero_asserts` plus an
+Two of the five terms fire on unverified tests (`w_zero_asserts` plus an
 inflated setup ratio), so an empty test lands between about `0.22` for a short
 body and `0.35` for a long one — `0.35` is the ceiling of those two terms
 together and is approached, never reached. Do not read a score in that band as
 mock abuse.
+
+A test with `assertion_count == 0` and `external_verification_count > 0` does
+not reach that band *for those reasons*: the `w_zero_asserts` term is off, and
+the setup ratio is measured to the first verification call site instead of the
+whole body height, so it is no longer inflated — though it still contributes,
+exactly as it does for a test with a real assertion. The mock, patch and smell
+terms score as they would on any other test, so such a test can still reach
+`0.22`+ on those. When it does, that is a real signal about mock abuse, not
+about the test being empty — read the field, not just the score.
 
 ## Smell thresholds
 
@@ -421,20 +463,40 @@ assertions, or it exercises no project code, so it survives on the absence of an
 exception.
 
 **Signals.**
-- `assertion_count == 0`. Definitive for the assertionless variant. Note this
-  contributes `0.20` to the score on its own and inflates
-  `setup_to_assertion_ratio` to the full body height, so these tests cluster near
-  the top of `top_suspicious.test_functions`.
-- `assertion_count == 0` **and** `called_names` empty: the test neither asserts
-  nor calls project code.
-- The test's nodeid appears in no `sut_calls.by_name[].test_nodeids` list.
+- `assertion_count == 0` **and** `external_verification_count == 0`. Definitive
+  for the assertionless variant. Note this contributes `0.20` to the score on
+  its own and inflates `setup_to_assertion_ratio` to the full body height, so
+  these tests cluster near the top of `top_suspicious.test_functions`.
+- `assertion_count == 0`, `external_verification_count == 0` **and**
+  `called_names` empty: the test neither asserts nor calls project code.
+- The test's nodeid appears in no `sut_calls.by_name[].test_nodeids` list
+  **and** `external_verification_count == 0` — a test that shells out calls no
+  project code by construction, so this signal fires on it by default.
 
-**Verify by reading.** Two legitimate shapes look identical here. A smoke test
+**Not this pattern: verification in a child process.** A test with
+`assertion_count == 0` and `external_verification_count > 0` asserts in a
+process the AST cannot see and propagates the failure — `subprocess.run(...,
+check=True)` raises `CalledProcessError`, which fails the parent test. This is
+how a packaging or CLI integration test checks something the source-tree
+interpreter cannot: it installs a wheel into a temporary directory, then runs an
+isolated interpreter that asserts on the installed artifact. Those tests are
+correct as written; do not report them as assertionless, and do not ask for a
+local assertion that would have to duplicate the child's.
+
+The evidence is narrow on purpose. `check=True` proves the child's failure
+reaches the parent — nothing more. If the child command asserts nothing (a bare
+`--help`, a `true`), the test is still dead, and only reading it tells you which
+you have. A subprocess call with no `check=True` proves nothing at all and does
+not set this field: it needs its own evidence, such as an `assert
+completed.returncode == 0`, which is a normal assertion and counts as one.
+
+**Verify by reading.** Three legitimate shapes look identical here. A smoke test
 that asserts nothing but would raise on failure is doing real work — importing a
 module, constructing an object, running a migration. A test whose assertions are
 made through a helper function will show `assertion_count == 0` because pycoati
 counts `assert` statements syntactically in the test body and does not follow
-calls into helpers. Check for both before reporting.
+calls into helpers. And a test that verifies in a child process, as above. Check
+for all three before reporting.
 
 There is no per-test coverage in this schema, so "this test covers nothing" is
 not something the inventory can tell you. Do not claim it.

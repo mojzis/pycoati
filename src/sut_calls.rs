@@ -85,28 +85,19 @@ pub fn resolve_called_name(
     if raw.is_empty() || raw == "self" || raw.starts_with("self.") {
         return None;
     }
-    let (head, tail) = split_head(raw);
+    let (head, _) = split_head(raw);
 
     // 1. Head IS a project package: keep as-is.
     if project_packages.contains(head) {
         return Some(raw.to_string());
     }
 
-    // 2. Head resolves through the alias map.
+    // 2. Head resolves through the alias map. The rewrite itself lives in
+    // `canonicalize_called_name` — this step only decides whether to keep
+    // the result.
     if let Some(source_module) = imports.aliases.get(head) {
-        if head_under_project(source_module, project_packages) {
-            // Canonical form replaces the head with the full source-module
-            // dotted name. If the source_module IS the head (`import foo`
-            // produced alias `foo -> foo`), this still produces the same
-            // canonical form. The trailing attribute is preserved.
-            let canonical = match tail {
-                Some(rest) => format!("{source_module}.{rest}"),
-                None => source_module.clone(),
-            };
-            return Some(canonical);
-        }
-        // Aliased, but not to a project package — third-party / stdlib.
-        return None;
+        return head_under_project(source_module, project_packages)
+            .then(|| canonicalize_called_name(raw, imports));
     }
 
     // 3. Star import from a project package: opportunistically include.
@@ -118,6 +109,34 @@ pub fn resolve_called_name(
     }
 
     None
+}
+
+/// Rewrite the head segment of a dotted call chain through the import map,
+/// without filtering on project membership.
+///
+/// [`resolve_called_name`] answers "is this one of *our* names?" and drops
+/// everything else; this answers the narrower question "what does this name
+/// point at?", which is what matching a call against a known third-party or
+/// stdlib API needs. `import subprocess as sp` makes `sp.run` canonicalize
+/// to `subprocess.run`; `from subprocess import run as run_child` makes the
+/// bare `run_child` canonicalize to the same. A head with no binding in the
+/// file is returned unchanged — an unresolved name is reported as written,
+/// never guessed at.
+pub fn canonicalize_called_name(raw: &str, imports: &ImportMap) -> String {
+    let (head, tail) = split_head(raw);
+    let Some(source_module) = imports.aliases.get(head) else {
+        return raw.to_string();
+    };
+    match tail {
+        // `import a.b` binds the name `a` to the package `a`, so every chain
+        // rooted at `a` is already canonical — rewriting the head would
+        // produce `a.b.b.c`, which matches nothing. Alias forms
+        // (`import a.b as c`, `from a import b`) never self-prefix, so they
+        // still rewrite.
+        Some(_) if is_at_or_under(source_module, head) => raw.to_string(),
+        Some(rest) => format!("{source_module}.{rest}"),
+        None => source_module.clone(),
+    }
 }
 
 /// Mutate each test record's `called_names` in place: replace the raw list
@@ -182,6 +201,16 @@ pub fn dotted_head(name: &str) -> &str {
     name.split_once('.').map_or(name, |(h, _)| h)
 }
 
+/// True iff `name` is `prefix` itself or a name under it: `subprocess`
+/// and `subprocess.run` are both at-or-under `subprocess`, while
+/// `subprocesses` and `myproj.subprocess` are neither.
+///
+/// The dotted-prefix boundary rule in one place, next to [`dotted_head`],
+/// so its two callers cannot drift on the `subprocesses` edge case.
+pub fn is_at_or_under(name: &str, prefix: &str) -> bool {
+    name.strip_prefix(prefix).is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+}
+
 /// Split a dot-joined chain into `(head, optional_rest)`. Built on
 /// [`dotted_head`] to keep the split semantics consistent.
 fn split_head(raw: &str) -> (&str, Option<&str>) {
@@ -219,10 +248,69 @@ mod tests {
             patch_decorator_count: 0,
             stubs_count: 0,
             setup_to_assertion_ratio: 0.0,
+            external_verification_count: 0,
             called_names: called.iter().map(|s| (*s).to_string()).collect(),
             smell_hits: Vec::new(),
             suspicion_score: 0.0,
         }
+    }
+
+    #[test]
+    fn canonicalize_rewrites_an_aliased_module_head() {
+        let mut imports = ImportMap::default();
+        imports.aliases.insert("sp".to_string(), "subprocess".to_string());
+        assert_eq!(canonicalize_called_name("sp.run", &imports), "subprocess.run");
+    }
+
+    #[test]
+    fn canonicalize_rewrites_a_bare_imported_name() {
+        let mut imports = ImportMap::default();
+        imports.aliases.insert("run_child".to_string(), "subprocess.run".to_string());
+        assert_eq!(canonicalize_called_name("run_child", &imports), "subprocess.run");
+    }
+
+    #[test]
+    fn canonicalize_does_not_double_a_spelled_out_submodule() {
+        // `import unittest.mock` binds `unittest -> unittest.mock`.
+        let mut imports = ImportMap::default();
+        imports.aliases.insert("unittest".to_string(), "unittest.mock".to_string());
+        assert_eq!(
+            canonicalize_called_name("unittest.mock.MagicMock", &imports),
+            "unittest.mock.MagicMock"
+        );
+        // A sibling attribute is canonical as written too: `import
+        // unittest.mock` binds `unittest`, so `unittest.other` means
+        // `unittest.other`, never `unittest.mock.other`.
+        assert_eq!(canonicalize_called_name("unittest.other", &imports), "unittest.other");
+        // An alias binding does still rewrite.
+        let mut aliased = ImportMap::default();
+        aliased.aliases.insert("um".to_string(), "unittest.mock".to_string());
+        assert_eq!(canonicalize_called_name("um.other", &aliased), "unittest.mock.other");
+    }
+
+    #[test]
+    fn is_at_or_under_respects_segment_boundaries() {
+        assert!(is_at_or_under("subprocess", "subprocess"));
+        assert!(is_at_or_under("subprocess.run", "subprocess"));
+        assert!(!is_at_or_under("subprocesses", "subprocess"));
+        assert!(!is_at_or_under("myproj.subprocess", "subprocess"));
+    }
+
+    #[test]
+    fn canonicalize_leaves_an_unbound_head_alone() {
+        let imports = ImportMap::default();
+        assert_eq!(canonicalize_called_name("runner.run", &imports), "runner.run");
+    }
+
+    #[test]
+    fn canonicalize_keeps_names_a_project_filter_would_drop() {
+        // This is the difference from `resolve_called_name`: a stdlib name
+        // survives canonicalization, because the caller wants to match it.
+        let mut imports = ImportMap::default();
+        imports.aliases.insert("subprocess".to_string(), "subprocess".to_string());
+        let packages = pkgs(["myproj"]);
+        assert_eq!(canonicalize_called_name("subprocess.run", &imports), "subprocess.run");
+        assert_eq!(resolve_called_name("subprocess.run", &imports, &packages), None);
     }
 
     // ---- ImportMap construction is in parser.rs; these tests cross-check

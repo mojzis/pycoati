@@ -27,6 +27,10 @@
 //!   score  nodeid                                    asserts  mocks  stubs  smells
 //!    …
 //!
+//! In the per-test `asserts` column, `2+1x` means two syntactic assertions
+//! plus one external-verification call site (a checked child process — see
+//! [`crate::verification`]). A plain number means no such call site.
+//!
 //! Top suspicious files
 //! --------------------
 //!   score  path                  tests  asserts  mocks  stubs  smells
@@ -226,7 +230,15 @@ fn build_test_row(nodeid: &str, t: &TestRecord) -> TestRow {
     TestRow {
         score: format!("{:.2}", t.suspicion_score),
         nodeid: nodeid.to_string(),
-        asserts: t.assertion_count.to_string(),
+        // A child-process check verifies without an `assert` node, so a
+        // bare `0` here would read as "verifies nothing". Mark those rows
+        // `<asserts>+<n>x` — the JSON carries the exact count in
+        // `external_verification_count`.
+        asserts: if t.external_verification_count > 0 {
+            format!("{}+{}x", t.assertion_count, t.external_verification_count)
+        } else {
+            t.assertion_count.to_string()
+        },
         // Test records don't carry `mock_construction_count`; use the
         // patch-decorator count as the per-test mock proxy (matches the
         // mock_overuse smell logic in `smells.rs`). `stubs_count` renders
@@ -439,10 +451,30 @@ mod tests {
             patch_decorator_count: patches,
             stubs_count: 0,
             setup_to_assertion_ratio: 0.0,
+            external_verification_count: 0,
             called_names: Vec::new(),
             smell_hits: Vec::new(),
             suspicion_score: score,
         }
+    }
+
+    #[test]
+    fn asserts_column_marks_external_verification() {
+        let mut inv = empty_inv();
+        let mut verified = make_test("tests/probe.py::test_wheel", 0.02, 0, 0);
+        verified.external_verification_count = 1;
+        let plain = make_test("tests/probe.py::test_empty", 0.22, 0, 0);
+        inv.top_suspicious.test_functions = vec![verified.nodeid.clone(), plain.nodeid.clone()];
+        inv.test_functions = vec![verified, plain];
+        let out = render(&inv, 20);
+        let verified_row =
+            out.lines().find(|l| l.contains("test_wheel")).expect("verified row rendered");
+        assert!(
+            verified_row.contains("0+1x"),
+            "a checked child process must not render as a bare 0: {verified_row}"
+        );
+        let plain_row = out.lines().find(|l| l.contains("test_empty")).expect("plain row rendered");
+        assert!(!plain_row.contains('x'), "an unverified test keeps a bare count: {plain_row}");
     }
 
     #[test]
