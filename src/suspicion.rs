@@ -37,6 +37,19 @@ pub struct SuspicionWeights {
     pub w_smell_density: f64,
 }
 
+/// Inflection point of the setup-ratio sigmoid, in source lines per assertion.
+///
+/// At this ratio the setup term contributes exactly half its weight. It is
+/// also what [`crate::accept::Signal::HighSetupRatio`] fires at and what the
+/// analyze guide documents as the `setup-heavy` threshold — one number, so
+/// retuning the score cannot silently desynchronize the acceptances recorded
+/// against it.
+pub const SETUP_RATIO_INFLECTION: f64 = 8.0;
+
+/// Scale of the setup-ratio sigmoid: the ratio delta that moves the term one
+/// logistic unit.
+pub const SETUP_RATIO_SCALE: f64 = 4.0;
+
 /// Locked v1 weights. See `WEIGHTS.md` for rationale and revision policy.
 pub const DEFAULT: SuspicionWeights = SuspicionWeights {
     w_mock_only: 0.35,
@@ -53,7 +66,8 @@ pub const DEFAULT: SuspicionWeights = SuspicionWeights {
 /// ```text
 /// score = w_mock_only     * (only_asserts_on_mock ? 1.0 : 0.0)
 ///       + w_patch_count   * min(patch_decorator_count / 5.0, 1.0)
-///       + w_setup_ratio   * sigmoid((setup_to_assertion_ratio - 8.0) / 4.0)
+///       + w_setup_ratio   * sigmoid((setup_to_assertion_ratio - SETUP_RATIO_INFLECTION)
+///                                     / SETUP_RATIO_SCALE)
 ///       + w_zero_asserts  * (assertion_count == 0 ? 1.0 : 0.0)
 ///       + w_smell_density * min(smell_hits.len() / 3.0, 1.0)
 /// ```
@@ -63,7 +77,8 @@ pub fn score_test(test: &TestRecord, weights: &SuspicionWeights) -> f64 {
     let patch_ratio = (test.patch_decorator_count as f64 / 5.0).min(1.0);
     let patch_term = weights.w_patch_count * patch_ratio;
 
-    let setup_term = weights.w_setup_ratio * sigmoid((test.setup_to_assertion_ratio - 8.0) / 4.0);
+    let setup_term = weights.w_setup_ratio
+        * sigmoid((test.setup_to_assertion_ratio - SETUP_RATIO_INFLECTION) / SETUP_RATIO_SCALE);
 
     let zero_asserts_term = if test.assertion_count == 0 { weights.w_zero_asserts } else { 0.0 };
 
@@ -92,13 +107,17 @@ pub fn score_file(file: &FileRecord, test_scores: &[f64]) -> f64 {
 
 /// Return the top-N test nodeids by suspicion score (descending), tie-broken
 /// by nodeid ascending for determinism. `n = 0` returns an empty vector;
-/// `n > records.len()` returns every nodeid.
-pub fn top_n_tests(records: &[TestRecord], n: usize) -> Vec<String> {
-    if n == 0 || records.is_empty() {
+/// `n` above the record count returns every nodeid.
+///
+/// Takes an iterator rather than a slice so callers can rank a subset —
+/// `lib.rs` filters out tests whose every active signal was accepted before
+/// handing the rest over.
+pub fn top_n_tests<'a>(records: impl IntoIterator<Item = &'a TestRecord>, n: usize) -> Vec<String> {
+    let mut ranked: Vec<(&str, f64)> =
+        records.into_iter().map(|t| (t.nodeid.as_str(), t.suspicion_score)).collect();
+    if n == 0 || ranked.is_empty() {
         return Vec::new();
     }
-    let mut ranked: Vec<(&str, f64)> =
-        records.iter().map(|t| (t.nodeid.as_str(), t.suspicion_score)).collect();
     // `total_cmp` is a total order over f64 (NaN-aware), so the sort is
     // panic-free and deterministic even if a NaN somehow slips in.
     ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
@@ -146,6 +165,8 @@ mod tests {
             called_names: Vec::new(),
             smell_hits: Vec::new(),
             suspicion_score: 0.0,
+            fingerprint: None,
+            accepted_signals: Vec::new(),
         }
     }
 

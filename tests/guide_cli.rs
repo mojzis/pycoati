@@ -245,7 +245,7 @@ fn json_scan_never_emits_the_footer() {
     // The strongest form of "uncontaminated": the whole stream is one JSON doc.
     let parsed: serde_json::Value =
         serde_json::from_str(&stdout).expect("json stdout must parse in its entirety");
-    assert_eq!(parsed["schema_version"], "2");
+    assert_eq!(parsed["schema_version"], "3");
     assert!(!stdout.contains("pycoati guide"), "json output must not mention the guide");
 }
 
@@ -297,7 +297,7 @@ fn adding_the_subcommand_did_not_break_the_positional_form() {
     let stdout =
         String::from_utf8(assert.get_output().stdout.clone()).expect("stdout must be UTF-8");
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("stdout must be valid JSON");
-    assert_eq!(v["schema_version"], "2");
+    assert_eq!(v["schema_version"], "3");
 }
 
 #[test]

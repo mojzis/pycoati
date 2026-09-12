@@ -133,9 +133,10 @@ fn stubs_count_serializes_in_json_output() {
             "every FileRecord must serialize stubs_count as a number, got {f}"
         );
     }
-    // Schema version stays at "2" — adding fields inside existing records
-    // is permitted by the schema-v2 lock.
-    assert_eq!(v["schema_version"], Value::String("2".to_string()));
+    // `stubs_count` was added inside an existing record, which the schema
+    // contract permits without a version bump. The "3" here comes from the
+    // later `accepted` block — a new top-level key — not from this field.
+    assert_eq!(v["schema_version"], Value::String("3".to_string()));
 }
 
 #[test]

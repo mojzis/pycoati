@@ -1,7 +1,7 @@
 //! Schema-shape integration test for the Inventory output.
 //!
 //! Verifies that `pycoati::run_static` produces JSON whose top-level structure
-//! exactly matches the `schema_version` "2" contract. Key-set equality is
+//! exactly matches the `schema_version` "3" contract. Key-set equality is
 //! asserted on `serde_json::Value` so cosmetic struct-field reordering does
 //! not break the test.
 
@@ -23,7 +23,7 @@ fn keys(v: &Value) -> BTreeSet<String> {
 }
 
 #[test]
-fn inventory_top_level_keys_match_schema_v2() {
+fn inventory_top_level_keys_match_schema_v3() {
     let path = fixture_path("tests/fixtures/simple/empty.py");
     let inv = pycoati::run_static(&path).expect("run_static on empty.py");
     let v = serde_json::to_value(&inv).expect("serialize inventory");
@@ -36,21 +36,43 @@ fn inventory_top_level_keys_match_schema_v2() {
         "test_functions",
         "sut_calls",
         "top_suspicious",
+        "accepted",
         "tool",
     ]
     .iter()
     .map(|s| (*s).to_string())
     .collect();
 
-    assert_eq!(keys(&v), expected, "top-level keys must match schema v2");
+    assert_eq!(keys(&v), expected, "top-level keys must match schema v3");
 }
 
 #[test]
-fn inventory_schema_version_is_string_two() {
+fn inventory_accepted_block_is_empty_without_a_baseline() {
     let path = fixture_path("tests/fixtures/simple/empty.py");
     let inv = pycoati::run_static(&path).expect("run_static on empty.py");
     let v = serde_json::to_value(&inv).expect("serialize inventory");
-    assert_eq!(v["schema_version"], Value::String("2".to_string()));
+
+    let accepted_keys: BTreeSet<String> = ["path", "included_in_shortlist", "findings", "stale"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    assert_eq!(keys(&v["accepted"]), accepted_keys);
+
+    // The fixture directory holds no `.pycoati-accept.toml`, so the whole
+    // block is the "nothing accepted" shape — and `path` is null rather than
+    // an empty string.
+    assert_eq!(v["accepted"]["path"], Value::Null);
+    assert_eq!(v["accepted"]["included_in_shortlist"], Value::Bool(false));
+    assert_eq!(v["accepted"]["findings"], Value::Array(vec![]));
+    assert_eq!(v["accepted"]["stale"], Value::Array(vec![]));
+}
+
+#[test]
+fn inventory_schema_version_is_string_three() {
+    let path = fixture_path("tests/fixtures/simple/empty.py");
+    let inv = pycoati::run_static(&path).expect("run_static on empty.py");
+    let v = serde_json::to_value(&inv).expect("serialize inventory");
+    assert_eq!(v["schema_version"], Value::String("3".to_string()));
 }
 
 #[test]
