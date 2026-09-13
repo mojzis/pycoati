@@ -89,7 +89,9 @@ pub enum Signal {
     MockOnlyAssertions,
     /// The test patches/stubs far more than it asserts.
     MockOveruse,
-    /// The test body contains no effective assertion.
+    /// The test verifies nothing: no effective assertion in its body, and
+    /// no external verification either (see
+    /// [`crate::TestRecord::verifies_nothing`]).
     ZeroAsserts,
     /// `setup_to_assertion_ratio >= ` [`HIGH_SETUP_RATIO`].
     HighSetupRatio,
@@ -140,7 +142,7 @@ pub fn active_signals(test: &TestRecord) -> BTreeSet<Signal> {
             out.insert(signal);
         }
     }
-    if test.assertion_count == 0 {
+    if test.verifies_nothing() {
         out.insert(Signal::ZeroAsserts);
     }
     if test.setup_to_assertion_ratio >= HIGH_SETUP_RATIO {
@@ -600,6 +602,7 @@ mod tests {
             patch_decorator_count: 0,
             stubs_count: 0,
             setup_to_assertion_ratio: 0.0,
+            external_verification_count: 0,
             called_names: Vec::new(),
             smell_hits: Vec::new(),
             suspicion_score: 0.0,
@@ -668,6 +671,19 @@ mod tests {
         // The two constants must stay one number, or an accepted
         // `high_setup_ratio` would stop describing what ranked the test.
         assert!((HIGH_SETUP_RATIO - crate::suspicion::SETUP_RATIO_INFLECTION).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn zero_asserts_is_not_active_when_verification_is_external() {
+        // The score stopped charging the zero-assert weight for a test that
+        // checks a child process (issue #17). The signal set has to agree,
+        // or the baseline would offer a finding the audit no longer makes.
+        let mut t = make_test("a::t");
+        t.assertion_count = 0;
+        t.external_verification_count = 1;
+        assert!(!active_signals(&t).contains(&Signal::ZeroAsserts));
+        t.external_verification_count = 0;
+        assert!(active_signals(&t).contains(&Signal::ZeroAsserts));
     }
 
     #[test]

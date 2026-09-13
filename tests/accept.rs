@@ -6,9 +6,10 @@
 //!
 //! | test                          | signals                            |
 //! |-------------------------------|------------------------------------|
-//! | `test_child_interpreter_smoke`| `zero_asserts`, `high_setup_ratio` |
+//! | `test_startup_sequence_smoke` | `zero_asserts`, `high_setup_ratio` |
 //! | `test_short_smoke`            | `zero_asserts`                     |
 //! | `test_mock_only_assertion`    | `mock_only_assertions`             |
+//! | `test_checked_child_process`  | none — it verifies in a child      |
 //! | `test_clean`                  | none                               |
 //!
 //! Two fixtures, deliberately paired:
@@ -41,7 +42,8 @@ use serde_json::Value;
 mod common;
 use common::{fixture_path, integration_python, pytest_available, stage_fixture};
 
-const SMOKE: &str = "tests/test_accepted.py::test_child_interpreter_smoke";
+const SMOKE: &str = "tests/test_accepted.py::test_startup_sequence_smoke";
+const CHILD: &str = "tests/test_accepted.py::test_checked_child_process";
 const SHORT: &str = "tests/test_accepted.py::test_short_smoke";
 const MOCK_ONLY: &str = "tests/test_accepted.py::test_mock_only_assertion";
 const CLEAN: &str = "tests/test_accepted.py::test_clean";
@@ -179,13 +181,13 @@ fn acceptance_changes_nothing_but_the_shortlist() {
 
 #[test]
 fn accepting_one_signal_of_two_keeps_the_test_actionable() {
-    // `test_child_interpreter_smoke` fires both `zero_asserts` and
+    // `test_startup_sequence_smoke` fires both `zero_asserts` and
     // `high_setup_ratio`. Signing off only the first must leave it listed.
     let (_tmp, root) = stage_fixture("accept_project");
     write_baseline(
         &root,
         &format!(
-            "schema_version = \"1\"\n\n[[accept]]\ntest = \"{SMOKE}\"\nsignal = \"zero_asserts\"\nreason = \"assertions run in a child interpreter\"\n"
+            "schema_version = \"1\"\n\n[[accept]]\ntest = \"{SMOKE}\"\nsignal = \"zero_asserts\"\nreason = \"smoke contract: the startup sequence must not raise\"\n"
         ),
     );
     let v = scan(&root, &[]);
@@ -204,7 +206,7 @@ fn accepting_both_signals_of_a_test_drops_it() {
     write_baseline(
         &root,
         &format!(
-            "schema_version = \"1\"\n\n[[accept]]\ntest = \"{SMOKE}\"\nsignals = [\"zero_asserts\", \"high_setup_ratio\"]\nreason = \"assertions run in a child interpreter\"\n"
+            "schema_version = \"1\"\n\n[[accept]]\ntest = \"{SMOKE}\"\nsignals = [\"zero_asserts\", \"high_setup_ratio\"]\nreason = \"smoke contract: the startup sequence must not raise\"\n"
         ),
     );
     let v = scan(&root, &[]);
@@ -374,6 +376,30 @@ fn an_entry_for_a_test_that_is_gone_is_reported_stale() {
     assert_eq!(stale[0]["test"], "tests/test_accepted.py::test_renamed_away");
     assert_eq!(stale[0]["reason"], "smoke contract");
     assert!(v["accepted"]["findings"].as_array().expect("findings").is_empty());
+}
+
+#[test]
+fn a_test_that_verifies_in_a_child_process_is_never_offered_zero_asserts() {
+    // The score stopped charging the zero-assert weight for a checked
+    // subprocess (issue #17), so the signal set must agree: there is nothing
+    // here to review, and an entry accepting it is stale rather than
+    // suppressing.
+    let (_tmp, root) = stage_fixture("accept_project");
+    write_baseline(
+        &root,
+        &format!(
+            "schema_version = \"1\"\n\n[[accept]]\ntest = \"{CHILD}\"\nsignal = \"zero_asserts\"\nreason = \"child interpreter\"\n"
+        ),
+    );
+    let v = scan(&root, &[]);
+
+    assert!(signals(&v, CHILD).is_empty(), "nothing was suppressed");
+    assert_eq!(record(&v, CHILD)["assertion_count"], 0);
+    assert_eq!(record(&v, CHILD)["external_verification_count"], 1);
+    let stale = v["accepted"]["stale"].as_array().expect("stale array");
+    assert_eq!(stale.len(), 1);
+    assert_eq!(stale[0]["status"], "signal_not_active");
+    assert_eq!(stale[0]["test"], CHILD);
 }
 
 #[test]
@@ -845,7 +871,7 @@ fn accepted_tests_are_still_collected_run_and_covered() {
     let accepted = run(
         &acc_root,
         Some(&format!(
-            "schema_version = \"1\"\n\n[[accept]]\ntest = \"{SHORT}\"\nsignal = \"zero_asserts\"\nreason = \"smoke contract\"\n\n[[accept]]\ntest = \"{SMOKE}\"\nsignals = [\"zero_asserts\", \"high_setup_ratio\"]\nreason = \"assertions run in a child interpreter\"\n"
+            "schema_version = \"1\"\n\n[[accept]]\ntest = \"{SHORT}\"\nsignal = \"zero_asserts\"\nreason = \"smoke contract\"\n\n[[accept]]\ntest = \"{SMOKE}\"\nsignals = [\"zero_asserts\", \"high_setup_ratio\"]\nreason = \"smoke contract: the startup sequence must not raise\"\n"
         )),
     );
 
@@ -863,7 +889,7 @@ fn accepted_tests_are_still_collected_run_and_covered() {
         "acceptance must not change how many tests pytest collects"
     );
     let raw_count = raw["suite"]["test_count"].as_u64().expect("test_count");
-    assert_eq!(raw_count, 4, "all four fixture tests must be collected");
+    assert_eq!(raw_count, 5, "all five fixture tests must be collected");
     assert!(raw["suite"]["runtime_seconds"].as_f64().expect("runtime") > 0.0);
     assert!(accepted["suite"]["runtime_seconds"].as_f64().expect("runtime") > 0.0);
 

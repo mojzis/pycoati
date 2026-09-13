@@ -57,6 +57,7 @@ fn populated_inventory() -> Inventory {
             patch_decorator_count: 1,
             stubs_count: 1,
             setup_to_assertion_ratio: 3.0,
+            external_verification_count: 1,
             called_names: vec!["demo.thing".to_string()],
             smell_hits: vec![smell_hit(Some("tests/test_x.py::test_a"))],
             suspicion_score: 0.5,
@@ -222,7 +223,7 @@ fn the_walk_actually_reaches_nested_structs() {
     }
     assert_eq!(
         emitted.len(),
-        49,
+        50,
         "single-project schema field count changed. If you added or removed an \
          inventory field, update this count AND the field's bullet in \
          docs/guide/analyze.md."

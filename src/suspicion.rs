@@ -31,7 +31,8 @@ pub struct SuspicionWeights {
     pub w_patch_count: f64,
     /// Sigmoid term over `setup_to_assertion_ratio` (inflection at 8 lines).
     pub w_setup_ratio: f64,
-    /// Bonus when the test has zero `assert_statement` nodes.
+    /// Bonus when the test has zero `assert_statement` nodes **and** no
+    /// external-verification evidence.
     pub w_zero_asserts: f64,
     /// Density term over `smell_hits.len()` (saturates at three).
     pub w_smell_density: f64,
@@ -68,9 +69,24 @@ pub const DEFAULT: SuspicionWeights = SuspicionWeights {
 ///       + w_patch_count   * min(patch_decorator_count / 5.0, 1.0)
 ///       + w_setup_ratio   * sigmoid((setup_to_assertion_ratio - SETUP_RATIO_INFLECTION)
 ///                                     / SETUP_RATIO_SCALE)
-///       + w_zero_asserts  * (assertion_count == 0 ? 1.0 : 0.0)
+///       + w_zero_asserts  * (unverified ? 1.0 : 0.0)
 ///       + w_smell_density * min(smell_hits.len() / 3.0, 1.0)
+///
+/// unverified = assertion_count == 0 && external_verification_count == 0
+///              (`TestRecord::verifies_nothing`)
 /// ```
+///
+/// The zero-assert term asks whether the test can fail for its own reason,
+/// not whether an `assert` keyword appears in it. A test that checks a
+/// child process's exit status (`external_verification_count > 0`) fails
+/// when that child fails, so the term does not apply — and its mock, patch
+/// and smell terms score as they would for any other test.
+///
+/// The `setup_to_assertion_ratio` this function reads is itself computed
+/// differently for such a test — measured to the verification call site
+/// rather than to the end of the body, see
+/// `parser::compute_setup_to_assertion_ratio` — so the setup term is not
+/// suppressed here, just no longer fed the whole body height.
 pub fn score_test(test: &TestRecord, weights: &SuspicionWeights) -> f64 {
     let mock_only_term = if test.only_asserts_on_mock { weights.w_mock_only } else { 0.0 };
 
@@ -80,7 +96,7 @@ pub fn score_test(test: &TestRecord, weights: &SuspicionWeights) -> f64 {
     let setup_term = weights.w_setup_ratio
         * sigmoid((test.setup_to_assertion_ratio - SETUP_RATIO_INFLECTION) / SETUP_RATIO_SCALE);
 
-    let zero_asserts_term = if test.assertion_count == 0 { weights.w_zero_asserts } else { 0.0 };
+    let zero_asserts_term = if test.verifies_nothing() { weights.w_zero_asserts } else { 0.0 };
 
     let smell_ratio = (test.smell_hits.len() as f64 / 3.0).min(1.0);
     let smell_term = weights.w_smell_density * smell_ratio;
@@ -162,6 +178,7 @@ mod tests {
             patch_decorator_count: 0,
             stubs_count: 0,
             setup_to_assertion_ratio: 0.0,
+            external_verification_count: 0,
             called_names: Vec::new(),
             smell_hits: Vec::new(),
             suspicion_score: 0.0,
@@ -274,6 +291,33 @@ mod tests {
         t.assertion_count = 1;
         let one = score_test(&t, &DEFAULT);
         assert!(approx_eq(zero - one, DEFAULT.w_zero_asserts));
+    }
+
+    #[test]
+    fn zero_asserts_term_is_off_when_external_verification_exists() {
+        let mut t = make_test("a");
+        t.assertion_count = 0;
+        t.external_verification_count = 1;
+        let verified = score_test(&t, &DEFAULT);
+        t.external_verification_count = 0;
+        let unverified = score_test(&t, &DEFAULT);
+        assert!(approx_eq(unverified - verified, DEFAULT.w_zero_asserts));
+    }
+
+    #[test]
+    fn external_verification_suppresses_only_the_zero_asserts_term() {
+        // Everything else the test trips must still score: recognising the
+        // child process is not an exemption from the other heuristics.
+        let mut t = make_test("a");
+        t.assertion_count = 0;
+        t.external_verification_count = 1;
+        t.only_asserts_on_mock = true;
+        t.patch_decorator_count = 5;
+        t.smell_hits = vec![smell_hit(), smell_hit(), smell_hit()];
+        t.setup_to_assertion_ratio = 8.0;
+        let s = score_test(&t, &DEFAULT);
+        // 0.35 + 0.20 + 0.075 + 0.00 + 0.10 = 0.725
+        assert!(approx_eq(s, 0.725), "expected 0.725, got {s}");
     }
 
     #[test]

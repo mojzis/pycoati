@@ -161,6 +161,10 @@ fingerprint = "3f0a1c7d9b2e4a56"
   inventory. When set, editing the test lapses the acceptance until someone
   reviews it again. When unset, the acceptance survives edits.
 
+`zero_asserts` means the test verifies nothing at all: no `assert`-shaped
+construct **and** no `external_verification_count`. A test that checks a child
+process's exit status never trips it, so it needs no entry.
+
 An assertionless test usually trips `high_setup_ratio` too, because the ratio
 degrades to the height of the whole body. Accept both signals in one entry if
 that is the reviewed judgement — accepting only `zero_asserts` deliberately

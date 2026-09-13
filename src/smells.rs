@@ -141,6 +141,7 @@ mod tests {
             patch_decorator_count: 0,
             stubs_count: 0,
             setup_to_assertion_ratio: 0.0,
+            external_verification_count: 0,
             called_names: Vec::new(),
             smell_hits: Vec::new(),
             suspicion_score: 0.0,

@@ -16,8 +16,10 @@ Per-test score:
 score = w_mock_only      * (only_asserts_on_mock ? 1.0 : 0.0)
       + w_patch_count    * min(patch_decorator_count / 5.0, 1.0)
       + w_setup_ratio    * sigmoid((setup_to_assertion_ratio - 8.0) / 4.0)
-      + w_zero_asserts   * (assertion_count == 0 ? 1.0 : 0.0)
+      + w_zero_asserts   * (unverified ? 1.0 : 0.0)
       + w_smell_density  * min(smell_hits.len() / 3.0, 1.0)
+
+unverified = assertion_count == 0 && external_verification_count == 0
 ```
 
 `sigmoid(x) = 1.0 / (1.0 + e^-x)`.
@@ -29,7 +31,7 @@ score = w_mock_only      * (only_asserts_on_mock ? 1.0 : 0.0)
 | `w_mock_only` | `0.35` | Strongest single signal — a test whose only assertions target the Mock API is exercising the test double itself, not production logic. |
 | `w_patch_count` | `0.20` | High-density `@patch` decorators flag tests where the System Under Test has been replaced wholesale; saturates at 5 to avoid runaway scores on extreme outliers. |
 | `w_setup_ratio` | `0.15` | Long setup before the first assertion correlates with brittle tests that drift from their intent; sigmoid keeps the term smooth and bounded. |
-| `w_zero_asserts` | `0.20` | A test without any assertions cannot fail by intent — it survives only by not raising. Weight is high but slightly below `w_mock_only` because such tests are often vestigial smoke tests rather than mock-theater. |
+| `w_zero_asserts` | `0.20` | A test that verifies nothing cannot fail by intent — it survives only by not raising. Weight is high but slightly below `w_mock_only` because such tests are often vestigial smoke tests rather than mock-theater. The term is gated on `unverified`, not on `assertion_count` alone: a test that checks a child process's exit status does fail by intent. |
 | `w_smell_density` | `0.10` | Re-uses information already captured by other heuristics, so weighted lowest — but a test that trips multiple smells should rank above one that trips none. |
 
 Sum of the weight values: **1.00** — a test that fires every term and
@@ -42,15 +44,41 @@ saturates each saturating sub-metric reaches a score of 1.0.
   A raises block is treated as one effective non-mock assertion: it
   contributes to the count, disqualifies `only_asserts_on_mock`, and
   participates in `setup_to_assertion_ratio` like an `assert_statement`.
-- `setup_to_assertion_ratio` (locked, Run 3; extended to raises blocks):
-  when at least one effective assertion exists in the body,
-  `(first_effective_line - def_line) / effective_count` measured in
-  tree-sitter `start_position().row` deltas, where an effective assertion
-  is an `assert_statement` or a `with pytest.raises(...)` block. When the
-  body has no effective assertions, the numerator becomes
-  `(last_body_line - def_line)` and the denominator is `1` — the result
-  is the body height. This naturally pushes setup-heavy zero-assert tests
-  up the ranking, complementing the `w_zero_asserts` term.
+- `external_verification_count` counts call sites that propagate a
+  failure from outside the test process: a call resolving to
+  `subprocess.check_call` / `subprocess.check_output`, a call resolving
+  to `subprocess.run` carrying the literal `check=True`, and
+  `<receiver>.check_returncode()`. Import aliases are canonicalized
+  first. It is deliberately **not** folded into `assertion_count`, which
+  stays a syntactic count — the two answer different questions, and
+  merging them would silently change a published field's meaning. Its
+  effects on the score are two: the `w_zero_asserts` term switches off,
+  and `setup_to_assertion_ratio` is measured to the first verification
+  call site instead of the body height (see the next bullet). The mock,
+  patch and smell terms are computed as usual, so a checked-subprocess
+  test that overuses mocks still ranks for that.
+  A checked call against a name the test itself replaced with a double
+  (`@patch`, `monkeypatch.setattr`, a fixture of the same name, a local
+  assigned from a `Mock()`, a patcher a `setUp` started for the whole
+  class) is excluded, as is one whose failure may never reach pytest —
+  nested in a `def`/`lambda` or a generator expression, inside a `try`
+  that has an `except`, or inside `with contextlib.suppress(...)`. Evidence the test manufactured, or that cannot
+  escape, is not evidence. `from subprocess import *` is never matched
+  at all, which under-counts; that is the safe direction.
+- `setup_to_assertion_ratio` (locked, Run 3; extended to raises blocks
+  and to external verification): when at least one effective assertion
+  exists in the body, `(first_effective_line - def_line) /
+  effective_count` measured in tree-sitter `start_position().row`
+  deltas, where an effective assertion is an `assert_statement` or a
+  `with pytest.raises(...)` block. When the body has no effective
+  assertion but does carry external verification, the first verification
+  call site takes the assertion's place: `(first_verification_line -
+  def_line) / external_verification_count` — the body is not "setup with
+  no payoff", so the fallback below would misread it. When it has
+  neither, the numerator becomes `(last_body_line - def_line)` and the
+  denominator is `1` — the result is the body height. This naturally
+  pushes setup-heavy unverified tests up the ranking, complementing the
+  `w_zero_asserts` term.
 - `patch_decorator_count` saturates at **5**: the term becomes `1.0`
   once a test has five or more `@patch`-shaped decorators. Five is the
   point past which incremental decorators add no new signal — the test

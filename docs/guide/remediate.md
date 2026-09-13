@@ -45,9 +45,11 @@ means the test was edited since review.
 **Rung 1 — dead-test → delete.**
 A test with no assertions that calls no project code protects nothing. Delete
 it. Before deleting, confirm once more that it is not a smoke test whose value
-is that it does not raise, and that its assertions are not made through a helper
-function. If either is true, it is not a rung 1 finding — drop it from the
-ladder entirely.
+is that it does not raise, that its assertions are not made through a helper
+function, and that it does not verify in a child process
+(`external_verification_count > 0` — a failing child fails the test through
+`CalledProcessError`). If any is true, it is not a rung 1 finding — drop it from
+the ladder entirely.
 
 **Rung 2 — tautology → fix the assertion, or delete.**
 Prefer fixing: replace the self-referential assertion with one about a value the

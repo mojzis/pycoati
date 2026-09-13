@@ -12,7 +12,9 @@
 //! function count from `suite.test_count` (pytest-collected, parametrize-
 //! expanded); `"3"` adds the top-level `accepted` block plus
 //! `test_functions[].fingerprint` and `test_functions[].accepted_signals`
-//! for the reviewed-suppression baseline (see [`accept`]). Every top-level
+//! for the reviewed-suppression baseline (see [`accept`]), and
+//! `test_functions[].external_verification_count` for verification that
+//! happens outside the test process. Every top-level
 //! field is always serialized; fields not yet computed in the current run
 //! are populated with defaults (`null` / `0` / `[]`).
 
@@ -33,6 +35,7 @@ pub mod python_detect;
 pub(crate) mod smells;
 pub(crate) mod suspicion;
 pub(crate) mod sut_calls;
+pub(crate) mod verification;
 pub mod walker;
 pub mod workspace;
 
@@ -158,6 +161,20 @@ pub struct TestRecord {
     /// constructions remain a file-scope signal only.
     pub stubs_count: u64,
     pub setup_to_assertion_ratio: f64,
+    /// Call sites in this test's body that verify an outcome the test body
+    /// cannot see: today, a child process whose non-zero exit status is
+    /// checked (`subprocess.run(..., check=True)`, `check_call`,
+    /// `check_output`, `CompletedProcess.check_returncode()`).
+    ///
+    /// Kept separate from `assertion_count`, which stays a syntactic count
+    /// of `assert`-shaped constructs. A non-zero value means a failure
+    /// raised outside this process still fails the test, so zero assertions
+    /// is not the absence of verification.
+    ///
+    /// The inference is narrow: a checked call against a name the test
+    /// replaced with a double, or one nested in a `def` the test may never
+    /// invoke, does not count.
+    pub external_verification_count: u64,
     pub called_names: Vec<String>,
     pub smell_hits: Vec<SmellHit>,
     pub suspicion_score: f64,
@@ -183,6 +200,21 @@ impl TestRecord {
         let active = accept::active_signals(self);
         !active.is_empty()
             && active.iter().all(|s| self.accepted_signals.iter().any(|a| a == s.as_str()))
+    }
+}
+
+impl TestRecord {
+    /// True when the test verifies nothing: no `assert`-shaped construct in
+    /// its body **and** no external-verification call site, so it can only
+    /// fail by raising.
+    ///
+    /// The one definition of "assertionless" in the crate. Both consumers —
+    /// the `w_zero_asserts` term of `suspicion_score` and the `zero_asserts`
+    /// entry of [`accept::active_signals`] — read it here, so the score and
+    /// the acceptance baseline can never disagree about which tests the
+    /// signal covers.
+    pub fn verifies_nothing(&self) -> bool {
+        self.assertion_count == 0 && self.external_verification_count == 0
     }
 }
 
