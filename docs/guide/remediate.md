@@ -34,6 +34,14 @@ implying a clean result.
 Take the **first rung that applies** to a finding. Do not skip ahead. A finding
 that matches rungs 1 and 4 is a rung 1 finding.
 
+**Rung 0 — already accepted → skip it.**
+A finding covered by `accepted.findings` has been reviewed and signed off.
+Quote the reason in your report and take no action. This rung exists so the
+ladder never walks over a recorded decision. It applies only to the exact
+(test, signal) pair listed, and never to an entry under `accepted.stale` — a
+lapsed acceptance is an ordinary finding again, and a `content_changed` one
+means the test was edited since review.
+
 **Rung 1 — dead-test → delete.**
 A test with no assertions that calls no project code protects nothing. Delete
 it. Before deleting, confirm once more that it is not a smoke test whose value
@@ -84,6 +92,30 @@ from a human. Then move on to the next finding.
 This rung is where a large share of real findings land. That is the correct
 outcome, not a failure to finish.
 
+**Rung 7 — correct as written, for a reason only the project knows → propose
+an accept entry.**
+Some tests trip a signal and are right anyway, in a way no amount of static
+analysis will ever see: assertions made in a child interpreter, a smoke
+contract whose value is that it does not raise, assertions made through a
+helper. When you have read the test and concluded that, the finding is not a
+code change — it is a review decision to record.
+
+Put the proposed entry in your report, for a human to add to
+`.pycoati-accept.toml`:
+
+```toml
+[[accept]]
+test = "<nodeid>"
+signals = ["<the signals you confirmed>"]
+reason = "<what you found when you read the test>"
+fingerprint = "<test_functions[].fingerprint>"
+```
+
+**Do not write this file yourself.** It records someone's judgement, and
+signing it on their behalf is exactly the thing the approval gate exists to
+prevent. Name only the signals you actually confirmed; a test you accept for
+`zero_asserts` must still surface tomorrow if it grows a `mock_overuse` hit.
+
 ## After approval — the edit loop
 
 Approval covers the report that was approved. Work one finding at a time, in
@@ -116,6 +148,11 @@ which is a decision for a human.
   deliberately not configurable per run. `--top-suspicious` changes list length
   only — shortening the list does not resolve anything, and using it to trim a
   report is falsifying the report.
+- **Do not write or edit `.pycoati-accept.toml`.** Propose entries in the
+  report (rung 7) and let a human add them. Adding an acceptance to make a
+  finding go away, widening an existing entry to cover a new signal, or
+  re-pinning a `content_changed` entry's fingerprint without reading the test
+  are all the same move as raising a threshold, dressed as a review.
 - **Do not delete or skip a test to make a gate pass.** Adding a skip marker,
   an expected-failure marker, or a narrowing condition to silence a failing test
   is out of scope for every rung on this ladder.
@@ -133,9 +170,13 @@ which is a decision for a human.
 ## Finishing
 
 Report, in this order: findings resolved and how, findings escalated and what
-decision each needs, findings reverted and why, and the before/after of
-`top_suspicious.test_functions`. State plainly if any finding was left
-untouched.
+decision each needs, accept entries proposed and for which signals, findings
+reverted and why, and the before/after of `top_suspicious.test_functions`.
+State plainly if any finding was left untouched.
+
+Also list every `accepted.stale[]` entry, with what you did about it: worked
+the finding, or proposed deleting a dead entry. A stale list that grows every
+scan is a baseline nobody is reading.
 
 next: run `pycoati . --output inventory.json` and `pycoati guide analyze` to
 confirm the result

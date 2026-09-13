@@ -1,0 +1,5 @@
+[project]
+name = "reviewed"
+
+[tool.hatch.build.targets.wheel]
+packages = ["reviewed"]

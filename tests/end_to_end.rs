@@ -198,7 +198,7 @@ fn nodeids_are_relative_to_project_root() {
 #[test]
 fn schema_invariants_preserved_under_walker_mode() {
     let v = run_pycoati();
-    assert_eq!(v["schema_version"], Value::String("2".to_string()));
+    assert_eq!(v["schema_version"], Value::String("3".to_string()));
     assert_eq!(v["tool"]["ran_pytest"], Value::Bool(false));
     assert_eq!(v["tool"]["ran_coverage"], Value::Bool(false));
     assert_eq!(v["suite"]["test_count"], Value::Null);
@@ -306,7 +306,7 @@ fn empty_tests_directory_emits_warn_and_clean_inventory() {
     // Inventory is clean and empty.
     assert_eq!(v["files"].as_array().expect("files array").len(), 0);
     assert_eq!(v["test_functions"].as_array().expect("test_functions array").len(), 0);
-    assert_eq!(v["schema_version"], Value::String("2".to_string()));
+    assert_eq!(v["schema_version"], Value::String("3".to_string()));
 
     // A WARN must fire that names the test-discovery branch (not just the
     // pytest WARNs that fire on any empty inventory). The wording must be

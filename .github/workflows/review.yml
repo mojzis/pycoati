@@ -62,5 +62,8 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install pytest
-        run: pip install pytest
+        # pytest-cov too: the integration tests probe for both
+        # (`import pytest, pytest_cov`) and silently self-skip without it,
+        # which would hide every pytest-path test rather than fail.
+        run: pip install pytest pytest-cov
       - run: cargo test --all-features

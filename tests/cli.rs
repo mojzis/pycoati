@@ -24,7 +24,7 @@ fn happy_path_prints_valid_json_to_stdout() {
     let stdout =
         String::from_utf8(assert.get_output().stdout.clone()).expect("stdout must be valid UTF-8");
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("stdout must be valid JSON");
-    assert_eq!(v["schema_version"], serde_json::Value::String("2".to_string()));
+    assert_eq!(v["schema_version"], serde_json::Value::String("3".to_string()));
     assert_eq!(v["tool"]["name"], serde_json::Value::String("pycoati".to_string()));
 }
 
@@ -52,7 +52,7 @@ fn format_json_emits_valid_json() {
     let stdout =
         String::from_utf8(assert.get_output().stdout.clone()).expect("stdout must be valid UTF-8");
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("stdout must be valid JSON");
-    assert_eq!(v["schema_version"], serde_json::Value::String("2".to_string()));
+    assert_eq!(v["schema_version"], serde_json::Value::String("3".to_string()));
 }
 
 #[test]
@@ -142,7 +142,7 @@ fn single_project_regression_keeps_bare_inventory_shape() {
         v.get("workspace_root").is_none(),
         "single-project payload must not carry workspace_root, got: {v:#?}"
     );
-    assert_eq!(v["schema_version"], serde_json::Value::String("2".to_string()));
+    assert_eq!(v["schema_version"], serde_json::Value::String("3".to_string()));
 }
 
 #[test]
@@ -357,5 +357,5 @@ fn output_flag_writes_to_file_and_omits_stdout() {
     let contents = std::fs::read_to_string(&out_path).expect("read output file");
     let v: serde_json::Value =
         serde_json::from_str(&contents).expect("output file must be valid JSON");
-    assert_eq!(v["schema_version"], serde_json::Value::String("2".to_string()));
+    assert_eq!(v["schema_version"], serde_json::Value::String("3".to_string()));
 }
