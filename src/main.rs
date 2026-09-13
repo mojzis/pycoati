@@ -138,6 +138,34 @@ struct Cli {
     /// (so scripts can pass it unconditionally) but silently ignored.
     #[arg(long, value_enum, default_value_t = MemberCwd::Root, value_name = "WHERE")]
     member_cwd: MemberCwd,
+
+    /// Accepted-findings baseline to apply. Defaults to
+    /// `<project>/.pycoati-accept.toml` when that file exists — and for a
+    /// single-file scan, to the nearest such file at or above the file's own
+    /// directory. Absent one, no findings are accepted. A path passed here
+    /// must exist.
+    ///
+    /// Each entry records a reviewed exception for one test and one signal,
+    /// with a required reason. Accepted findings stay in the inventory with
+    /// their evidence intact and are listed under `accepted.findings`; they
+    /// are only kept off `top_suspicious.test_functions`. Rejected against a
+    /// uv-workspace root — give each member its own file.
+    #[arg(long, value_name = "PATH", conflicts_with = "no_accept")]
+    accept_file: Option<PathBuf>,
+
+    /// Ignore the accepted-findings baseline entirely and report the raw
+    /// shortlist. Use to see what a reviewer signed off on.
+    #[arg(long)]
+    no_accept: bool,
+
+    /// Keep accepted findings on `top_suspicious.test_functions` — the full
+    /// audit report rather than the default actionable shortlist. The
+    /// `accepted` block is emitted either way.
+    ///
+    /// Conflicts with `--no-accept`: with no baseline read there is nothing
+    /// being held back, so the flag would describe a filter that never ran.
+    #[arg(long, conflicts_with = "no_accept")]
+    include_accepted: bool,
 }
 
 /// Subcommands. Deliberately kept to one: everything else pycoati does is
@@ -251,6 +279,11 @@ fn run_audit(cli: &Cli) -> Result<()> {
         );
     };
     let top_n = cli.top_suspicious.unwrap_or(pycoati::DEFAULT_TOP_SUSPICIOUS);
+    let accept_opts = pycoati::AcceptOptions {
+        file: cli.accept_file.clone(),
+        disabled: cli.no_accept,
+        include_accepted: cli.include_accepted,
+    };
 
     let result = if cli.static_only {
         pycoati::run_audit_static(
@@ -258,6 +291,7 @@ fn run_audit(cli: &Cli) -> Result<()> {
             cli.tests_dir.as_deref(),
             cli.project_package.as_deref(),
             top_n,
+            &accept_opts,
         )?
     } else {
         let python_cmd: Option<Vec<String>> =
@@ -273,6 +307,7 @@ fn run_audit(cli: &Cli) -> Result<()> {
             cli.project_package.as_deref(),
             top_n,
             cli.member_cwd.into(),
+            &accept_opts,
         )?
     };
 

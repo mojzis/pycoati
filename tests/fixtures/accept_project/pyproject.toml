@@ -1,0 +1,5 @@
+[project]
+name = "acceptproj"
+
+[tool.hatch.build.targets.wheel]
+packages = ["acceptproj"]

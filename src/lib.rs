@@ -5,20 +5,25 @@
 //! model and the [`run_static`] entry point used by the `pycoati` binary and
 //! by integration tests.
 //!
-//! The output schema is at `schema_version = "2"` — `"1"` was the initial
+//! The output schema is at `schema_version = "3"` — `"1"` was the initial
 //! Run-1/Run-2 shape; `"2"` renamed `tests[]` to `test_functions[]` and
 //! `test_count` (per-file, per-sut-call, `top_suspicious`) to
 //! `test_function_count` / `test_functions` to disambiguate the AST-level
 //! function count from `suite.test_count` (pytest-collected, parametrize-
-//! expanded). Every top-level field is always serialized; fields not yet
-//! computed in the current run are populated with defaults (`null` / `0` /
-//! `[]`).
+//! expanded); `"3"` adds the top-level `accepted` block plus
+//! `test_functions[].fingerprint` and `test_functions[].accepted_signals`
+//! for the reviewed-suppression baseline (see [`accept`]), and
+//! `test_functions[].external_verification_count` for verification that
+//! happens outside the test process. Every top-level
+//! field is always serialized; fields not yet computed in the current run
+//! are populated with defaults (`null` / `0` / `[]`).
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::Serialize;
 
+pub mod accept;
 pub mod coverage;
 pub mod guide;
 pub mod mock_api;
@@ -33,6 +38,8 @@ pub(crate) mod sut_calls;
 pub(crate) mod verification;
 pub mod walker;
 pub mod workspace;
+
+pub use accept::{AcceptOptions, Accepted, AcceptedFinding, StaleAcceptance};
 
 /// Top-level audit result for a CLI invocation.
 ///
@@ -56,8 +63,9 @@ pub enum AuditResult {
 
 /// Workspace-mode wrapper around a list of per-member [`Inventory`]s.
 ///
-/// `schema_version` stays at `"2"` — the new shape is discriminated by
-/// the presence of `workspace_root`, not by a version bump. `tool`
+/// `schema_version` tracks the single-project value (currently `"3"`) —
+/// the workspace shape is discriminated by the presence of
+/// `workspace_root`, not by a version of its own. `tool`
 /// mirrors the single-project [`ToolInfo`] so consumers can read the
 /// pycoati version and `ran_pytest` / `ran_coverage` flags off the
 /// wrapper without descending into every member.
@@ -80,6 +88,11 @@ pub struct Inventory {
     pub test_functions: Vec<TestRecord>,
     pub sut_calls: SutCalls,
     pub top_suspicious: TopSuspicious,
+    /// Reviewed suppressions in effect for this run, and the entries that no
+    /// longer apply. Findings stay in `test_functions[].smell_hits` and in
+    /// every count regardless — acceptance changes what the shortlist
+    /// promotes, never what the audit observed.
+    pub accepted: Accepted,
     pub tool: ToolInfo,
 }
 
@@ -165,6 +178,44 @@ pub struct TestRecord {
     pub called_names: Vec<String>,
     pub smell_hits: Vec<SmellHit>,
     pub suspicion_score: f64,
+    /// Content fingerprint of this test's source — see
+    /// [`accept::fingerprint`]. Emitted so a reviewer recording an
+    /// acceptance can copy it straight out of the inventory. `null` only
+    /// when the source could not be read as UTF-8, which no acceptance can
+    /// pin against.
+    pub fingerprint: Option<String>,
+    /// Signals on this test that a baseline entry accepted, sorted. Empty
+    /// unless a baseline is in effect and matched.
+    pub accepted_signals: Vec<String>,
+}
+
+impl TestRecord {
+    /// Whether every signal currently firing on this test has been accepted.
+    ///
+    /// This — not "has any acceptance" — is the shortlist rule: a test that
+    /// picks up an unreviewed signal stays actionable no matter how many of
+    /// its other findings were accepted. A test firing no signal at all is
+    /// never "fully accepted"; there was nothing to accept.
+    pub fn accepted_in_full(&self) -> bool {
+        let active = accept::active_signals(self);
+        !active.is_empty()
+            && active.iter().all(|s| self.accepted_signals.iter().any(|a| a == s.as_str()))
+    }
+}
+
+impl TestRecord {
+    /// True when the test verifies nothing: no `assert`-shaped construct in
+    /// its body **and** no external-verification call site, so it can only
+    /// fail by raising.
+    ///
+    /// The one definition of "assertionless" in the crate. Both consumers —
+    /// the `w_zero_asserts` term of `suspicion_score` and the `zero_asserts`
+    /// entry of [`accept::active_signals`] — read it here, so the score and
+    /// the acceptance baseline can never disagree about which tests the
+    /// signal covers.
+    pub fn verifies_nothing(&self) -> bool {
+        self.assertion_count == 0 && self.external_verification_count == 0
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -265,7 +316,7 @@ fn empty_file_record(path: &Path) -> FileRecord {
 /// the default shape (every key present, dynamic fields null/empty).
 fn empty_inventory(project: Project) -> Inventory {
     Inventory {
-        schema_version: "2".to_string(),
+        schema_version: "3".to_string(),
         project,
         suite: Suite {
             test_count: None,
@@ -277,6 +328,7 @@ fn empty_inventory(project: Project) -> Inventory {
         test_functions: Vec::new(),
         sut_calls: SutCalls { by_name: Vec::new(), top_called: Vec::new() },
         top_suspicious: TopSuspicious { test_functions: Vec::new(), files: Vec::new() },
+        accepted: Accepted::none(false),
         tool: ToolInfo::without_runtime(),
     }
 }
@@ -293,6 +345,11 @@ pub const DEFAULT_TOP_SUSPICIOUS: usize = 20;
 /// single-file mode) or a project root directory (Phase 2 walker mode). The
 /// default `<project_root>/tests` is used for test discovery; see
 /// [`run_static_with_tests_dir`] to override.
+///
+/// Uses the default [`AcceptOptions`]: a `.pycoati-accept.toml` at the
+/// project root is discovered and applied, which filters
+/// `top_suspicious.test_functions`. Pass an explicit `AcceptOptions` to
+/// [`run_static_with_top_n`] to disable that.
 pub fn run_static(path: &Path) -> Result<Inventory> {
     run_static_with_tests_dir(path, None)
 }
@@ -301,8 +358,9 @@ pub fn run_static(path: &Path) -> Result<Inventory> {
 /// package override. When `Some(name)`, the override replaces the
 /// pyproject-detected package list for sut-call resolution.
 ///
-/// Uses the [`DEFAULT_TOP_SUSPICIOUS`] cap for the `top_suspicious` lists.
-/// Callers needing a custom cap use [`run_static_with_top_n`].
+/// Uses the [`DEFAULT_TOP_SUSPICIOUS`] cap for the `top_suspicious` lists,
+/// and the default [`AcceptOptions`] (project baseline discovered and
+/// applied). Callers needing either knob use [`run_static_with_top_n`].
 pub fn run_static_with_options(
     path: &Path,
     tests_dir_override: Option<&Path>,
@@ -313,6 +371,7 @@ pub fn run_static_with_options(
         tests_dir_override,
         project_package_override,
         DEFAULT_TOP_SUSPICIOUS,
+        &AcceptOptions::default(),
     )
 }
 
@@ -331,6 +390,7 @@ pub fn run_static_with_top_n(
     tests_dir_override: Option<&Path>,
     project_package_override: Option<&str>,
     top_n: usize,
+    accept_opts: &AcceptOptions,
 ) -> Result<Inventory> {
     if !path.exists() {
         anyhow::bail!("path does not exist: {}", path.display());
@@ -344,7 +404,14 @@ pub fn run_static_with_top_n(
                 path.display()
             );
         }
-        run_static_dir_with_options(path, tests_dir_override, project_package_override, top_n, true)
+        run_static_dir_with_options(
+            path,
+            tests_dir_override,
+            project_package_override,
+            top_n,
+            true,
+            accept_opts,
+        )
     } else {
         if tests_dir_override.is_some() {
             anyhow::bail!(
@@ -352,7 +419,7 @@ pub fn run_static_with_top_n(
                 path.display()
             );
         }
-        run_static_file_with_options(path, project_package_override, top_n)
+        run_static_file_with_options(path, project_package_override, top_n, accept_opts)
     }
 }
 
@@ -374,6 +441,7 @@ pub fn run_audit_static(
     tests_dir_override: Option<&Path>,
     project_package_override: Option<&str>,
     top_n: usize,
+    accept_opts: &AcceptOptions,
 ) -> Result<AuditResult> {
     if !path.exists() {
         anyhow::bail!("path does not exist: {}", path.display());
@@ -387,7 +455,7 @@ pub fn run_audit_static(
                 path.display()
             );
         }
-        let inv = run_static_file_with_options(path, project_package_override, top_n)?;
+        let inv = run_static_file_with_options(path, project_package_override, top_n, accept_opts)?;
         return Ok(AuditResult::Single(inv));
     }
 
@@ -404,7 +472,8 @@ pub fn run_audit_static(
                 path.display()
             );
         }
-        let wsi = run_workspace_static(&ws, top_n)?;
+        reject_workspace_accept_file(path, accept_opts)?;
+        let wsi = run_workspace_static(&ws, top_n, accept_opts)?;
         return Ok(AuditResult::Workspace(wsi));
     }
 
@@ -414,23 +483,43 @@ pub fn run_audit_static(
         project_package_override,
         top_n,
         true,
+        accept_opts,
     )?;
     Ok(AuditResult::Single(inv))
+}
+
+/// A single `--accept-file` cannot address a workspace: entries are keyed by
+/// a nodeid that is relative to one member's root, so the same path would
+/// mean a different test in every member. Each member discovers its own
+/// baseline instead.
+fn reject_workspace_accept_file(path: &Path, accept_opts: &AcceptOptions) -> Result<()> {
+    if accept_opts.file.is_some() {
+        anyhow::bail!(
+            "--accept-file is incompatible with a uv-workspace root ({}); put a {} in each member instead",
+            path.display(),
+            accept::DEFAULT_ACCEPT_FILENAME
+        );
+    }
+    Ok(())
 }
 
 /// Static-mode pass for every workspace member. Per-member, runs the
 /// existing single-project pipeline with `strict_missing_tests = false`
 /// so a member without `tests/` skips with a `warn!` rather than aborting
 /// the whole workspace audit.
-fn run_workspace_static(ws: &workspace::Workspace, top_n: usize) -> Result<WorkspaceInventory> {
+fn run_workspace_static(
+    ws: &workspace::Workspace,
+    top_n: usize,
+    accept_opts: &AcceptOptions,
+) -> Result<WorkspaceInventory> {
     let mut members: Vec<Inventory> = Vec::with_capacity(ws.members.len());
     for member in &ws.members {
-        let inv = run_static_dir_with_options(member, None, None, top_n, false)
+        let inv = run_static_dir_with_options(member, None, None, top_n, false, accept_opts)
             .with_context(|| format!("auditing workspace member {}", member.display()))?;
         members.push(inv);
     }
     Ok(WorkspaceInventory {
-        schema_version: "2".to_string(),
+        schema_version: "3".to_string(),
         workspace_root: ws.root.clone(),
         members,
         tool: ToolInfo::without_runtime(),
@@ -461,6 +550,7 @@ fn run_workspace_static(ws: &workspace::Workspace, top_n: usize) -> Result<Works
 /// `project_package_override` wins over the discovered `Inventory.project.name`
 /// when picking the `--cov=<pkg>` argument. This matches the CLI's
 /// `--project-package` flag.
+#[allow(clippy::too_many_arguments)]
 pub fn run_with_pytest(
     project: &Path,
     tests_dir_override: Option<&Path>,
@@ -469,11 +559,17 @@ pub fn run_with_pytest(
     no_coverage: bool,
     project_package_override: Option<&str>,
     top_n: usize,
+    accept_opts: &AcceptOptions,
 ) -> Result<Inventory> {
     // `run_static_with_top_n` already bails on workspace roots; this
     // propagates that contract to the pytest path.
-    let mut inv =
-        run_static_with_top_n(project, tests_dir_override, project_package_override, top_n)?;
+    let mut inv = run_static_with_top_n(
+        project,
+        tests_dir_override,
+        project_package_override,
+        top_n,
+        accept_opts,
+    )?;
 
     // Single-file input has no project-level pytest semantics; leave
     // `suite` and `tool` at their static defaults.
@@ -617,6 +713,7 @@ pub fn run_audit_with_pytest(
     project_package_override: Option<&str>,
     top_n: usize,
     member_cwd: MemberCwd,
+    accept_opts: &AcceptOptions,
 ) -> Result<AuditResult> {
     if !path.exists() {
         anyhow::bail!("path does not exist: {}", path.display());
@@ -633,6 +730,7 @@ pub fn run_audit_with_pytest(
             no_coverage,
             project_package_override,
             top_n,
+            accept_opts,
         )?;
         return Ok(AuditResult::Single(inv));
     }
@@ -650,6 +748,7 @@ pub fn run_audit_with_pytest(
                 path.display()
             );
         }
+        reject_workspace_accept_file(path, accept_opts)?;
         let wsi = run_workspace_with_pytest(
             &ws,
             python_cmd,
@@ -657,6 +756,7 @@ pub fn run_audit_with_pytest(
             no_coverage,
             top_n,
             member_cwd,
+            accept_opts,
         )?;
         return Ok(AuditResult::Workspace(wsi));
     }
@@ -669,12 +769,14 @@ pub fn run_audit_with_pytest(
         no_coverage,
         project_package_override,
         top_n,
+        accept_opts,
     )?;
     Ok(AuditResult::Single(inv))
 }
 
 /// Run static + pytest for each workspace member, sharing one detected
 /// python across the lot.
+#[allow(clippy::too_many_arguments)]
 fn run_workspace_with_pytest(
     ws: &workspace::Workspace,
     python_cmd: Option<&[String]>,
@@ -682,6 +784,7 @@ fn run_workspace_with_pytest(
     no_coverage: bool,
     top_n: usize,
     member_cwd: MemberCwd,
+    accept_opts: &AcceptOptions,
 ) -> Result<WorkspaceInventory> {
     // Detect python ONCE at the workspace root. The whole point of
     // workspace mode is that all members share the same interpreter.
@@ -698,7 +801,7 @@ fn run_workspace_with_pytest(
     let mut any_ran_pytest = false;
     let mut any_ran_coverage = false;
     for member in &ws.members {
-        let mut inv = run_static_dir_with_options(member, None, None, top_n, false)
+        let mut inv = run_static_dir_with_options(member, None, None, top_n, false, accept_opts)
             .with_context(|| format!("auditing workspace member {}", member.display()))?;
 
         // Workspace member without a `tests/` dir was skipped with a warn
@@ -743,7 +846,7 @@ fn run_workspace_with_pytest(
     }
 
     Ok(WorkspaceInventory {
-        schema_version: "2".to_string(),
+        schema_version: "3".to_string(),
         workspace_root: ws.root.clone(),
         members,
         tool: ToolInfo::with_runtime(any_ran_pytest, any_ran_coverage),
@@ -777,6 +880,8 @@ fn split_python_cmd(python_cmd: &[String]) -> (String, Vec<String>) {
 /// Same as [`run_static`] but lets the caller override the tests directory.
 /// Only meaningful in directory mode; passing a tests-dir override alongside
 /// a single-file input is an error.
+///
+/// Uses the default [`AcceptOptions`], like [`run_static`].
 pub fn run_static_with_tests_dir(
     path: &Path,
     tests_dir_override: Option<&Path>,
@@ -791,6 +896,7 @@ fn run_static_file_with_options(
     path: &Path,
     project_package_override: Option<&str>,
     top_n: usize,
+    accept_opts: &AcceptOptions,
 ) -> Result<Inventory> {
     let project = project_from_file(path);
     let source = std::fs::read_to_string(path)
@@ -826,7 +932,11 @@ fn run_static_file_with_options(
         inv.files.push(file_record);
     }
     inv.test_functions = test_functions;
-    score_and_rank(&mut inv, top_n);
+    // Single-file mode has no project root of its own, so the baseline is
+    // the nearest one at or above the file's directory — see
+    // [`AcceptOptions::resolve_from_file`].
+    let baseline = accept_opts.resolve_from_file(&inv.project.path)?;
+    score_and_rank(&mut inv, top_n, baseline, accept_opts.include_accepted);
     Ok(inv)
 }
 
@@ -847,9 +957,14 @@ fn run_static_dir_with_options(
     project_package_override: Option<&str>,
     top_n: usize,
     strict_missing_tests: bool,
+    accept_opts: &AcceptOptions,
 ) -> Result<Inventory> {
     let project = project_from_root(project_root);
     let mut inv = empty_inventory(project);
+
+    // Resolved before discovery so a malformed or missing `--accept-file`
+    // fails fast, rather than after a full parse pass.
+    let baseline = accept_opts.resolve(&inv.project.path)?;
 
     let tests_dir =
         tests_dir_override.map_or_else(|| inv.project.path.join("tests"), Path::to_path_buf);
@@ -865,6 +980,8 @@ fn run_static_dir_with_options(
             tests_dir = %tests_dir.display(),
             "tests directory not found; emitting empty inventory"
         );
+        inv.accepted =
+            accept::apply(&mut inv.test_functions, baseline, accept_opts.include_accepted);
         return Ok(inv);
     }
 
@@ -932,14 +1049,25 @@ fn run_static_dir_with_options(
         file.smell_hits.extend(smells::derive_file_smells(file, &tests_in_file, &config));
     }
 
-    score_and_rank(&mut inv, top_n);
+    score_and_rank(&mut inv, top_n, baseline, accept_opts.include_accepted);
     Ok(inv)
 }
 
-/// Apply the suspicion-score pipeline: per-test score, per-file score, then
-/// the top-N rankings. Shared between single-file and directory mode so both
-/// paths produce a fully-populated `top_suspicious` block.
-fn score_and_rank(inv: &mut Inventory, top_n: usize) {
+/// Apply the suspicion-score pipeline: per-test score, per-file score, the
+/// accepted-findings pass, then the top-N rankings. Shared between
+/// single-file and directory mode so both paths produce a fully-populated
+/// `top_suspicious` block.
+///
+/// Acceptance runs *after* scoring and *before* ranking, which is the whole
+/// contract in one line: every score and every smell hit is computed from
+/// the raw evidence, and the baseline only decides what the shortlist
+/// promotes.
+fn score_and_rank(
+    inv: &mut Inventory,
+    top_n: usize,
+    baseline: Option<accept::Baseline>,
+    include_accepted: bool,
+) {
     let weights = suspicion::DEFAULT;
     // Per-test scores: write back into the record so the JSON `suspicion_score`
     // field reflects the same number we sort on.
@@ -958,7 +1086,15 @@ fn score_and_rank(inv: &mut Inventory, top_n: usize) {
             .collect();
         file_scores.push(suspicion::score_file(file, &scores));
     }
-    inv.top_suspicious.test_functions = suspicion::top_n_tests(&inv.test_functions, top_n);
+    inv.accepted = accept::apply(&mut inv.test_functions, baseline, include_accepted);
+
+    // A test whose every active signal was accepted drops off the shortlist;
+    // it keeps its record, its score, and its hits in `test_functions`.
+    // `--include-accepted` turns the filter off for a full audit report.
+    inv.top_suspicious.test_functions = suspicion::top_n_tests(
+        inv.test_functions.iter().filter(|t| include_accepted || !t.accepted_in_full()),
+        top_n,
+    );
     inv.top_suspicious.files = suspicion::top_n_files(&inv.files, &file_scores, top_n);
 }
 

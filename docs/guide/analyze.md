@@ -20,15 +20,12 @@ the test wins — drop the candidate.
 # Part 1 — field reference
 
 Every field is always present. `null` never means zero; it means not measured.
-`"2"` is additive: a counter this page documents may be absent from a payload
-written by an older binary, and an absent counter means `0`. Check
-`tool.version` when a field you expect is missing.
 The payload has two shapes, discriminated by one key.
 
 ## Top level, single project
 
 - `schema_version` — schema contract version, as a string. This page describes
-  `"2"`. Any other value means this guide and the inventory disagree; stop and
+  `"3"`. Any other value means this guide and the inventory disagree; stop and
   re-run `pycoati guide analyze` from the binary that produced the file.
 - `project` — object. Identity of the audited project.
 - `suite` — object. Suite-level runtime metrics from pytest.
@@ -37,12 +34,14 @@ The payload has two shapes, discriminated by one key.
 - `test_functions` — array of test records, one per collected test function.
 - `sut_calls` — object. Aggregated project-internal call frequency.
 - `top_suspicious` — object. Pre-ranked shortlists.
+- `accepted` — object. Reviewed suppressions in effect for this run.
 - `tool` — object. Producer metadata.
 
 ## Top level, workspace
 
 A workspace payload carries `schema_version`, `workspace_root`, `members`, and
-`tool`, and nothing else.
+`tool`, and nothing else. Each member carries its own `accepted` block —
+acceptance is per member, because a nodeid is only unique within one.
 
 - `workspace_root` — path of the workspace root. **The presence of this key is
   the only discriminator between the two shapes.** Check for it first.
@@ -182,6 +181,18 @@ analysis reads from here.
 - `suspicion_score` — float in `0.0`–`1.0`. Composite; see the formula below.
   Higher is more suspicious. This is a ranking device, not a measurement — the
   absolute value has no meaning beyond ordering.
+- `fingerprint` — 16 hex digits identifying this test's current source,
+  decorators included. Trailing whitespace and blank lines are ignored;
+  everything else, comments included, is part of it. Its only use is the
+  `fingerprint` key of an accept entry: recording it there makes the
+  acceptance lapse when the test is edited. Not a checksum of anything else,
+  and not comparable across tests. `null` only when the source could not be
+  read as UTF-8 — an entry pinned against such a test reports
+  `content_changed` rather than silently matching.
+- `accepted_signals` — sorted signal names a baseline entry accepted for this
+  test, or `[]`. A signal listed here was reviewed and signed off; **it is
+  still computed, still scored, and still present in `smell_hits`**. Read this
+  alongside `accepted.findings`, which carries the reason for each.
 
 ## `smell_hits[]`
 
@@ -218,9 +229,68 @@ Convenience shortlists, capped by `--top-suspicious` (default 20). They contain
 no information that is not already in `test_functions` and `files`.
 
 - `test_functions` — nodeids of the highest-scoring tests, descending by
-  `suspicion_score`, ties broken by nodeid ascending.
+  `suspicion_score`, ties broken by nodeid ascending. **A test whose every
+  active signal was accepted is omitted** unless the scan ran with
+  `--include-accepted`; `accepted.included_in_shortlist` tells you which. The
+  test's own record in `test_functions[]` is there either way.
 - `files` — paths of the highest-scoring files, descending by file score, ties
-  broken by path ascending.
+  broken by path ascending. Acceptance is per test and never filters this
+  list: a file whose tests were all accepted keeps its score and its place.
+
+## `accepted`
+
+Reviewed per-test suppressions, read from the baseline file described on the
+setup page. This block is the *only* place a suppression is visible — nothing
+is removed from `files`, `test_functions`, `smell_hits`, or any count.
+
+- `path` — the baseline file that was read, or `null` when none was found or
+  the scan ran with `--no-accept`. `null` with a non-empty `findings` array is
+  impossible.
+- `included_in_shortlist` — `true` when the scan ran with
+  `--include-accepted`, meaning accepted findings were **not** held back from
+  `top_suspicious.test_functions`. Report this: it changes what the shortlist
+  means.
+- `findings` — array of acceptances that matched a live finding.
+- `stale` — array of acceptances that matched nothing. Each one is a finding
+  that is actionable again, or an entry to delete. Both are reported to stderr
+  as warnings during the scan.
+
+### `accepted.findings[]`
+
+- `test` — nodeid of the accepted test. Joins to `test_functions[].nodeid`.
+- `signal` — the one signal accepted for that test, from the closed set:
+  `mock_only_assertions`, `mock_overuse`, `zero_asserts`, `high_setup_ratio`.
+  The first two mirror `smell_hits[].category`; the last two are score-bearing
+  signals that produce no smell hit. `zero_asserts` fires on the same
+  condition as the score's term — `assertion_count == 0` **and**
+  `external_verification_count == 0` — so a test that checks a child process
+  never offers it, and an entry accepting it on such a test goes `stale`.
+- `reason` — the reviewer's recorded justification. Always non-empty; the file
+  will not parse without it. **Quote it in your report** — it is the whole
+  content of the review decision, and re-deriving it is what this block
+  exists to prevent.
+- `reviewed` — free-form provenance note (a date, a name, a PR link), or
+  `null`. Never interpreted.
+- `fingerprint` — the `test_functions[].fingerprint` recorded at review time,
+  or `null` when the entry did not pin one. When present it matched, or this
+  entry would be under `stale` instead.
+
+### `accepted.stale[]`
+
+- `test`, `signal`, `reason` — copied verbatim from the entry that did not
+  apply.
+- `status` — why, from a closed set of three:
+  - `unknown_test` — no test in this inventory carries that nodeid. The test
+    was renamed, moved, or deleted; the entry is dead weight.
+  - `signal_not_active` — the test is there and the signal no longer fires.
+    The underlying problem was fixed, or the heuristic changed.
+  - `content_changed` — the test's `fingerprint` differs from the one the
+    entry pinned, or the test has no fingerprint at all. The acceptance is
+    suspended until a human looks again. This is the only status that can
+    hide a real, currently-firing finding, so treat it as an unreviewed
+    finding, not as bookkeeping.
+- `detail` — human-readable explanation, carrying the current fingerprint for
+  the `content_changed` case. Display it; do not parse it.
 
 ## `tool`
 
@@ -284,6 +354,37 @@ about the test being empty — read the field, not just the score.
   `mocks / max(assertion_count, 1) > 2.0`. Both comparisons strict. `mocks` is
   `patch_decorator_count + stubs_count` at test scope, and
   `mock_construction_count + patch_decorator_count + stubs_count` at file scope.
+
+---
+
+## Accepted findings and what they mean for your report
+
+An acceptance is a **review decision recorded once**, not a rule change and
+not a threshold. Read it as: a human looked at this exact test, agreed the
+signal fires, and wrote down why it is correct anyway.
+
+They live in `.pycoati-accept.toml` at the project root, one `[[accept]]`
+block per (test, signal) pair, each with a required `reason`. `accepted.path`
+names the file this run actually read. Run `pycoati guide setup` for the full
+format — you do not need it to read an inventory, only to propose an entry.
+
+Three consequences for how you read an inventory:
+
+- **Do not re-litigate an accepted finding.** If `accepted.findings` covers a
+  test and signal, that judgement has been made. Quote the reason and move on.
+- **An acceptance covers one signal, never a test.** A test with
+  `accepted_signals: ["zero_asserts"]` that also carries a `mock_overuse` hit
+  is a live candidate for that hit, and it will be on the shortlist. Work it.
+- **Every `stale` entry is work.** A `content_changed` entry in particular
+  means the accepted test was edited since review and the finding is live
+  again — report it as a candidate, and say the acceptance lapsed.
+
+If you cannot confirm a finding by reading the test, and the reason it looks
+suspicious is genuinely project context the AST cannot see, the right output
+is a proposed accept entry in your report — test nodeid, signal, reason,
+fingerprint — for a human to add to `.pycoati-accept.toml`. Not a threshold
+change, and not a deleted test. The remediate page gives the exact block to
+put in the report, and the rule that you propose it rather than write it.
 
 ---
 

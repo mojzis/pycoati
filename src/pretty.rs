@@ -31,6 +31,16 @@
 //! plus one external-verification call site (a checked child process — see
 //! [`crate::verification`]). A plain number means no such call site.
 //!
+//! Accepted findings (held back from the shortlist)   # omitted when empty
+//! -----------------------------------------------
+//!   <nodeid> — <signal>
+//!       <reason>
+//!
+//! Stale acceptances (actionable again)               # omitted when empty
+//! -----------------------------------
+//!   <nodeid> — <signal> [<status>]
+//!       <detail>
+//!
 //! Top suspicious files
 //! --------------------
 //!   score  path                  tests  asserts  mocks  stubs  smells
@@ -88,6 +98,7 @@ pub fn render(inv: &Inventory, top_n: usize) -> String {
     out.push('\n');
     render_top_tests(&mut out, inv, top_n);
     out.push('\n');
+    render_accepted(&mut out, inv);
     render_top_files(&mut out, inv, top_n);
     out.push('\n');
     render_sut_calls(&mut out, inv);
@@ -259,6 +270,42 @@ fn join_smell_categories(hits: &[crate::SmellHit]) -> String {
     cats.join(", ")
 }
 
+/// Render the accepted-findings sections, or nothing at all.
+///
+/// Skipped entirely when no baseline matched anything — a project without
+/// acceptances should not grow two empty headers. Reasons are printed in
+/// full on their own line: the reason is the whole point of the entry, and
+/// truncating it to fit a column would hide the judgement being recorded.
+fn render_accepted(out: &mut String, inv: &Inventory) {
+    let accepted = &inv.accepted;
+    if accepted.findings.is_empty() && accepted.stale.is_empty() {
+        return;
+    }
+
+    if !accepted.findings.is_empty() {
+        let scope = if accepted.included_in_shortlist {
+            "Accepted findings (kept in the shortlist)"
+        } else {
+            "Accepted findings (held back from the shortlist)"
+        };
+        render_section_header(out, scope);
+        for f in &accepted.findings {
+            let _ = writeln!(out, "  {} — {}", f.test, f.signal);
+            let _ = writeln!(out, "      {}", f.reason);
+        }
+        out.push('\n');
+    }
+
+    if !accepted.stale.is_empty() {
+        render_section_header(out, "Stale acceptances (actionable again)");
+        for s in &accepted.stale {
+            let _ = writeln!(out, "  {} — {} [{}]", s.test, s.signal, s.status);
+            let _ = writeln!(out, "      {}", s.detail);
+        }
+        out.push('\n');
+    }
+}
+
 struct FileRow {
     score: String,
     path: String,
@@ -421,7 +468,7 @@ mod tests {
 
     fn empty_inv() -> Inventory {
         Inventory {
-            schema_version: "2".to_string(),
+            schema_version: "3".to_string(),
             // Pick a path whose basename matches the project name so the
             // title-rendering helper produces the single-token form
             // `pycoati audit — demo`. Tests that exercise the
@@ -437,6 +484,7 @@ mod tests {
             test_functions: Vec::new(),
             sut_calls: SutCalls { by_name: Vec::new(), top_called: Vec::new() },
             top_suspicious: TopSuspicious { test_functions: Vec::new(), files: Vec::new() },
+            accepted: crate::Accepted::none(false),
             tool: ToolInfo::with_runtime(false, false),
         }
     }
@@ -455,7 +503,60 @@ mod tests {
             called_names: Vec::new(),
             smell_hits: Vec::new(),
             suspicion_score: score,
+            fingerprint: None,
+            accepted_signals: Vec::new(),
         }
+    }
+
+    fn accepted_with(included: bool) -> crate::Accepted {
+        crate::Accepted {
+            path: Some(PathBuf::from(".pycoati-accept.toml")),
+            included_in_shortlist: included,
+            findings: vec![crate::AcceptedFinding {
+                test: "tests/x.py::test_smoke".to_string(),
+                signal: "zero_asserts".to_string(),
+                reason: "assertions run in a child interpreter".to_string(),
+                reviewed: None,
+                fingerprint: None,
+            }],
+            stale: vec![crate::StaleAcceptance {
+                test: "tests/x.py::test_gone".to_string(),
+                signal: "mock_overuse".to_string(),
+                reason: "boundary stubs only".to_string(),
+                status: "unknown_test".to_string(),
+                detail: "no test function with this nodeid in the current inventory".to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn accepted_sections_name_the_finding_the_signal_and_the_reason() {
+        let mut inv = empty_inv();
+        inv.accepted = accepted_with(false);
+        let out = render(&inv, 20);
+
+        assert!(out.contains("Accepted findings (held back from the shortlist)"), "{out}");
+        assert!(out.contains("tests/x.py::test_smoke — zero_asserts"), "{out}");
+        assert!(out.contains("      assertions run in a child interpreter"), "{out}");
+        assert!(out.contains("Stale acceptances (actionable again)"), "{out}");
+        assert!(out.contains("tests/x.py::test_gone — mock_overuse [unknown_test]"), "{out}");
+    }
+
+    #[test]
+    fn accepted_header_says_so_when_the_shortlist_was_not_filtered() {
+        let mut inv = empty_inv();
+        inv.accepted = accepted_with(true);
+        let out = render(&inv, 20);
+
+        assert!(out.contains("Accepted findings (kept in the shortlist)"), "{out}");
+        assert!(!out.contains("held back"), "{out}");
+    }
+
+    #[test]
+    fn accepted_sections_are_absent_when_nothing_was_accepted() {
+        let out = render(&empty_inv(), 20);
+        assert!(!out.contains("Accepted findings"), "{out}");
+        assert!(!out.contains("Stale acceptances"), "{out}");
     }
 
     #[test]
@@ -731,7 +832,7 @@ mod tests {
         b.project = Project { path: PathBuf::from("/ws/pkg_b"), name: "pkg_b".to_string() };
 
         let ws = WorkspaceInventory {
-            schema_version: "2".to_string(),
+            schema_version: "3".to_string(),
             workspace_root: PathBuf::from("/ws"),
             members: vec![a, b],
             tool: ToolInfo::with_runtime(false, false),

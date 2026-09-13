@@ -1,0 +1,27 @@
+# Reviewed exceptions for this suite. Committed alongside the tests, the way
+# a real project keeps them: each block records one human's judgement about
+# one test and one signal, and the reason is the whole point of the entry.
+schema_version = "1"
+
+# Both signals reviewed together: an assertionless test is also a tall test,
+# so `high_setup_ratio` fires for the same underlying reason as
+# `zero_asserts`. The fingerprint pins the review to this exact body —
+# editing the test lapses the acceptance until someone looks again.
+[[accept]]
+test = "tests/test_reviewed.py::test_cli_entry_point_installs"
+signals = ["zero_asserts", "high_setup_ratio"]
+reason = "assertions run in a child interpreter; the parent propagates failure via subprocess.run(check=True)"
+reviewed = "2026-09-12 / packaging review"
+fingerprint = "f4e02e3172e2c958"
+
+# Single signal, and deliberately unpinned: this body is one line and the
+# contract is "it does not raise", which stays true through a rename.
+[[accept]]
+test = "tests/test_reviewed.py::test_import_does_not_raise"
+signal = "zero_asserts"
+reason = "smoke contract: importing and calling must not raise"
+reviewed = "2026-09-12"
+
+# Nothing here accepts tests/test_reviewed.py::test_retry_reports_through_the_mock.
+# Its mock_only_assertions hit has never been reviewed, so it stays on the
+# shortlist — that is the point of scoping acceptance to a named signal.

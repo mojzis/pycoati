@@ -8,6 +8,9 @@
 //! probe fails (no pytest available), the test prints a `SKIPPED:` line on
 //! stderr and returns without asserting.
 //!
+//! Fixture staging and the pytest probe live in `tests/common/mod.rs`,
+//! shared with `accept.rs`.
+//!
 //! The failure-path test (`--python false`) is the regression guard against
 //! subprocess panics corrupting the JSON inventory: even when the pytest
 //! subprocess fails entirely, pycoati must still exit 0 with a valid JSON
@@ -21,85 +24,11 @@ use std::process::Command as StdCommand;
 use assert_cmd::Command;
 use serde_json::Value;
 
+mod common;
+use common::{fixture_path, integration_python, pytest_available, stage_fixture};
+
 fn fixture_root() -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("tests/fixtures/project");
-    p
-}
-
-fn hyphen_fixture_root() -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("tests/fixtures/hyphen_project");
-    p
-}
-
-/// Recursively copy a fixture tree into `dst`, skipping the build artifacts
-/// pytest/coverage.py leave behind. We use this to give each integration
-/// test that targets `hyphen_project` its own writable copy: `pytest-cov`
-/// writes `.coverage` (and `.pytest_cache/`) to the project root, and two
-/// tests pointed at the same directory race on those files in parallel
-/// `cargo test` runs — see the test docstrings below for the failure mode
-/// (the override test would observe a non-null coverage value leaked from
-/// the default test). Tempdir copies eliminate the race and also keep the
-/// source tree clean.
-fn copy_fixture_tree(src: &Path, dst: &Path) {
-    for entry in std::fs::read_dir(src).expect("read fixture dir") {
-        let entry = entry.expect("dir entry");
-        let name = entry.file_name();
-        // Skip artifacts a previous run may have left in the source tree.
-        let name_str = name.to_string_lossy();
-        if matches!(name_str.as_ref(), ".coverage" | ".pytest_cache" | "__pycache__" | ".pycoati") {
-            continue;
-        }
-        let src_path = entry.path();
-        let dst_path = dst.join(&name);
-        let ft = entry.file_type().expect("file type");
-        if ft.is_dir() {
-            std::fs::create_dir_all(&dst_path).expect("create dir in tempdir");
-            copy_fixture_tree(&src_path, &dst_path);
-        } else if ft.is_file() {
-            std::fs::copy(&src_path, &dst_path).expect("copy fixture file");
-        }
-        // Symlinks / others: fixture tree has none today; skip if encountered.
-    }
-}
-
-/// Stage the hyphenated-distribution fixture in a fresh tempdir and return
-/// the (`TempDir` guard, project root) pair. Holding the guard alive for the
-/// duration of the test keeps the tempdir on disk; dropping it removes the
-/// copy plus any `.coverage` / `.pytest_cache` pytest-cov writes there.
-fn staged_hyphen_fixture() -> (tempfile::TempDir, PathBuf) {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let root = tmp.path().join("hyphen_project");
-    std::fs::create_dir_all(&root).expect("create staged fixture root");
-    copy_fixture_tree(&hyphen_fixture_root(), &root);
-    (tmp, root)
-}
-
-/// Whitespace-split a command-line string into program + args.
-fn split_command(cmd: &str) -> Option<(String, Vec<String>)> {
-    let mut tokens = cmd.split_whitespace();
-    let prog = tokens.next()?.to_string();
-    let args: Vec<String> = tokens.map(str::to_string).collect();
-    Some((prog, args))
-}
-
-/// Probe for pytest + pytest-cov availability using the given python command.
-/// Returns true iff `python -c 'import pytest, pytest_cov'` exits 0.
-fn pytest_available(python_cmd: &str) -> bool {
-    let Some((prog, args)) = split_command(python_cmd) else {
-        return false;
-    };
-    let mut cmd = StdCommand::new(&prog);
-    cmd.args(&args).args(["-c", "import pytest, pytest_cov"]);
-    cmd.status().map(|s| s.success()).unwrap_or(false)
-}
-
-/// Resolve the Python command to use for the integration tests. Honour the
-/// `COATI_TEST_PYTHON` env var (e.g. `"uv run python"`) so CI can wire in a
-/// venv; otherwise default to plain `python`.
-fn integration_python() -> String {
-    std::env::var("COATI_TEST_PYTHON").unwrap_or_else(|_| "python".to_string())
+    fixture_path("tests/fixtures/project")
 }
 
 #[test]
@@ -215,7 +144,7 @@ fn no_python_flag_uses_auto_detect_and_emits_valid_inventory() {
 
     let files = v["files"].as_array().expect("files array");
     assert!(!files.is_empty(), "static inventory must populate the files array");
-    assert_eq!(v["schema_version"], Value::String("2".to_string()));
+    assert_eq!(v["schema_version"], Value::String("3".to_string()));
     // `tool.ran_pytest` is true *or* false depending on whether the
     // auto-detected interpreter can import pytest — either way the field
     // must exist as a bool, never null.
@@ -542,7 +471,7 @@ fn hyphenated_pyproject_name_produces_non_zero_coverage_via_default() {
     // they would race on those files and the override test could see
     // coverage data leaked from this one. Staging in a tempdir per test
     // eliminates the race and keeps the source tree clean.
-    let (_guard, fixture_root) = staged_hyphen_fixture();
+    let (_guard, fixture_root) = stage_fixture("hyphen_project");
 
     let assert = Command::cargo_bin("pycoati")
         .expect("binary built")
@@ -603,7 +532,7 @@ fn cli_project_package_override_with_hyphen_is_passed_verbatim() {
     // this avoids. With both tests sharing the source-tree fixture, the
     // override test below would intermittently observe coverage > 0
     // leaked from the default test's `.coverage` write.
-    let (_guard, fixture_root) = staged_hyphen_fixture();
+    let (_guard, fixture_root) = stage_fixture("hyphen_project");
 
     let assert = Command::cargo_bin("pycoati")
         .expect("binary built")

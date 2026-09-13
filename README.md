@@ -40,9 +40,43 @@ pycoati . --static-only
 Key flags: `--format <json|pretty>`, `--output <PATH>`, `--tests-dir <PATH>`,
 `--static-only`, `--no-coverage`, `--top-suspicious <N>`,
 `--project-package <NAME>`, `--python <CMD>`, `--pytest-args <STR>`,
-`--member-cwd <root|member>`. See `pycoati --help` for the full list.
+`--member-cwd <root|member>`, `--accept-file <PATH>`, `--no-accept`,
+`--include-accepted`. See `pycoati --help` for the full list.
 
 Weights behind `suspicion_score` are documented in [WEIGHTS.md](WEIGHTS.md).
+
+### Accepted findings
+
+An audit that runs on a schedule keeps re-surfacing the same legitimate tests.
+Record the review decision once, with a reason, in `.pycoati-accept.toml` at
+the project root (a single-file scan walks up from the file to find it):
+
+```toml
+schema_version = "1"
+
+[[accept]]
+test = "tests/test_packaging.py::test_wheel_installs"
+signals = ["zero_asserts", "high_setup_ratio"]
+reason = "assertions run in a child interpreter; the parent propagates failure via subprocess.run(check=True)"
+reviewed = "2026-09-12"
+fingerprint = "3f0a1c7d9b2e4a56"   # optional: lapses the entry if the test is edited
+```
+
+`reason` is required — an entry without one is a parse error. Acceptance is
+scoped to one test and one named signal (`mock_only_assertions`,
+`mock_overuse`, `zero_asserts`, `high_setup_ratio`); there is no wildcard, so
+a new finding on an accepted test still surfaces.
+
+The accepted test keeps running and keeps counting: pytest arguments are
+untouched, so `suite.test_count`, runtime and coverage are unchanged, and every
+count, smell hit and score stays in the inventory as measured. The only effect
+is that a test whose *every* active signal is accepted is held back from
+`top_suspicious.test_functions`. The decisions and their reasons are reported
+under `accepted.findings`, entries that no longer apply under `accepted.stale`,
+and `--include-accepted` puts everything back on the shortlist for a full
+report.
+
+Run `pycoati guide setup` for the full reference.
 
 ### `pycoati guide [PAGE]`
 

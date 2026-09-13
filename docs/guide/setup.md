@@ -30,13 +30,18 @@ smell as it is written, pycoati finds the ones already in the suite.
   fails with `pytest exit=4`, `line_coverage_pct` is `null`, and stderr says
   so; pass `--no-coverage` if coverage is not wanted.
 
-## There is no config file
+## Configuration
 
-pycoati reads no configuration of its own. It has no `coati.toml`, and it
-reads no `[tool.pycoati]` table. Every knob is a command-line flag, and the
-defaults below are the values compiled into the binary.
+**No knob is configurable.** pycoati has no `coati.toml`, reads no
+`[tool.pycoati]` table, and exposes no way to change a threshold, a weight, or
+a scoring rule. Every switch is a command-line flag, and the defaults below
+are the values compiled into the binary.
 
-It does read three tables that other tools own, and only these:
+The one file of its own that pycoati reads is `.pycoati-accept.toml`, the
+accepted-findings baseline. It changes no threshold and no score — it records
+reviewed per-test exceptions. See "Accepted findings" below.
+
+It also reads three tables that other tools own, and only these:
 
 - `[project].name` — seeds `project.name` and the coverage package.
 - `[tool.uv.workspace].members` — switches the scan into workspace mode.
@@ -104,6 +109,92 @@ pycoati . --format pretty
   pytest from the workspace root; `member` runs each from its own directory so
   member-local `conftest.py` applies. Default: `root`. Silently ignored outside
   workspace mode.
+- `--accept-file <PATH>` — accepted-findings baseline. Default for a project
+  scan: `<project>/.pycoati-accept.toml` when that file exists, otherwise
+  none. For a single-file scan: the nearest `.pycoati-accept.toml` at or above
+  the file's own directory. A path passed explicitly must exist, or the scan
+  fails. Rejected against a workspace root — each member reads its own.
+- `--no-accept` — ignore the baseline and report the raw shortlist. Nothing is
+  read, and `accepted.path` is `null`.
+- `--include-accepted` — keep accepted findings on
+  `top_suspicious.test_functions`. The full audit report rather than the
+  default actionable shortlist. The `accepted` block is emitted either way.
+
+## Accepted findings
+
+A periodic audit re-surfaces the same legitimate tests every time it runs. The
+baseline is where a reviewer records that judgement once, with a reason, so the
+next scan does not make them reconstruct it.
+
+Put `.pycoati-accept.toml` at the project root — a single-file scan looks
+there too, walking up from the file's own directory to the nearest one:
+
+```toml
+schema_version = "1"
+
+[[accept]]
+test = "tests/test_packaging.py::test_wheel_installs"
+signals = ["zero_asserts", "high_setup_ratio"]
+reason = "assertions run in a child interpreter; the parent propagates failure via subprocess.run(check=True)"
+reviewed = "2026-09-12"
+fingerprint = "3f0a1c7d9b2e4a56"
+```
+
+- `test` — required. The nodeid exactly as it appears in
+  `test_functions[].nodeid`. In a workspace, relative to the member.
+
+  **Copy it from the inventory, and scan the same way every time.** In
+  project mode the file prefix is relative to the project root, so
+  `pycoati .` and `pycoati /abs/path/to/project` produce the same nodeid. In
+  single-file mode the prefix is the path *exactly as typed*, so scanning the
+  same file by a different path produces a different nodeid and the entry
+  reports `unknown_test` instead of applying.
+- `signal` / `signals` — required, exactly one of the two. One signal name, or
+  a list of them. The closed set is `mock_only_assertions`, `mock_overuse`,
+  `zero_asserts`, `high_setup_ratio`. There is no wildcard, on purpose:
+  accepting this test's current finding must not accept a future one.
+- `reason` — **required and non-empty.** A file with an entry that omits it
+  does not parse. The reason is the point of the entry.
+- `reviewed` — optional, free-form (a date, a name, a PR link). Never
+  interpreted.
+- `fingerprint` — optional. Copy `test_functions[].fingerprint` from the
+  inventory. When set, editing the test lapses the acceptance until someone
+  reviews it again. When unset, the acceptance survives edits.
+
+`zero_asserts` means the test verifies nothing at all: no `assert`-shaped
+construct **and** no `external_verification_count`. A test that checks a child
+process's exit status never trips it, so it needs no entry.
+
+An assertionless test usually trips `high_setup_ratio` too, because the ratio
+degrades to the height of the whole body. Accept both signals in one entry if
+that is the reviewed judgement — accepting only `zero_asserts` deliberately
+leaves the other one visible.
+
+### What acceptance does, and does not do
+
+- The test is still discovered, still parsed, still counted, and still run by
+  pytest. `suite.test_count`, `suite.runtime_seconds`, and
+  `suite.line_coverage_pct` are identical with and without a baseline. This is
+  not pytest deselection.
+- Every count, every `smell_hits` entry, and every `suspicion_score` stays
+  exactly as measured. Nothing is subtracted.
+- The only effect is on `top_suspicious.test_functions`: a test whose **every**
+  active signal is accepted is held back from it. One unreviewed signal and the
+  test is back on the list.
+- The accepted findings and their reasons are reported under `accepted`, and
+  `--include-accepted` puts them back on the shortlist for a full report.
+
+### Stale entries
+
+Every scan re-checks each entry and reports the ones that no longer apply
+under `accepted.stale[]`, with a warning on stderr:
+
+- `unknown_test` — the nodeid is gone. Delete the entry.
+- `signal_not_active` — the signal stopped firing. Delete the entry.
+- `content_changed` — the test was edited since its recorded `fingerprint`.
+  The finding is live again until a reviewer updates the entry.
+
+A stale entry never suppresses anything.
 
 ## What gets scanned
 
@@ -138,7 +229,7 @@ and rankings are computed per member and are not comparable across members.
 `inventory.json` is usable when all of these hold:
 
 - It parses as JSON.
-- `schema_version` is `"2"`.
+- `schema_version` is `"3"`.
 - `test_functions` is non-empty. An empty array on a project with tests means
   discovery found nothing — check `--tests-dir` and the file naming convention
   above before continuing.

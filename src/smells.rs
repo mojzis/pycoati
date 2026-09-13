@@ -145,6 +145,8 @@ mod tests {
             called_names: Vec::new(),
             smell_hits: Vec::new(),
             suspicion_score: 0.0,
+            fingerprint: None,
+            accepted_signals: Vec::new(),
         }
     }
 

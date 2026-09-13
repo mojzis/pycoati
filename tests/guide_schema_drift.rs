@@ -19,15 +19,15 @@ use std::path::PathBuf;
 use serde_json::Value;
 
 use pycoati::{
-    FileRecord, Inventory, Project, SlowTest, SmellHit, Suite, SutCallEntry, SutCalls, TestRecord,
-    ToolInfo, TopSuspicious, WorkspaceInventory,
+    Accepted, AcceptedFinding, FileRecord, Inventory, Project, SlowTest, SmellHit, StaleAcceptance,
+    Suite, SutCallEntry, SutCalls, TestRecord, ToolInfo, TopSuspicious, WorkspaceInventory,
 };
 
 /// An inventory with every nested collection non-empty, so the key walk
 /// reaches every struct in the schema.
 fn populated_inventory() -> Inventory {
     Inventory {
-        schema_version: "2".to_string(),
+        schema_version: "3".to_string(),
         project: Project { path: PathBuf::from("."), name: "demo".to_string() },
         suite: Suite {
             test_count: Some(3),
@@ -61,6 +61,8 @@ fn populated_inventory() -> Inventory {
             called_names: vec!["demo.thing".to_string()],
             smell_hits: vec![smell_hit(Some("tests/test_x.py::test_a"))],
             suspicion_score: 0.5,
+            fingerprint: Some("0123456789abcdef".to_string()),
+            accepted_signals: vec!["zero_asserts".to_string()],
         }],
         sut_calls: SutCalls {
             by_name: vec![SutCallEntry {
@@ -74,13 +76,37 @@ fn populated_inventory() -> Inventory {
             test_functions: vec!["tests/test_x.py::test_a".to_string()],
             files: vec!["tests/test_x.py".to_string()],
         },
+        accepted: accepted_block(),
         tool: tool_info(),
+    }
+}
+
+/// Both arrays non-empty, so the key walk descends into `AcceptedFinding`
+/// and `StaleAcceptance` as well as the wrapper.
+fn accepted_block() -> Accepted {
+    Accepted {
+        path: Some(PathBuf::from(".pycoati-accept.toml")),
+        included_in_shortlist: false,
+        findings: vec![AcceptedFinding {
+            test: "tests/test_x.py::test_a".to_string(),
+            signal: "zero_asserts".to_string(),
+            reason: "assertions run in a child interpreter".to_string(),
+            reviewed: Some("2026-09-12".to_string()),
+            fingerprint: Some("0123456789abcdef".to_string()),
+        }],
+        stale: vec![StaleAcceptance {
+            test: "tests/test_x.py::test_gone".to_string(),
+            signal: "mock_overuse".to_string(),
+            reason: "boundary stubs".to_string(),
+            status: "unknown_test".to_string(),
+            detail: "no test function with this nodeid in the current inventory".to_string(),
+        }],
     }
 }
 
 fn populated_workspace() -> WorkspaceInventory {
     WorkspaceInventory {
-        schema_version: "2".to_string(),
+        schema_version: "3".to_string(),
         workspace_root: PathBuf::from("."),
         members: vec![populated_inventory()],
         tool: tool_info(),
@@ -183,12 +209,21 @@ fn the_walk_actually_reaches_nested_structs() {
         &serde_json::to_value(populated_inventory()).expect("serialize inventory"),
         &mut emitted,
     );
-    for nested in ["seconds", "evidence", "test_nodeids", "suspicion_score", "fixture_count"] {
+    for nested in [
+        "seconds",
+        "evidence",
+        "test_nodeids",
+        "suspicion_score",
+        "fixture_count",
+        "reason",
+        "status",
+        "included_in_shortlist",
+    ] {
         assert!(emitted.contains(nested), "key walk never reached nested field `{nested}`");
     }
     assert_eq!(
         emitted.len(),
-        39,
+        50,
         "single-project schema field count changed. If you added or removed an \
          inventory field, update this count AND the field's bullet in \
          docs/guide/analyze.md."

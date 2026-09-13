@@ -39,6 +39,9 @@
 //!   process's exit status, so that a failure outside this process still
 //!   fails the test. See [`crate::verification`] for the matched shapes and
 //!   for why the inference stops where it does.
+//! * `fingerprint` — [`crate::accept::fingerprint`] of the test's source
+//!   (decorators included), used to lapse an accepted finding when the test
+//!   it was recorded against changes.
 //! * `called_names` — raw, sorted, deduped dot-joined attribute chain at
 //!   the `function` child of every `call_expression` in the test body,
 //!   minus calls whose head chain starts with `self.`. Phase 2 resolves
@@ -62,6 +65,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use tree_sitter::{Node, Parser};
 
+use crate::accept::fingerprint;
 use crate::mock_api::{
     chain_constructs_a_mock, is_mock_api_attribute, is_mock_constructor, is_stub_call_head,
 };
@@ -423,6 +427,28 @@ fn build_record(
         None => format!("{}::{}", file_path.display(), name),
     };
 
+    // Fingerprint the decorated definition when there is one: a changed
+    // `@pytest.mark.parametrize` case list changes what the test does just as
+    // much as a changed body does, and an acceptance recorded against the old
+    // shape should lapse. `nodeid` is built above so the warn path can name
+    // the test.
+    let source_node = decorated.unwrap_or(func);
+    let fingerprint = match source_node.utf8_text(source) {
+        Ok(content) => Some(fingerprint(content)),
+        // Unreachable today — `source` came from `read_to_string`. Emitting
+        // `None` rather than hashing the empty string matters anyway: every
+        // affected test would otherwise share one fingerprint that a
+        // baseline could pin and that no edit would ever move.
+        Err(err) => {
+            tracing::warn!(
+                nodeid = %nodeid,
+                error = %err,
+                "test source is not valid UTF-8; emitting a null fingerprint"
+            );
+            None
+        }
+    };
+
     let record = TestRecord {
         nodeid,
         file: file_path.to_path_buf(),
@@ -436,6 +462,8 @@ fn build_record(
         called_names,
         smell_hits: Vec::new(),
         suspicion_score: 0.0,
+        fingerprint,
+        accepted_signals: Vec::new(),
     };
     (record, mock_construction_count)
 }
