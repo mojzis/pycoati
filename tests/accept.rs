@@ -889,7 +889,7 @@ fn accepted_tests_are_still_collected_run_and_covered() {
         "acceptance must not change how many tests pytest collects"
     );
     let raw_count = raw["suite"]["test_count"].as_u64().expect("test_count");
-    assert_eq!(raw_count, 4, "all four fixture tests must be collected");
+    assert_eq!(raw_count, 5, "all five fixture tests must be collected");
     assert!(raw["suite"]["runtime_seconds"].as_f64().expect("runtime") > 0.0);
     assert!(accepted["suite"]["runtime_seconds"].as_f64().expect("runtime") > 0.0);
 
