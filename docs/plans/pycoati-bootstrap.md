@@ -53,7 +53,7 @@ For a single Python project (one `pyproject.toml`, one test directory), produce 
 
 - No LLM calls.
 - No proposals, no diffs, no edits to test files.
-- No mutation testing. That is a Phase 2 sampling activity, driven by the LLM after reading `inventory.json`.
+- No mutation testing. That is a Phase 2 sampling activity, driven by the LLM after reading `inventory.json`. The remediate guide page (`docs/guide/remediate.md`, "Mutation check") now describes it.
 - **No structural *shape-similarity* detection** between test bodies — that's biston's job (LSH + anti-unification). However, **SUT call-site frequency** (how many tests invoke each function under test) **is** in scope: different algorithm, different signal, specifically valuable in the test domain. See "Call-site frequency" below.
 - No multi-project orchestration in v1. One project, one invocation. Monorepo dispatch is a thin shell layer on top, added later.
 - No coverage parsing beyond the top-level percentage. Per-line coverage attribution is out of scope for Phase 1.

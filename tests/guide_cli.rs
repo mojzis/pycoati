@@ -421,3 +421,61 @@ fn the_setup_page_documents_no_flag_the_cli_dropped() {
         "docs/guide/setup.md documents flags the CLI no longer accepts: {stale:?}"
     );
 }
+
+// --- mutation check ---------------------------------------------------------
+
+/// The body of the `## Mutation check` section on the remediate page.
+fn mutation_section() -> &'static str {
+    let text = remediate_page();
+    let start = text.find("## Mutation check").expect("remediate should have the section");
+    let end = text[start + 3..].find("\n## ").map_or(text.len(), |i| start + 3 + i);
+    &text[start..end]
+}
+
+/// Idea `mutation-check-guide`: the Phase 2 mutation sampling the bootstrap
+/// plan promised was never written down. It must sit between the approval gate
+/// and the ladder, because its output is evidence for the report.
+#[test]
+fn remediate_page_places_the_mutation_check_before_the_ladder() {
+    let text = remediate_page();
+    let gate = text.find("## The approval gate").expect("gate stays first");
+    let check = text.find("## Mutation check").expect("remediate should have the section");
+    let ladder = text.find("## The remedy ladder").expect("ladder stays");
+    assert!(gate < check && check < ladder, "order must be gate, mutation check, ladder");
+}
+
+#[test]
+fn mutation_check_is_targeted_at_called_names_and_one_test() {
+    let section = mutation_section();
+    assert!(section.contains("called_names"), "targets come from the inventory: {section}");
+    assert!(section.contains("mutmut"), "names the tool");
+    assert!(
+        section.contains("pytest_add_cli_args_test_selection"),
+        "restricts the run to the one test under suspicion"
+    );
+    assert!(section.contains("x_<function>__mutmut_*"), "gives the mutant-name pattern");
+    assert!(section.contains("git worktree"), "runs outside the working tree, so the gate holds");
+}
+
+#[test]
+fn mutation_check_record_is_a_separate_file_pycoati_never_reads() {
+    let section = mutation_section();
+    assert!(section.contains(".pycoati-mutation.toml"), "names the record file");
+    for field in ["test", "fingerprint", "targets", "source_files", "commit", "survived"] {
+        assert!(section.contains(&format!("\n{field} = ")), "record example lacks `{field}`");
+    }
+    assert!(section.contains("pycoati never reads"), "the tool stays stateless");
+    assert!(
+        !pycoati::guide::ANALYZE.contains(".pycoati-mutation.toml"),
+        "the inventory reference must not imply pycoati reads the record"
+    );
+}
+
+#[test]
+fn the_report_and_the_finish_both_carry_the_mutation_result() {
+    let text = remediate_page();
+    let gate_end = text.find("## Mutation check").expect("section");
+    assert!(text[..gate_end].contains("mutation check"), "the report lists the check result");
+    let finishing = text.find("## Finishing").expect("finishing stays");
+    assert!(text[finishing..].contains(".pycoati-mutation.toml"), "finish says what was recorded");
+}
