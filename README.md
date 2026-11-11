@@ -5,6 +5,8 @@ with tree-sitter, optionally runs `pytest` for collection, durations, and
 coverage, and emits a structured inventory: per-file and per-test counts,
 mock-API smells, and a per-test suspicion score.
 
+Part of **[aesop](https://mojzis.github.io/aesop/)**, a small menagerie of tools for agentic Python.
+
 ## Install
 
 ```bash
