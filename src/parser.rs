@@ -14,13 +14,15 @@
 //! Functions nested inside other functions are deliberately not collected —
 //! pytest does not collect them either.
 //!
-//! `assertion_count` reflects the number of effective assertions in each
-//! test function's body — `assert_statement` nodes plus `with pytest.raises(...)`
-//! / `with raises(...)` blocks. A raises block is a non-mock effective
-//! assertion: it contributes to the count and disqualifies
-//! [`only_asserts_on_mock`](crate::TestRecord). The `only_asserts_on_mock`
-//! predicate is `true` when every `assert_statement` targets a Mock-API
-//! attribute *and* the test contains no raises blocks.
+//! `assertion_count` reflects the number of effective assertion sites in
+//! each test function's body — `assert_statement` nodes, `with
+//! pytest.raises(...)` / `with raises(...)` blocks, `self.assertXxx(...)`
+//! calls inside a class, and bare Mock-API assertion statements
+//! (`m.assert_called_once_with(1)`). `mock_assertion_count` is the subset
+//! that inspects a Mock-API attribute (see [`reads_mock_api`] and
+//! [`unittest_assert_targets_mock_api`]); a raises block is never in it.
+//! [`only_asserts_on_mock`](crate::TestRecord) is `true` when the test has
+//! at least one assertion site and every one of them is in that subset.
 //!
 //! Per-test AST counts (Run 3 phase 1):
 //!
@@ -28,8 +30,9 @@
 //!   any `@<something>.patch` decorator on the test function (or on its
 //!   wrapping `decorated_definition`).
 //! * `setup_to_assertion_ratio` — `(first_assert_line - def_line) /
-//!   max(assertion_count, 1)` as `f64`, using tree-sitter `start_position()`
-//!   row deltas. When the body contains no `assert_statement`, the
+//!   assertion_sites` as `f64`, using tree-sitter `start_position()` row
+//!   deltas, where an assertion site is an `assert_statement`, a raises
+//!   block or a bare Mock-API assertion call. When the body has none, the
 //!   numerator becomes `last_body_line - def_line` and the denominator is
 //!   `1`, so zero-assert setup-heavy tests naturally rank high on the
 //!   suspicion-score axis — unless the body carries external verification,
@@ -67,7 +70,8 @@ use tree_sitter::{Node, Parser};
 
 use crate::accept::fingerprint;
 use crate::mock_api::{
-    chain_constructs_a_mock, is_mock_api_attribute, is_mock_constructor, is_stub_call_head,
+    chain_constructs_a_mock, is_mock_api_attribute, is_mock_assert_method,
+    is_mock_assertion_helper, is_mock_constructor, is_stub_call_head,
 };
 use crate::sut_calls::{canonicalize_called_name, dotted_head, is_at_or_under, ImportMap};
 use crate::verification::{
@@ -377,24 +381,35 @@ fn build_record(
     let mut calls: Vec<Node<'_>> = Vec::new();
     let mut raises_blocks: Vec<Node<'_>> = Vec::new();
     let mut unittest_asserts: Vec<Node<'_>> = Vec::new();
+    let mut bare_mock_asserts: Vec<Node<'_>> = Vec::new();
     if let Some(body_node) = body {
         collect_asserts(body_node, &mut asserts);
         collect_calls(body_node, &mut calls);
+        collect_bare_mock_asserts(&calls, source, &mut bare_mock_asserts);
         collect_raises_blocks(body_node, source, &mut raises_blocks);
         // Reuse the `calls` vector already walked above instead of rewalking
         // the body — keeps the parse pass single-walk per node kind.
         collect_unittest_asserts(&calls, class.prefix, source, &mut unittest_asserts);
     }
 
-    // `with pytest.raises(...)` blocks are non-mock effective assertions: they
-    // count toward `assertion_count` and disqualify `only_asserts_on_mock`.
-    // `self.assertXxx(...)` method calls inside a `unittest.TestCase` subclass
-    // are also non-mock effective assertions: each call site counts once.
-    let assertion_count = (asserts.len() + raises_blocks.len() + unittest_asserts.len()) as u64;
-    let only_asserts_on_mock = !asserts.is_empty()
-        && raises_blocks.is_empty()
-        && unittest_asserts.is_empty()
-        && asserts.iter().all(|a| assert_targets_mock_api(*a, source));
+    // Four kinds of assertion site, each counted once:
+    // * `assert` statements — mock-targeting when the asserted expression
+    //   reads a Mock-API attribute;
+    // * `with pytest.raises(...)` blocks — never mock-targeting;
+    // * `self.assertXxx(...)` calls inside a class — mock-targeting when every
+    //   non-literal argument reads a Mock-API attribute;
+    // * bare `m.assert_*(...)` statements — always mock-targeting.
+    let assertion_count =
+        (asserts.len() + raises_blocks.len() + unittest_asserts.len() + bare_mock_asserts.len())
+            as u64;
+    let mock_assertion_count =
+        (asserts.iter().filter(|a| assert_targets_mock_api(**a, source)).count()
+            + unittest_asserts
+                .iter()
+                .filter(|c| unittest_assert_targets_mock_api(**c, source, imports))
+                .count()
+            + bare_mock_asserts.len()) as u64;
+    let only_asserts_on_mock = assertion_count > 0 && mock_assertion_count == assertion_count;
 
     let mock_construction_count =
         calls.iter().filter(|c| call_head_is_mock_constructor(**c, source)).count() as u64;
@@ -419,8 +434,10 @@ fn build_record(
 
     let patch_decorator_count = decorated.map_or(0, |d| count_patch_decorators(d, source));
 
+    let assertion_sites: Vec<Node<'_>> =
+        asserts.iter().chain(&raises_blocks).chain(&bare_mock_asserts).copied().collect();
     let setup_to_assertion_ratio =
-        compute_setup_to_assertion_ratio(func, body, &asserts, &raises_blocks, &verification_sites);
+        compute_setup_to_assertion_ratio(func, body, &assertion_sites, &verification_sites);
 
     let nodeid = match class.prefix {
         Some(cls) => format!("{}::{}::{}", file_path.display(), cls, name),
@@ -455,6 +472,7 @@ fn build_record(
         line,
         assertion_count,
         only_asserts_on_mock,
+        mock_assertion_count,
         patch_decorator_count,
         stubs_count,
         setup_to_assertion_ratio,
@@ -469,9 +487,11 @@ fn build_record(
 }
 
 /// Compute `setup_to_assertion_ratio` per the locked Run 3 definition,
-/// extended to treat `with pytest.raises(...)` blocks as effective assertions.
+/// extended to treat `with pytest.raises(...)` blocks and bare Mock-API
+/// assertion calls as effective assertions.
 ///
-/// With at least one effective assertion (assert statement or raises block):
+/// With at least one effective assertion (assert statement, raises block or
+/// bare `m.assert_*(...)` call):
 ///   `(first_effective_row - def_row) / effective_count`
 ///
 /// With zero effective assertions but at least one external-verification
@@ -487,17 +507,14 @@ fn build_record(
 fn compute_setup_to_assertion_ratio(
     func: Node<'_>,
     body: Option<Node<'_>>,
-    asserts: &[Node<'_>],
-    raises_blocks: &[Node<'_>],
+    assertion_sites: &[Node<'_>],
     verification_sites: &[Node<'_>],
 ) -> f64 {
     let def_row = func.start_position().row;
-    let effective_count = asserts.len() + raises_blocks.len();
-    let first_row =
-        asserts.iter().chain(raises_blocks.iter()).map(|n| n.start_position().row).min();
+    let first_row = assertion_sites.iter().map(|n| n.start_position().row).min();
     if let Some(first) = first_row {
         let delta = first.saturating_sub(def_row) as f64;
-        let denom = effective_count.max(1) as f64;
+        let denom = assertion_sites.len().max(1) as f64;
         return delta / denom;
     }
     // No local assertion, but the body checks a child process: the body is
@@ -1338,6 +1355,38 @@ fn collect_asserts<'a>(node: Node<'a>, out: &mut Vec<Node<'a>>) {
     collect_descendants(node, "assert_statement", out);
 }
 
+/// Select the calls in `calls` that make up a whole expression statement
+/// and invoke a Mock-API assertion method on some receiver:
+/// `m.assert_called_once_with(1)`, `self.client.send.assert_called()`,
+/// `mocks["a"].assert_not_called()`.
+///
+/// These raise `AssertionError` themselves, so each is an assertion site —
+/// and always a mock-targeting one. A receiver of bare `self` is rejected:
+/// `self.assert_called_with(...)` is a helper on the test class, not a mock
+/// (the same lookalike [`collect_unittest_asserts`] rejects by case).
+///
+/// Calls *inside* an `assert` statement are not matched here — that shape is
+/// an `assert_statement`, classified by [`assert_targets_mock_api`].
+fn collect_bare_mock_asserts<'a>(calls: &[Node<'a>], source: &[u8], out: &mut Vec<Node<'a>>) {
+    out.extend(calls.iter().copied().filter(|call| {
+        let is_whole_statement = call
+            .parent()
+            .is_some_and(|p| p.kind() == "expression_statement" && p.named_child_count() == 1);
+        if !is_whole_statement {
+            return false;
+        }
+        let Some(func) = call.child_by_field_name("function").filter(|f| f.kind() == "attribute")
+        else {
+            return false;
+        };
+        let method = func.child_by_field_name("attribute").and_then(|a| a.utf8_text(source).ok());
+        let receiver_is_self = func
+            .child_by_field_name("object")
+            .is_some_and(|o| o.kind() == "identifier" && o.utf8_text(source).ok() == Some("self"));
+        method.is_some_and(is_mock_assert_method) && !receiver_is_self
+    }));
+}
+
 /// Collect every `with_statement` in the subtree whose context manager is a
 /// call to `pytest.raises(...)` or bare `raises(...)`. These are treated as
 /// effective assertions (a pytest test passes when the expected exception is
@@ -1497,21 +1546,11 @@ fn collect_descendants<'a>(node: Node<'a>, target_kind: &str, out: &mut Vec<Node
 
 /// Decide whether an `assert_statement` targets a Mock-API attribute.
 ///
-/// `assert_statement` in tree-sitter-python has `assert` followed by the
-/// asserted expression(s). We look at the first non-keyword child — the
-/// expression being asserted — and decide whether its **outermost** value
-/// shape is `<receiver>.<mock_api_attribute>` (possibly chained, possibly
-/// called).
-///
-/// Conservative classification: anything we cannot positively identify as a
-/// mock-API attribute access (bare names, comparisons, `isinstance(...)`,
-/// arithmetic, etc.) is treated as non-mock. The optional `msg` argument
-/// after a comma is ignored — only the truth-y expression matters.
+/// The asserted expression is the first named child; an optional `msg`
+/// after the comma is ignored. The verdict is [`reads_mock_api`] on that
+/// expression — see there for the recognised shapes.
 fn assert_targets_mock_api(assert_stmt: Node<'_>, source: &[u8]) -> bool {
-    let Some(expr) = first_asserted_expression(assert_stmt) else {
-        return false;
-    };
-    last_attribute_name(expr, source).is_some_and(is_mock_api_attribute)
+    first_asserted_expression(assert_stmt).is_some_and(|expr| reads_mock_api(expr, source))
 }
 
 /// Return the first asserted expression of an `assert_statement`. The first
@@ -1520,39 +1559,189 @@ fn first_asserted_expression(assert_stmt: Node<'_>) -> Option<Node<'_>> {
     assert_stmt.named_child(0)
 }
 
-/// Determine the "last attribute" of an expression for Mock-API matching.
+/// The builtin whose result over a Mock-API attribute is still a fact about
+/// the mock: `len(m.call_args_list) == 2` counts calls just as
+/// `m.call_count == 2` does.
+const LEN_BUILTIN: &str = "len";
+
+/// True iff `expr` inspects a Mock-API attribute, so asserting on its truth
+/// verifies the test double rather than the system under test.
 ///
-/// Recognised shapes (and only these):
+/// Recognised shapes, and only these:
 ///
-/// * `(attribute object: <X> attribute: (identifier) @last)` → returns `@last`
-/// * `(call function: (attribute ... attribute: (identifier) @last) ...)` → returns `@last`
-/// * `(parenthesized_expression <inner>)` → recurses into `<inner>`. Parens
-///   do not change semantics, so `assert (mock.called)` matches just like
-///   `assert mock.called`.
+/// * an attribute access whose name is in
+///   [`crate::mock_api::MOCK_API_ATTRIBUTES`] — `m.called`,
+///   `repo.save.call_count` — or anything reached *through* one:
+///   `m.call_args.kwargs`, `m.call_args[0][0]`, `m.call_args.kwargs.get("x")`;
+/// * a call on such an attribute chain — `m.assert_called_once_with(1)`;
+/// * `len(<one of the above>)`;
+/// * `not <one of the above>`, and parentheses around any of them;
+/// * a comparison with at least one operand of the above shapes —
+///   `m.call_count == 2`, `m.call_count == len(items)`. The other side does
+///   not rescue it: comparing the mock's call log against anything is still
+///   a statement about the mock. `result == m.return_value` does not match,
+///   since `return_value` is configuration, not part of the inspected API.
 ///
-/// Everything else — bare identifiers, comparisons, calls without an
-/// attribute head, unary/boolean operators, comprehensions — returns
-/// `None` (i.e. "not a mock-API assert"). Conservative is correct: when
-/// uncertain, callers treat the result as non-mock.
-fn last_attribute_name<'a>(expr: Node<'_>, source: &'a [u8]) -> Option<&'a str> {
-    let attribute_node = match expr.kind() {
-        "attribute" => expr,
+/// * `and` / `or` whose operands *all* have one of the above shapes —
+///   `m.called and m.call_count == 1`. One real operand makes the whole
+///   expression real verification.
+///
+/// Everything else — bare names, arbitrary calls such as
+/// `helper(m.call_count)` — is not mock-targeting. Note the direction this
+/// leans: a `true` here removes a site from the verification tally, so
+/// widening it under-credits verification, the safe failure mode.
+fn reads_mock_api(expr: Node<'_>, source: &[u8]) -> bool {
+    match expr.kind() {
+        "attribute" => {
+            let name = expr.child_by_field_name("attribute").and_then(|a| a.utf8_text(source).ok());
+            name.is_some_and(is_mock_api_attribute)
+                || expr.child_by_field_name("object").is_some_and(|o| reads_mock_api(o, source))
+        }
+        "subscript" => expr.child_by_field_name("value").is_some_and(|v| reads_mock_api(v, source)),
         "call" => {
-            let func = expr.child_by_field_name("function")?;
-            if func.kind() == "attribute" {
-                func
-            } else {
-                return None;
+            let Some(func) = expr.child_by_field_name("function") else {
+                return false;
+            };
+            match func.kind() {
+                "attribute" => reads_mock_api(func, source),
+                "identifier" if func.utf8_text(source).ok() == Some(LEN_BUILTIN) => {
+                    sole_positional_argument(expr).is_some_and(|a| reads_mock_api(a, source))
+                }
+                _ => false,
             }
         }
-        "parenthesized_expression" => {
-            let inner = expr.named_child(0)?;
-            return last_attribute_name(inner, source);
+        "not_operator" => {
+            expr.child_by_field_name("argument").is_some_and(|a| reads_mock_api(a, source))
         }
-        _ => return None,
+        "parenthesized_expression" => {
+            expr.named_child(0).is_some_and(|i| reads_mock_api(i, source))
+        }
+        // Every operand must read the mock: `m.called and result == 3`
+        // carries a real check in its right operand.
+        "boolean_operator" => ["left", "right"]
+            .iter()
+            .all(|f| expr.child_by_field_name(f).is_some_and(|o| reads_mock_api(o, source))),
+        "comparison_operator" => any_named_child(expr, |op| reads_mock_api(op, source)),
+        _ => false,
+    }
+}
+
+/// The single positional argument of a call, or `None` when the call has
+/// any other argument shape.
+fn sole_positional_argument(call: Node<'_>) -> Option<Node<'_>> {
+    let args = call.child_by_field_name("arguments")?;
+    if args.named_child_count() != 1 {
+        return None;
+    }
+    args.named_child(0).filter(|a| a.kind() != "keyword_argument")
+}
+
+/// The `unittest` keyword argument that carries a failure message. Its value
+/// is never the thing being verified, so it takes no part in classifying a
+/// `self.assertXxx(...)` call.
+const UNITTEST_MSG_KEYWORD: &str = "msg";
+
+/// Decide whether a `self.assertXxx(...)` call targets the Mock API.
+///
+/// True iff at least one argument [`reads_mock_api`] and every other
+/// argument is inert — a literal, a Mock-API assertion helper such as
+/// `call(...)` / `ANY`, or a container of those (see [`is_inert_operand`]).
+/// `self.assertEqual(m.call_count, 1)` and `self.assertFalse(m.called)`
+/// match; `self.assertEqual(m.call_count, len(items))` does not.
+///
+/// Stricter than the comparison rule in [`reads_mock_api`] on purpose: a
+/// unittest argument list does not mark which side is the value under test,
+/// so a non-mock, non-literal argument might be exactly that.
+fn unittest_assert_targets_mock_api(call: Node<'_>, source: &[u8], imports: &ImportMap) -> bool {
+    let Some(args) = call.child_by_field_name("arguments") else {
+        return false;
     };
-    let last = attribute_node.child_by_field_name("attribute")?;
-    last.utf8_text(source).ok()
+    let mut cursor = args.walk();
+    let verdict = args
+        .named_children(&mut cursor)
+        .filter_map(|arg| {
+            if arg.kind() != "keyword_argument" {
+                return Some(arg);
+            }
+            let name = arg.child_by_field_name("name").and_then(|n| n.utf8_text(source).ok());
+            if name == Some(UNITTEST_MSG_KEYWORD) {
+                None
+            } else {
+                arg.child_by_field_name("value")
+            }
+        })
+        // `None` short-circuits on the first argument that is neither a
+        // mock read nor inert; otherwise the fold tracks "seen a mock read".
+        .try_fold(false, |any_mock, operand| {
+            if reads_mock_api(operand, source) {
+                Some(true)
+            } else if is_inert_operand(operand, source, imports) {
+                Some(any_mock)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(false);
+    verdict
+}
+
+/// True iff `expr` cannot carry a value the system under test produced: a
+/// literal (number, string, `True` / `False` / `None`, `...`, a negated
+/// number), a name resolving to a Mock-API assertion helper (`ANY`,
+/// `call(...)`, `call.save(...)`, `mock.call(...)`), or a list / tuple /
+/// set / dict built only from those.
+///
+/// The arguments of a `call(...)` helper are not inspected: whatever they
+/// hold, the comparison is still against the mock's recorded calls.
+fn is_inert_operand(expr: Node<'_>, source: &[u8], imports: &ImportMap) -> bool {
+    match expr.kind() {
+        "integer" | "float" | "true" | "false" | "none" | "ellipsis" => true,
+        // An f-string's `interpolation` children carry live values.
+        "string" => !any_named_child(expr, |c| c.kind() == "interpolation"),
+        "concatenated_string" => all_named_children(expr, |c| is_inert_operand(c, source, imports)),
+        "unary_operator" => expr
+            .child_by_field_name("argument")
+            .is_some_and(|a| matches!(a.kind(), "integer" | "float")),
+        "parenthesized_expression" => {
+            expr.named_child(0).is_some_and(|i| is_inert_operand(i, source, imports))
+        }
+        "list" | "tuple" | "set" => {
+            all_named_children(expr, |e| is_inert_operand(e, source, imports))
+        }
+        "dictionary" => all_named_children(expr, |pair| {
+            pair.kind() == "pair"
+                && ["key", "value"].iter().all(|field| {
+                    pair.child_by_field_name(field)
+                        .is_some_and(|n| is_inert_operand(n, source, imports))
+                })
+        }),
+        "identifier" | "attribute" => attribute_chain_text(expr, source)
+            .is_some_and(|chain| resolves_to_mock_assertion_helper(&chain, imports)),
+        "call" => call_head_chain(expr, source)
+            .is_some_and(|chain| resolves_to_mock_assertion_helper(&chain, imports)),
+        _ => false,
+    }
+}
+
+/// True iff a raw dotted name resolves, through the file's import map, to a
+/// Mock-API assertion helper (`call`, `ANY`).
+fn resolves_to_mock_assertion_helper(chain: &str, imports: &ImportMap) -> bool {
+    is_mock_assertion_helper(&canonicalize_called_name(chain, imports))
+}
+
+/// True iff `pred` holds for every named child of `node`. Owns the cursor,
+/// so callers need not bind the result to outlive the iterator's borrow.
+fn all_named_children(node: Node<'_>, pred: impl FnMut(Node<'_>) -> bool) -> bool {
+    let mut cursor = node.walk();
+    let all = node.named_children(&mut cursor).all(pred);
+    all
+}
+
+/// True iff `pred` holds for at least one named child of `node`.
+fn any_named_child(node: Node<'_>, pred: impl FnMut(Node<'_>) -> bool) -> bool {
+    let mut cursor = node.walk();
+    let any = node.named_children(&mut cursor).any(pred);
+    any
 }
 
 #[cfg(test)]
@@ -1899,6 +2088,10 @@ def test_unchecked():
         );
     }
 
+    /// `assert m.assert_called_once_with(1)` always fails at runtime — the
+    /// method returns `None` — so no passing suite contains it, but a broken
+    /// one might, and it is still unambiguously about the mock. Kept as the
+    /// one test pinning that shape; fixtures use the bare-call idiom.
     #[test]
     fn only_mock_asserts_predicate_is_true_for_pure_mock_test() {
         let src = "\
@@ -1993,16 +2186,261 @@ def test_h():
         assert!(recs[0].only_asserts_on_mock);
     }
 
+    // ---- Mock-assertion idioms (bare calls, comparisons, `not`, unittest) ----
+
+    /// A bare `m.assert_*(...)` statement raises on its own, so it is an
+    /// assertion site — and always a mock one.
     #[test]
-    fn unary_negation_is_conservative_non_mock() {
-        // `not mock.called` is NOT an attribute access at the outer level —
-        // the spec says "Conservative is correct: when uncertain, mark as
-        // non-mock." Run-3 may revisit if a clear policy emerges.
+    fn bare_mock_assert_call_is_a_mock_assertion() {
+        let src = "\
+def test_a():
+    m = Mock()
+    m(1)
+    m.assert_called_once_with(1)
+";
+        let recs = parse(src);
+        assert_eq!(recs[0].assertion_count, 1);
+        assert_eq!(recs[0].mock_assertion_count, 1);
+        assert!(recs[0].only_asserts_on_mock);
+    }
+
+    #[test]
+    fn every_assert_method_in_the_mock_api_counts_as_a_bare_assertion() {
+        let src = "\
+def test_a():
+    m.assert_called()
+    m.assert_called_with(1)
+    m.assert_called_once()
+    m.assert_called_once_with(1)
+    m.assert_not_called()
+    m.assert_any_call(1)
+    m.assert_has_calls([])
+    self.client.send.assert_called_once()
+    mocks['a'].assert_called()
+";
+        let recs = parse(src);
+        assert_eq!(recs[0].assertion_count, 9);
+        assert_eq!(recs[0].mock_assertion_count, 9);
+        assert!(recs[0].only_asserts_on_mock);
+    }
+
+    #[test]
+    fn bare_non_assert_calls_are_not_assertions() {
+        // `called` / `call_count` are attributes, not assertion methods, and
+        // `save` is not mock API at all. A bare `self.assert_called_with`
+        // has `self` itself as receiver: a user helper on the test class,
+        // not a mock (the unittest fixture pins this lookalike).
+        let src = "\
+class TestX:
+    def test_a(self):
+        m.save(1)
+        m.called
+        m.reset_mock()
+        self.assert_called_with('x')
+";
+        let recs = parse(src);
+        assert_eq!(recs[0].assertion_count, 0);
+        assert_eq!(recs[0].mock_assertion_count, 0);
+        assert!(!recs[0].only_asserts_on_mock);
+    }
+
+    #[test]
+    fn bare_mock_assert_beside_a_real_assert_is_mixed() {
+        let src = "\
+def test_a():
+    result = run(m)
+    m.assert_called_once_with(1)
+    assert result == 3
+";
+        let recs = parse(src);
+        assert_eq!(recs[0].assertion_count, 2);
+        assert_eq!(recs[0].mock_assertion_count, 1);
+        assert!(!recs[0].only_asserts_on_mock);
+    }
+
+    #[test]
+    fn bare_mock_asserts_nested_in_blocks_are_collected() {
+        let src = "\
+def test_a():
+    with patch('a.b') as m:
+        run()
+        m.assert_called_once()
+    for x in xs:
+        x.assert_not_called()
+";
+        let recs = parse(src);
+        assert_eq!(recs[0].assertion_count, 2);
+        assert_eq!(recs[0].mock_assertion_count, 2);
+        assert!(recs[0].only_asserts_on_mock);
+    }
+
+    #[test]
+    fn bare_mock_asserts_are_assertion_sites_for_the_setup_ratio() {
+        // def row 0, first bare assertion row 2, two sites → 2 / 2 = 1.0.
+        // The zero-assert fallback would have given the body height, 3.0.
+        let src = "\
+def test_a():
+    m = Mock()
+    m.assert_not_called()
+    m.assert_not_called()
+";
+        let t = &parse(src)[0];
+        assert!(
+            (t.setup_to_assertion_ratio - 1.0).abs() < 1e-9,
+            "expected 1.0, got {}",
+            t.setup_to_assertion_ratio
+        );
+    }
+
+    #[test]
+    fn comparison_on_a_mock_attribute_is_mock_targeting() {
+        for expr in [
+            "m.call_count == 2",
+            "2 == m.call_count",
+            "m.call_args == call(1)",
+            "m.call_args_list == [call(1), call(2)]",
+            "m.called is True",
+            "m.call_count == len(items)",
+            "len(m.call_args_list) == 2",
+            "m.call_args[0][0] == 1",
+            "m.call_args.kwargs['x'] == 1",
+            "(m.call_count) == 2",
+            "m.called and m.call_count == 1",
+            "not m.called or m.call_count < 3",
+        ] {
+            let src = format!("def test_a():\n    assert {expr}\n");
+            let recs = parse(&src);
+            assert_eq!(recs[0].mock_assertion_count, 1, "`assert {expr}` must target the mock");
+            assert!(recs[0].only_asserts_on_mock, "`assert {expr}` must target the mock");
+        }
+    }
+
+    #[test]
+    fn comparison_without_a_mock_attribute_is_real_verification() {
+        for expr in [
+            "result == m.return_value",
+            "result == 3",
+            "len(items) == 2",
+            "m.call_count == 2 and result == 3",
+            "helper(m.call_count) == 2",
+        ] {
+            let src = format!("def test_a():\n    assert {expr}\n");
+            let recs = parse(&src);
+            assert_eq!(recs[0].mock_assertion_count, 0, "`assert {expr}` must not target the mock");
+            assert!(!recs[0].only_asserts_on_mock, "`assert {expr}` must not target the mock");
+        }
+    }
+
+    #[test]
+    fn negated_mock_attribute_is_mock_targeting() {
         let src = "\
 def test_i():
     assert not mock.called
+    assert not (repo.save.call_count > 1)
 ";
         let recs = parse(src);
+        assert_eq!(recs[0].assertion_count, 2);
+        assert_eq!(recs[0].mock_assertion_count, 2);
+        assert!(recs[0].only_asserts_on_mock);
+    }
+
+    #[test]
+    fn negated_real_value_is_not_mock_targeting() {
+        let src = "\
+def test_i():
+    assert not result.failed
+";
+        let recs = parse(src);
+        assert_eq!(recs[0].assertion_count, 1);
+        assert_eq!(recs[0].mock_assertion_count, 0);
+        assert!(!recs[0].only_asserts_on_mock);
+    }
+
+    #[test]
+    fn unittest_asserts_on_mock_attributes_are_mock_targeting() {
+        let src = "\
+from unittest import mock
+from unittest.mock import call, ANY
+
+class TestX(unittest.TestCase):
+    def test_a(self):
+        self.assertEqual(m.call_count, 1)
+        self.assertEqual(1, m.call_count, msg=note)
+        self.assertFalse(m.called)
+        self.assertTrue(m.call_count == 2)
+        self.assertEqual(m.call_args, call(1, ANY))
+        self.assertEqual(m.call_args_list, [mock.call(1), call.save(2)])
+        self.assertIsNone(m.call_args)
+";
+        let recs = parse(src);
+        assert_eq!(recs[0].assertion_count, 7);
+        assert_eq!(recs[0].mock_assertion_count, 7);
+        assert!(recs[0].only_asserts_on_mock);
+    }
+
+    #[test]
+    fn unittest_assert_with_a_non_mock_non_literal_argument_is_real() {
+        // Unlike `assert m.call_count == len(items)`, the unittest rule asks
+        // every non-literal argument to be mock API: the argument list does
+        // not say which side is "the value under test".
+        for args in ["m.call_count, len(items)", "result, 2", "m.call_args, expected", "1, 1"] {
+            let src = format!(
+                "class TestX(unittest.TestCase):\n    def test_a(self):\n        self.assertEqual({args})\n"
+            );
+            let recs = parse(&src);
+            assert_eq!(recs[0].assertion_count, 1);
+            assert_eq!(
+                recs[0].mock_assertion_count, 0,
+                "assertEqual({args}) must not target the mock"
+            );
+            assert!(!recs[0].only_asserts_on_mock, "assertEqual({args}) must not target the mock");
+        }
+    }
+
+    #[test]
+    fn interpolated_string_argument_is_not_inert() {
+        // `f"{result}"` carries a value the code produced; only a plain
+        // string literal is inert.
+        let src = "\
+class TestX(unittest.TestCase):
+    def test_a(self):
+        self.assertEqual(m.call_args[0][0], f\"{result}\")
+        self.assertEqual(m.call_args[0][0], f\"fixed\")
+";
+        let recs = parse(src);
+        assert_eq!(recs[0].assertion_count, 2);
+        assert_eq!(recs[0].mock_assertion_count, 1);
+        assert!(!recs[0].only_asserts_on_mock);
+    }
+
+    #[test]
+    fn unresolved_call_helper_is_not_inert() {
+        // `call` that does not resolve to `unittest.mock.call` / `mock.call`
+        // is an arbitrary function; its result is an expected value.
+        let src = "\
+from myproj import call
+
+class TestX(unittest.TestCase):
+    def test_a(self):
+        self.assertEqual(m.call_args, call(1))
+";
+        let recs = parse(src);
+        assert_eq!(recs[0].assertion_count, 1);
+        assert_eq!(recs[0].mock_assertion_count, 0);
+        assert!(!recs[0].only_asserts_on_mock);
+    }
+
+    #[test]
+    fn raises_block_still_disqualifies_bare_mock_assertions() {
+        let src = "\
+def test_a():
+    with pytest.raises(ValueError):
+        run(m)
+    m.assert_called_once()
+";
+        let recs = parse(src);
+        assert_eq!(recs[0].assertion_count, 2);
+        assert_eq!(recs[0].mock_assertion_count, 1);
         assert!(!recs[0].only_asserts_on_mock);
     }
 

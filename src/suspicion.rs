@@ -175,6 +175,7 @@ mod tests {
             line: 1,
             assertion_count: 1,
             only_asserts_on_mock: false,
+            mock_assertion_count: 0,
             patch_decorator_count: 0,
             stubs_count: 0,
             setup_to_assertion_ratio: 0.0,

@@ -39,11 +39,33 @@ saturates each saturating sub-metric reaches a score of 1.0.
 
 ## Sub-metric definitions
 
-- `assertion_count` includes both `assert_statement` nodes and
-  `with pytest.raises(...)` / `with raises(...)` context-manager blocks.
-  A raises block is treated as one effective non-mock assertion: it
-  contributes to the count, disqualifies `only_asserts_on_mock`, and
-  participates in `setup_to_assertion_ratio` like an `assert_statement`.
+- `assertion_count` counts four kinds of assertion site, one each:
+  `assert_statement` nodes, `with pytest.raises(...)` / `with raises(...)`
+  context-manager blocks, `self.assertXxx(...)` calls inside a test class,
+  and bare Mock-API assertion calls written as their own statement
+  (`m.assert_called_once_with(1)`, any `assert_*` name in
+  `MOCK_API_ATTRIBUTES`). All four raise at the line they sit on, which is
+  what keeps the count syntactic. A raises block is always a non-mock
+  assertion: it disqualifies `only_asserts_on_mock`. A bare Mock-API
+  assertion call is always a mock assertion. Raises blocks and bare mock
+  calls participate in `setup_to_assertion_ratio` like an
+  `assert_statement`; `self.assertXxx(...)` calls do not.
+- `mock_assertion_count` is the subset of `assertion_count` that inspects
+  the test double: bare `m.assert_*(...)` calls; `assert` statements whose
+  expression reads a Mock-API attribute directly, through `not`,
+  parentheses, `len(...)`, an index or attribute hanging off it
+  (`m.call_args[0][0]`), or on either side of a comparison
+  (`m.call_count == len(items)` counts; `result == m.return_value` does
+  not, since `return_value` is not in the set); and `self.assertXxx(...)`
+  calls whose every argument is a Mock-API read, a literal, or a
+  `unittest.mock` assertion helper (`call(...)`, `ANY`), with at least one
+  Mock-API read. `only_asserts_on_mock` is exactly
+  `assertion_count > 0 && mock_assertion_count == assertion_count`, which
+  is what the `w_mock_only` term reads. `and` / `or` counts as a mock read
+  only when every operand is one; `assert m.called and result == 3` is
+  real verification. An arbitrary call wrapped around an attribute
+  (`helper(m.call_count)`) is also classified as real verification: the
+  helper may check anything, and only `len(...)` is known not to.
 - `external_verification_count` counts call sites that propagate a
   failure from outside the test process: a call resolving to
   `subprocess.check_call` / `subprocess.check_output`, a call resolving
@@ -69,8 +91,8 @@ saturates each saturating sub-metric reaches a score of 1.0.
   and to external verification): when at least one effective assertion
   exists in the body, `(first_effective_line - def_line) /
   effective_count` measured in tree-sitter `start_position().row`
-  deltas, where an effective assertion is an `assert_statement` or a
-  `with pytest.raises(...)` block. When the body has no effective
+  deltas, where an effective assertion is an `assert_statement`, a
+  `with pytest.raises(...)` block or a bare Mock-API assertion call. When the body has no effective
   assertion but does carry external verification, the first verification
   call site takes the assertion's place: `(first_verification_line -
   def_line) / external_verification_count` — the body is not "setup with

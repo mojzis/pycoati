@@ -40,7 +40,7 @@ def test_retry_reports_through_the_mock():
     # project that has a baseline.
     client = Mock()
     client.send(1)
-    assert client.send.assert_called_once_with(1)
+    client.send.assert_called_once_with(1)
 
 
 def test_normalize_strips_and_lowercases():

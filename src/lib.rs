@@ -152,8 +152,22 @@ pub struct TestRecord {
     pub nodeid: String,
     pub file: PathBuf,
     pub line: u64,
+    /// Effective assertion sites in this test body: `assert` statements,
+    /// `with pytest.raises(...)` blocks, `self.assertXxx(...)` calls, and
+    /// bare Mock-API assertion calls (`m.assert_called_once_with(1)`) — every
+    /// construct that raises `AssertionError` (or fails the test like it) at
+    /// the line it appears on.
     pub assertion_count: u64,
+    /// `true` when `assertion_count > 0` and every assertion site counted
+    /// there targets the Mock API (`mock_assertion_count == assertion_count`).
     pub only_asserts_on_mock: bool,
+    /// The subset of `assertion_count` whose sites inspect a Mock-API
+    /// attribute rather than a value the system under test produced: bare
+    /// `m.assert_*(...)` calls, `assert` statements whose expression reads
+    /// a Mock-API attribute (`assert m.called`, `assert not m.called`,
+    /// `assert m.call_count == 2`), and `self.assertXxx(...)` calls whose
+    /// every non-literal argument is one (`self.assertEqual(m.call_count, 1)`).
+    pub mock_assertion_count: u64,
     pub patch_decorator_count: u64,
     /// Number of fixture-driven stub-API call sites in this test's body.
     /// At per-test scope, `mock_overuse` consumes

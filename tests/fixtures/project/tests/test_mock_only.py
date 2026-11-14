@@ -1,4 +1,4 @@
-# pycoati-expected: tests=1 asserts=2 only_mock=test_repo_save_called
+# pycoati-expected: tests=1 asserts=4 only_mock=test_repo_save_called
 from unittest.mock import Mock
 
 
@@ -6,6 +6,8 @@ def test_repo_save_called():
     mock = Mock()
     repo = Mock()
     mock.save(1)
-    repo.save.return_value = 2
-    assert mock.assert_called_once_with(1)
-    assert repo.save.assert_called()
+    repo.save(2)
+    mock.save.assert_called_once_with(1)
+    repo.save.assert_called()
+    assert repo.save.call_count == 1
+    assert not repo.delete.called

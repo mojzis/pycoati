@@ -95,9 +95,9 @@ opening a file at `file`:`line`.
 - `test_function_count` — number of `def test_*` functions parsed from this file
   via AST. Class-nested test methods are counted. **Parametrize is not
   expanded.**
-- `assertion_count` — effective assertions across every test body in the file.
-  An effective assertion is an `assert` statement or a `with pytest.raises(...)`
-  block; the raises block counts as one.
+- `assertion_count` — effective assertions across every test body in the file:
+  the sum of `test_functions[].assertion_count` for this file's tests, with the
+  same definition.
 - `mock_construction_count` — call sites in test bodies whose callee is `Mock`,
   `MagicMock`, `AsyncMock`, `create_autospec`, or `patch`. `patch` is counted
   here because `with patch(...)` is a construction at the call site. This is a
@@ -122,15 +122,44 @@ analysis reads from here.
   tests. **Parametrize is not expanded**, so there is never a `[...]` suffix.
 - `file` — path to the file containing this test. Joins to `files[].path`.
 - `line` — line of the `def`. **1-indexed**, matching what an editor shows.
-- `assertion_count` — effective assertions in this test body: `assert`
-  statements plus `with pytest.raises(...)` blocks, one each.
-- `only_asserts_on_mock` — `true` when every `assert` statement in the body
-  targets a mock-API attribute *and* the body contains no raises block. The
-  matched attribute set is exact: `called`, `call_count`, `call_args`,
-  `call_args_list`, `assert_called`, `assert_called_with`, `assert_called_once`,
-  `assert_called_once_with`, `assert_not_called`, `assert_any_call`,
-  `assert_has_calls`. **`false` when the test has zero assertions** — this flag
-  never fires on an assertionless test, so it does not overlap `dead-test`.
+- `assertion_count` — effective assertion sites in this test body, one each:
+  `assert` statements, `with pytest.raises(...)` blocks, `self.assertXxx(...)`
+  calls inside a test class, and bare mock-API assertion calls written as a
+  statement on their own (`m.assert_called_once_with(1)`). Every one of these
+  fails the test at the line it sits on. Verification that happens elsewhere
+  is counted separately — see `external_verification_count`.
+- `only_asserts_on_mock` — `true` when the test has at least one assertion and
+  every one of them targets the mock API, i.e. `mock_assertion_count ==
+  assertion_count > 0`. A raises block never targets the mock API, so one in
+  the body makes this `false`. **`false` when the test has zero assertions** —
+  this flag never fires on an assertionless test, so it does not overlap
+  `dead-test`.
+- `mock_assertion_count` — the part of `assertion_count` that inspects a test
+  double rather than a value the code under test produced. The mock-API
+  attribute set is closed and exact: `called`, `call_count`, `call_args`,
+  `call_args_list`, `assert_called`, `assert_called_with`,
+  `assert_called_once`, `assert_called_once_with`, `assert_not_called`,
+  `assert_any_call`, `assert_has_calls`. A site counts here when it is:
+  - a bare call to one of the `assert_*` names on any receiver except bare
+    `self` — `m.assert_called_once_with(1)`, `self.client.send.assert_called()`;
+  - an `assert` whose expression reads one of those attributes, directly or
+    through `not`, parentheses, `len(...)`, an indexing or attribute access
+    hanging off it (`m.call_args[0][0]`, `m.call_args.kwargs`), or either side
+    of a comparison — `assert not m.called`, `assert m.call_count == 2`,
+    `assert m.call_count == len(items)`. `assert result == m.return_value` does
+    **not** count: `return_value` is configuration, not part of the set;
+  - a `self.assertXxx(...)` call where at least one argument reads one of those
+    attributes and every other argument is a literal, a mock assertion helper
+    (`call(...)`, `call.save(...)`, `ANY`, imported from `unittest.mock` or
+    `mock`) or a container of those — `self.assertEqual(m.call_count, 1)`,
+    `self.assertFalse(m.called)`. `self.assertEqual(m.call_count, len(items))`
+    does not count, because the argument list does not say which side is the
+    value under test. A `msg=` argument is ignored.
+
+  `and` / `or` counts only when every operand reads the mock API
+  (`assert m.called and m.call_count == 1`); one real operand
+  (`assert m.called and result == 3`) makes it real verification. So does an
+  arbitrary call around the attribute (`helper(m.call_count)`).
 - `patch_decorator_count` — `@patch`, `@mock.patch`, `@patch.object`, or any
   `@<something>.patch` decorator on this test.
 - `stubs_count` — fixture-driven patch call sites in this test's body, from the
@@ -138,8 +167,9 @@ analysis reads from here.
 - `setup_to_assertion_ratio` — lines of setup per assertion, as a float.
   Computed as
   `(first_effective_assertion_line - def_line) / effective_assertion_count`,
-  where an effective assertion is an `assert` statement or a
-  `with pytest.raises(...)` block. `self.assertXxx(...)` calls raise
+  where an effective assertion is an `assert` statement, a
+  `with pytest.raises(...)` block or a bare mock-API assertion call
+  (`m.assert_called_once_with(1)`). `self.assertXxx(...)` calls raise
   `assertion_count` without feeding this denominator.
   When the body has no effective assertion but does carry external
   verification, the first such call site stands in for the first assertion:
@@ -156,7 +186,7 @@ analysis reads from here.
   `<receiver>.check_returncode()`. Import aliases are resolved first, so
   `import subprocess as sp` and `from subprocess import run as r` both match.
   **This is not part of `assertion_count`**, which stays a syntactic count of
-  `assert`-shaped constructs — read the two together. A non-zero value means
+  assertion sites in the body — read the two together. A non-zero value means
   zero assertions is not the absence of verification; it does **not** mean the
   child process checks anything worth checking. See `dead-test` below.
 
@@ -408,7 +438,13 @@ when the underlying behaviour is broken or entirely absent.
 
 **Signals.**
 - `only_asserts_on_mock == true` and `assertion_count > 0`. This is the
-  definitive signal; the flag is computed to mean exactly this pattern.
+  definitive signal; the flag is computed to mean exactly this pattern. It
+  covers bare `m.assert_called_once_with(...)` statements, `assert
+  m.call_count == 2`, `assert not m.called` and
+  `self.assertEqual(m.call_count, 1)` alike.
+- `mock_assertion_count > 0` with `only_asserts_on_mock == false` is the
+  partial form: some assertions verify the double, some verify output. Not a
+  candidate on its own.
 - Equivalently, a `smell_hits[]` entry with `category == "mock_only_assertions"`.
 - Strength scales with `assertion_count`: a test with six mock-API assertions and
   nothing else is a stronger candidate than one with a single such assertion.
@@ -595,8 +631,9 @@ completed.returncode == 0`, which is a normal assertion and counts as one.
 that asserts nothing but would raise on failure is doing real work — importing a
 module, constructing an object, running a migration. A test whose assertions are
 made through a helper function will show `assertion_count == 0` because pycoati
-counts `assert` statements syntactically in the test body and does not follow
-calls into helpers. And a test that verifies in a child process, as above. Check
+counts assertion sites — `assert` statements, raises blocks,
+`self.assertXxx(...)` calls and bare mock `assert_*` calls — syntactically in
+the test body and does not follow calls into helpers. And a test that verifies in a child process, as above. Check
 for all three before reporting.
 
 There is no per-test coverage in this schema, so "this test covers nothing" is

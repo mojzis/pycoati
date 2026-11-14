@@ -6,5 +6,5 @@ def test_partial_mock():
     mock = Mock()
     mock.do_thing()
     value = 42
-    assert mock.assert_called()
+    mock.do_thing.assert_called_once()
     assert value == 42
