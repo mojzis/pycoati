@@ -56,6 +56,8 @@ fn populated_inventory() -> Inventory {
             only_asserts_on_mock: true,
             mock_assertion_count: 1,
             patch_decorator_count: 1,
+            patch_call_count: 1,
+            mock_construction_count: 1,
             stubs_count: 1,
             setup_to_assertion_ratio: 3.0,
             external_verification_count: 1,
@@ -224,7 +226,7 @@ fn the_walk_actually_reaches_nested_structs() {
     }
     assert_eq!(
         emitted.len(),
-        51,
+        52,
         "single-project schema field count changed. If you added or removed an \
          inventory field, update this count AND the field's bullet in \
          docs/guide/analyze.md."

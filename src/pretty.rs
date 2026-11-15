@@ -498,6 +498,8 @@ mod tests {
             only_asserts_on_mock: false,
             mock_assertion_count: 0,
             patch_decorator_count: patches,
+            patch_call_count: 0,
+            mock_construction_count: 0,
             stubs_count: 0,
             setup_to_assertion_ratio: 0.0,
             external_verification_count: 0,

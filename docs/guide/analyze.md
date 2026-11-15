@@ -98,17 +98,16 @@ opening a file at `file`:`line`.
 - `assertion_count` — effective assertions across every test body in the file:
   the sum of `test_functions[].assertion_count` for this file's tests, with the
   same definition.
-- `mock_construction_count` — call sites in test bodies whose callee is `Mock`,
-  `MagicMock`, `AsyncMock`, `create_autospec`, or `patch`. `patch` is counted
-  here because `with patch(...)` is a construction at the call site. This is a
-  file-scope signal only; there is no per-test equivalent.
+- `mock_construction_count` — sum of `test_functions[].mock_construction_count`
+  for this file's tests, with the same definition.
 - `patch_decorator_count` — sum of the per-test decorator counts in this file.
 - `stubs_count` — fixture-driven patch call sites in this file. The matched set
   is closed and exact: `monkeypatch.setattr`, `monkeypatch.setenv`,
   `monkeypatch.delattr`, `monkeypatch.delenv`, `monkeypatch.context`,
   `monkeypatch.syspath_prepend`, `monkeypatch.chdir`, `mocker.patch`,
   `mocker.patch.object`, `mocker.patch.dict`, `mocker.patch.multiple`,
-  `mocker.spy`, `mocker.stub`, `mocker.MagicMock`.
+  `mocker.spy`, `mocker.stub`, `mocker.Mock`, `mocker.MagicMock`,
+  `mocker.AsyncMock`, `mocker.create_autospec`.
 - `fixture_count` — `@pytest.fixture` / `@fixture` decorators anywhere in the
   file, including on non-test functions. File scope only.
 - `smell_hits` — array of smell hits at file scope. See `smell_hits[]` below.
@@ -162,6 +161,25 @@ analysis reads from here.
   arbitrary call around the attribute (`helper(m.call_count)`).
 - `patch_decorator_count` — `@patch`, `@mock.patch`, `@patch.object`, or any
   `@<something>.patch` decorator on this test.
+- `patch_call_count` — patches this test installs *without* a decorator: calls
+  in the body resolving to `patch`, `patch.object`, `patch.dict` or
+  `patch.multiple` from `unittest.mock` or the `mock` backport (usually as
+  `with patch(...):`), plus `mocker.patch`, `mocker.patch.object`,
+  `mocker.patch.dict` and `mocker.patch.multiple`. Spelling does not matter:
+  `with mock.patch(...)` under `from unittest import mock` counts. Read it
+  beside `patch_decorator_count` — together they are every patch the test
+  installs, and the score's patch term reads their sum. **Do not add it to
+  `mock_construction_count` or `stubs_count`**: each site here is already in
+  exactly one of those.
+- `mock_construction_count` — Mock-API constructions in this test's body:
+  calls resolving to `Mock`, `MagicMock`, `AsyncMock`, `create_autospec`,
+  `patch`, `patch.object`, `patch.dict` or `patch.multiple` in `unittest.mock`
+  or the `mock` backport. Call heads are resolved through the file's imports,
+  so `mock.Mock()` under `from unittest import mock` and an aliased
+  `MagicMock as MM` both count, while `factory.Mock()` or a `Mock` imported
+  from your own package do not. A bare `Mock()` that no import binds (star
+  import, conftest) still counts. `mocker.Mock()` and friends are stubs, not
+  constructions.
 - `stubs_count` — fixture-driven patch call sites in this test's body, from the
   closed list given under `files[].stubs_count`.
 - `setup_to_assertion_ratio` — lines of setup per assertion, as a float.
@@ -336,7 +354,7 @@ is removed from `files`, `test_functions`, `smell_hits`, or any count.
 
 ```
 suspicion_score = 0.35 * (only_asserts_on_mock ? 1 : 0)
-                + 0.20 * min(patch_decorator_count / 5, 1)
+                + 0.20 * min((patch_decorator_count + patch_call_count) / 5, 1)
                 + 0.15 * sigmoid((setup_to_assertion_ratio - 8) / 4)
                 + 0.20 * (unverified ? 1 : 0)
                 + 0.10 * min(len(smell_hits) / 3, 1)
@@ -350,8 +368,9 @@ Consequences you need when reading scores:
 
 - The setup term is never zero. Even a test with a ratio of `0` contributes
   `0.15 * sigmoid(-2)` ≈ `0.018`, so scores are never exactly `0.00`.
-- `patch_decorator_count` saturates at **5** and `len(smell_hits)` at **3**. Ten
-  patches score the same as five.
+- Patches (`patch_decorator_count + patch_call_count`) saturate at **5** and
+  `len(smell_hits)` at **3**. Ten patches score the same as five, and a `with
+  patch(...)` scores the same as a `@patch`.
 - The setup sigmoid inflects at a ratio of **8.0** with scale **4.0**: ratio 8
   contributes exactly half the setup weight.
 - File scores are the mean of their tests' scores plus a bonus that grows at
@@ -382,8 +401,10 @@ about the test being empty — read the field, not just the score.
   tests are excluded from that predicate.
 - `mock_overuse` fires when `mocks > max(assertion_count, 2)` **and**
   `mocks / max(assertion_count, 1) > 2.0`. Both comparisons strict. `mocks` is
-  `patch_decorator_count + stubs_count` at test scope, and
-  `mock_construction_count + patch_decorator_count + stubs_count` at file scope.
+  `mock_construction_count + patch_decorator_count + stubs_count` at both test
+  and file scope. Each patch lands in exactly one of those three, whatever its
+  spelling: a decorator in `patch_decorator_count`, `with patch(...)` in
+  `mock_construction_count`, `mocker.patch(...)` in `stubs_count`.
 
 ---
 
@@ -463,10 +484,12 @@ it does. It patches internal collaborators by dotted path, so any rename, move,
 or refactor breaks the test even though behaviour is unchanged.
 
 **Signals.**
-- `patch_decorator_count >= 3` on a single test.
+- `patch_decorator_count + patch_call_count >= 3` on a single test — every
+  patch, decorator or `with`.
 - `stubs_count >= 3` on a single test.
-- `patch_decorator_count + stubs_count` high relative to `assertion_count` — the
-  `mock_overuse` hit at test scope encodes exactly this ratio.
+- `mock_construction_count + patch_decorator_count + stubs_count` high relative
+  to `assertion_count` — the `mock_overuse` hit at test scope encodes exactly
+  this ratio.
 - `called_names` is short or empty while patch and stub counts are high: the
   test replaced more of your code than it calls.
 

@@ -28,7 +28,13 @@
 //!
 //! * `patch_decorator_count` — `@patch`, `@mock.patch`, `@patch.object`, or
 //!   any `@<something>.patch` decorator on the test function (or on its
-//!   wrapping `decorated_definition`).
+//!   wrapping `decorated_definition`), plus any decorator resolving to a
+//!   `patch*` variant through the import map.
+//! * `mock_construction_count` — calls in the body resolving to a Mock-API
+//!   constructor or `patch*` variant (see [`mock_api_call_name`]).
+//! * `patch_call_count` — body-level patches: the `patch*` subset of the
+//!   constructions plus `mocker.patch*` stub calls. Feeds the score's patch
+//!   term only, never the `mock_overuse` sum.
 //! * `setup_to_assertion_ratio` — `(first_assert_line - def_line) /
 //!   assertion_sites` as `f64`, using tree-sitter `start_position()` row
 //!   deltas, where an assertion site is an `assert_statement`, a raises
@@ -54,9 +60,9 @@
 //! Per-file AST counts (returned alongside the per-test records via
 //! [`ParsedFile`]):
 //!
-//! * `mock_construction_count` — count of `call_expression` nodes inside
-//!   any test body whose head name matches
-//!   [`crate::mock_api::MOCK_CONSTRUCTORS`].
+//! * `mock_construction_count` — sum of the per-test counts: calls whose
+//!   head resolves through the import map to a Mock-API constructor or
+//!   `patch*` variant (see [`mock_api_call_name`]).
 //! * `patch_decorator_count` — sum of the per-test counts.
 //! * `fixture_count` — number of `@pytest.fixture` / `@fixture` decorators
 //!   anywhere in the file (counted on any `decorated_definition`, not just
@@ -71,7 +77,8 @@ use tree_sitter::{Node, Parser};
 use crate::accept::fingerprint;
 use crate::mock_api::{
     chain_constructs_a_mock, is_mock_api_attribute, is_mock_assert_method,
-    is_mock_assertion_helper, is_mock_constructor, is_stub_call_head,
+    is_mock_assertion_helper, is_mock_construction_call, is_mocker_patch_head, is_patch_call,
+    is_stub_call_head, qualify_unbound_mock_name,
 };
 use crate::sut_calls::{canonicalize_called_name, dotted_head, is_at_or_under, ImportMap};
 use crate::verification::{
@@ -90,8 +97,7 @@ use crate::TestRecord;
 #[derive(Debug, Clone, Default)]
 pub struct ParsedFile {
     pub test_functions: Vec<TestRecord>,
-    /// Sum across every test body of `call_expression` heads matching
-    /// [`crate::mock_api::MOCK_CONSTRUCTORS`].
+    /// Sum of `mock_construction_count` across every test record.
     pub mock_construction_count: u64,
     /// Sum of `patch_decorator_count` across every test record.
     pub patch_decorator_count: u64,
@@ -331,10 +337,9 @@ fn try_collect_test_function(
 ) {
     if let Some(name) = node_name(func, source) {
         if name.starts_with("test_") {
-            let (record, mock_constructions) =
-                build_record(func, decorated, name, source, file_path, class, imports);
+            let record = build_record(func, decorated, name, source, file_path, class, imports);
             out.mock_construction_count =
-                out.mock_construction_count.saturating_add(mock_constructions);
+                out.mock_construction_count.saturating_add(record.mock_construction_count);
             out.patch_decorator_count =
                 out.patch_decorator_count.saturating_add(record.patch_decorator_count);
             // `stubs_count` is per-test (lives on `TestRecord`); the file
@@ -355,10 +360,6 @@ fn node_name<'a>(node: Node<'_>, source: &'a [u8]) -> Option<&'a str> {
 
 /// Build a [`TestRecord`] from a `function_definition` node plus the
 /// surrounding `decorated_definition` (if any).
-///
-/// Returns the record plus the count of mock-constructor call sites in
-/// the test body, which is aggregated at file level (no per-test field
-/// exists for it on `TestRecord`).
 fn build_record(
     func: Node<'_>,
     decorated: Option<Node<'_>>,
@@ -367,7 +368,7 @@ fn build_record(
     file_path: &Path,
     class: ClassContext<'_>,
     imports: &ImportMap,
-) -> (TestRecord, u64) {
+) -> TestRecord {
     // tree-sitter rows are zero-indexed `usize`. On every supported target
     // `usize` is at most 64 bits, so the cast is exact; `saturating_add`
     // converts to a 1-indexed line number without surfacing a bogus
@@ -411,16 +412,28 @@ fn build_record(
             + bare_mock_asserts.len()) as u64;
     let only_asserts_on_mock = assertion_count > 0 && mock_assertion_count == assertion_count;
 
+    // Each call head resolved once to its Mock-API name, if it has one.
+    let mock_api_heads: Vec<String> =
+        calls.iter().filter_map(|c| mock_api_call_name(*c, source, imports)).collect();
     let mock_construction_count =
-        calls.iter().filter(|c| call_head_is_mock_constructor(**c, source)).count() as u64;
+        mock_api_heads.iter().filter(|h| is_mock_construction_call(h)).count() as u64;
 
     // Fixture-driven stub call sites in this test's body. Walks the same
     // `calls` vector — no extra tree walk.
-    let stubs_count = calls
+    let stub_heads: Vec<String> = calls
         .iter()
         .filter_map(|c| call_head_chain(*c, source))
         .filter(|h| is_stub_call_head(h))
-        .count() as u64;
+        .collect();
+    let stubs_count = stub_heads.len() as u64;
+
+    // Patches installed in the body rather than by a decorator. Each one is
+    // also a construction (`with patch(...)`) or a stub (`mocker.patch(...)`)
+    // above; this count exists so the patch term can score them, not to be
+    // summed with those.
+    let patch_call_count = (mock_api_heads.iter().filter(|h| is_patch_call(h)).count()
+        + stub_heads.iter().filter(|h| is_mocker_patch_head(h)).count())
+        as u64;
 
     let called_names = called_names_for_test(&calls, source);
 
@@ -432,7 +445,7 @@ fn build_record(
     let verification_sites = external_verification_sites(&calls, body, source, imports, &shadowed);
     let external_verification_count = verification_sites.len() as u64;
 
-    let patch_decorator_count = decorated.map_or(0, |d| count_patch_decorators(d, source));
+    let patch_decorator_count = decorated.map_or(0, |d| count_patch_decorators(d, source, imports));
 
     let assertion_sites: Vec<Node<'_>> =
         asserts.iter().chain(&raises_blocks).chain(&bare_mock_asserts).copied().collect();
@@ -466,7 +479,7 @@ fn build_record(
         }
     };
 
-    let record = TestRecord {
+    TestRecord {
         nodeid,
         file: file_path.to_path_buf(),
         line,
@@ -474,6 +487,8 @@ fn build_record(
         only_asserts_on_mock,
         mock_assertion_count,
         patch_decorator_count,
+        patch_call_count,
+        mock_construction_count,
         stubs_count,
         setup_to_assertion_ratio,
         external_verification_count,
@@ -482,8 +497,7 @@ fn build_record(
         suspicion_score: 0.0,
         fingerprint,
         accepted_signals: Vec::new(),
-    };
-    (record, mock_construction_count)
+    }
 }
 
 /// Compute `setup_to_assertion_ratio` per the locked Run 3 definition,
@@ -1021,40 +1035,24 @@ fn last_named_child_row(node: Node<'_>) -> Option<usize> {
     last.map(|n| n.start_position().row)
 }
 
-/// True iff the `call_expression`'s `function` child has a head name
-/// (bare identifier or first segment of an attribute chain) that matches
-/// one of the known Mock-API constructors.
-fn call_head_is_mock_constructor(call: Node<'_>, source: &[u8]) -> bool {
-    let Some(func) = call.child_by_field_name("function") else {
-        return false;
-    };
-    match func.kind() {
-        "identifier" => func.utf8_text(source).is_ok_and(is_mock_constructor),
-        "attribute" => {
-            // For `mock.patch(...)` the head segment is `mock`; for our
-            // strict semantics we treat only an exact head match against
-            // the constructor set as a mock construction. This keeps
-            // `repo.save(...)` out of the count and avoids double-counting
-            // `mock.patch(...)` calls (the `@patch` decorator pathway
-            // captures decorator usage separately).
-            head_identifier(func, source).is_some_and(|h| is_mock_constructor(h) && h != "patch")
-        }
-        _ => false,
-    }
+/// The Mock-API name a call's head resolves to, for matching against
+/// [`crate::mock_api`]'s canonical sets: the head chain canonicalized
+/// through the file's import map when its head is bound
+/// (`mock.Mock` → `unittest.mock.Mock` under `from unittest import mock`),
+/// or qualified with the stdlib module when the head is an unbound
+/// Mock-API export (`Mock` under a star import). `None` when the head is an
+/// unbound name of anything else — `factory.Mock`, a local `mock`.
+fn mock_api_call_name(call: Node<'_>, source: &[u8], imports: &ImportMap) -> Option<String> {
+    let chain = call_head_chain(call, source)?;
+    resolve_mock_api_chain(&chain, imports)
 }
 
-/// Walk down an `attribute` node until the leftmost identifier is reached,
-/// returning that identifier's text.
-fn head_identifier<'a>(mut node: Node<'_>, source: &'a [u8]) -> Option<&'a str> {
-    loop {
-        match node.kind() {
-            "identifier" => return node.utf8_text(source).ok(),
-            "attribute" => {
-                let object = node.child_by_field_name("object")?;
-                node = object;
-            }
-            _ => return None,
-        }
+/// [`mock_api_call_name`] for an already-rendered dotted chain.
+fn resolve_mock_api_chain(chain: &str, imports: &ImportMap) -> Option<String> {
+    if imports.aliases.contains_key(dotted_head(chain)) {
+        Some(canonicalize_called_name(chain, imports))
+    } else {
+        qualify_unbound_mock_name(chain)
     }
 }
 
@@ -1110,14 +1108,27 @@ fn called_names_for_test(calls: &[Node<'_>], source: &[u8]) -> Vec<String> {
 ///   identifier is `patch`)
 /// - the same forms when used as call expressions: `@patch('a')`,
 ///   `@mock.patch('a')`, `@patch.object(SomeClass, 'method')`.
-fn count_patch_decorators(decorated: Node<'_>, source: &[u8]) -> u64 {
+fn count_patch_decorators(decorated: Node<'_>, source: &[u8], imports: &ImportMap) -> u64 {
     let mut count: u64 = 0;
     for decorator in decorator_nodes(decorated) {
-        if decorator_is_patch(decorator, source) {
+        if decorator_is_patch(decorator, source)
+            || decorator_resolves_to_patch(decorator, source, imports)
+        {
             count = count.saturating_add(1);
         }
     }
     count
+}
+
+/// True iff a decorator's target resolves through the import map to a
+/// patch: `@mock.patch.object(...)` under `from unittest import mock`, which
+/// the shape test in [`decorator_is_patch`] misses (neither end of the chain
+/// is `patch`).
+fn decorator_resolves_to_patch(decorator: Node<'_>, source: &[u8], imports: &ImportMap) -> bool {
+    decorator_target(decorator)
+        .and_then(|t| attribute_chain_text(t, source))
+        .and_then(|chain| resolve_mock_api_chain(&chain, imports))
+        .is_some_and(|canonical| is_patch_call(&canonical))
 }
 
 /// Walk a `decorator` node and decide whether its decorator-expression is
@@ -3034,5 +3045,170 @@ def test_x(monkeypatch):
         assert_eq!(parsed.mock_construction_count, 1);
         assert_eq!(parsed.stubs_count, 1);
         assert_eq!(parsed.test_functions[0].stubs_count, 1);
+    }
+
+    // ---- Mock counting independent of spelling (constructors, patches) ----
+
+    #[test]
+    fn mock_constructors_resolve_through_the_import_map() {
+        let src = "\
+import unittest.mock
+from unittest import mock
+from unittest.mock import MagicMock as MM
+
+def test_x():
+    a = mock.Mock()
+    b = mock.MagicMock()
+    c = unittest.mock.AsyncMock()
+    d = MM()
+    e = mock.create_autospec(Service)
+    assert a is not b
+";
+        let parsed = parse_full(src);
+        assert_eq!(parsed.mock_construction_count, 5);
+        assert_eq!(parsed.test_functions[0].mock_construction_count, 5);
+    }
+
+    #[test]
+    fn backport_mock_module_constructors_count() {
+        let src = "\
+import mock
+
+def test_x():
+    a = mock.Mock()
+    b = mock.MagicMock()
+    assert a is not b
+";
+        assert_eq!(parse_full(src).mock_construction_count, 2);
+    }
+
+    #[test]
+    fn unrelated_constructor_lookalikes_do_not_count() {
+        // `factory.Mock()` has an unrelated receiver; `Mock` imported from
+        // a project module is not the Mock API; `mock` that no import binds
+        // is a local name (`mock = Mock()` is common), not the module.
+        let src = "\
+from myproj.fakes import Mock as ProjectMock
+from myproj import Mock
+
+def test_x(mock):
+    a = factory.Mock()
+    b = Mock()
+    c = mock.Mock()
+    d = ProjectMock()
+    assert a
+";
+        let parsed = parse_full(src);
+        assert_eq!(parsed.mock_construction_count, 0);
+        assert_eq!(parsed.test_functions[0].mock_construction_count, 0);
+    }
+
+    #[test]
+    fn unimported_bare_constructors_still_count() {
+        // A star import or a conftest-provided name leaves `Mock` unbound in
+        // the import map; the bare Mock-API spelling still counts.
+        let src = "\
+from unittest.mock import *
+
+def test_x():
+    a = Mock()
+    with patch.object(Foo, 'bar'):
+        assert a
+";
+        assert_eq!(parse_full(src).mock_construction_count, 2);
+    }
+
+    #[test]
+    fn mock_construction_count_is_stored_per_test() {
+        let src = "\
+def test_a():
+    a = Mock()
+    assert a
+
+def test_b():
+    a = Mock()
+    b = MagicMock()
+    assert a
+";
+        let parsed = parse_full(src);
+        assert_eq!(parsed.test_functions[0].mock_construction_count, 1);
+        assert_eq!(parsed.test_functions[1].mock_construction_count, 2);
+        assert_eq!(parsed.mock_construction_count, 3);
+    }
+
+    #[test]
+    fn patch_calls_count_whatever_the_spelling() {
+        let src = "\
+from unittest import mock
+from unittest.mock import patch
+
+@patch('a.one')
+def test_x(one, mocker):
+    with patch('a.two'):
+        pass
+    with mock.patch('a.three'), patch.object(Foo, 'bar'):
+        pass
+    with mock.patch.dict('os.environ', {}):
+        pass
+    mocker.patch('a.four')
+    mocker.patch.object(Foo, 'baz')
+    assert one
+";
+        let t = &parse(src)[0];
+        assert_eq!(t.patch_decorator_count, 1);
+        // Four `with` patches plus two `mocker.patch*` calls.
+        assert_eq!(t.patch_call_count, 6);
+        // Each patch lands in exactly one term of the `mock_overuse` sum:
+        // decorator → patch_decorator_count, unittest patch call →
+        // mock_construction_count, mocker.patch* → stubs_count.
+        assert_eq!(t.mock_construction_count, 4);
+        assert_eq!(t.stubs_count, 2);
+    }
+
+    #[test]
+    fn unrelated_patch_calls_do_not_count() {
+        // `requests.patch(url)` is an HTTP verb; `patch.stopall()` installs
+        // nothing; `helpers.patch_config()` is not `patch`.
+        let src = "\
+import requests
+
+def test_x():
+    requests.patch('http://x')
+    patch.stopall()
+    helpers.patch_config()
+    assert True
+";
+        let t = &parse(src)[0];
+        assert_eq!(t.patch_call_count, 0);
+        assert_eq!(t.mock_construction_count, 0);
+    }
+
+    #[test]
+    fn resolved_patch_object_decorator_counts() {
+        let src = "\
+from unittest import mock
+
+@mock.patch.object(Foo, 'bar')
+@mock.patch.dict('os.environ', {})
+def test_x(bar):
+    assert bar
+";
+        assert_eq!(parse(src)[0].patch_decorator_count, 2);
+    }
+
+    #[test]
+    fn mocker_constructor_heads_are_stubs() {
+        let src = "\
+def test_x(mocker):
+    a = mocker.Mock()
+    b = mocker.MagicMock()
+    c = mocker.AsyncMock()
+    d = mocker.create_autospec(Service)
+    assert a
+";
+        let t = &parse(src)[0];
+        assert_eq!(t.stubs_count, 4);
+        assert_eq!(t.mock_construction_count, 0, "stubs and constructions stay disjoint");
+        assert_eq!(t.patch_call_count, 0);
     }
 }

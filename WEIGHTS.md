@@ -14,12 +14,13 @@ Per-test score:
 
 ```text
 score = w_mock_only      * (only_asserts_on_mock ? 1.0 : 0.0)
-      + w_patch_count    * min(patch_decorator_count / 5.0, 1.0)
+      + w_patch_count    * min(patches / 5.0, 1.0)
       + w_setup_ratio    * sigmoid((setup_to_assertion_ratio - 8.0) / 4.0)
       + w_zero_asserts   * (unverified ? 1.0 : 0.0)
       + w_smell_density  * min(smell_hits.len() / 3.0, 1.0)
 
 unverified = assertion_count == 0 && external_verification_count == 0
+patches    = patch_decorator_count + patch_call_count
 ```
 
 `sigmoid(x) = 1.0 / (1.0 + e^-x)`.
@@ -29,7 +30,7 @@ unverified = assertion_count == 0 && external_verification_count == 0
 | Weight | Value | Rationale |
 |---|---|---|
 | `w_mock_only` | `0.35` | Strongest single signal — a test whose only assertions target the Mock API is exercising the test double itself, not production logic. |
-| `w_patch_count` | `0.20` | High-density `@patch` decorators flag tests where the System Under Test has been replaced wholesale; saturates at 5 to avoid runaway scores on extreme outliers. |
+| `w_patch_count` | `0.20` | High patch density flags tests where the System Under Test has been replaced wholesale; saturates at 5 to avoid runaway scores on extreme outliers. Counts every patch the test installs — `@patch` decorators, `with patch(...)` / `patch.object(...)` in the body, `mocker.patch*` — so the spelling does not change the score. |
 | `w_setup_ratio` | `0.15` | Long setup before the first assertion correlates with brittle tests that drift from their intent; sigmoid keeps the term smooth and bounded. |
 | `w_zero_asserts` | `0.20` | A test that verifies nothing cannot fail by intent — it survives only by not raising. Weight is high but slightly below `w_mock_only` because such tests are often vestigial smoke tests rather than mock-theater. The term is gated on `unverified`, not on `assertion_count` alone: a test that checks a child process's exit status does fail by intent. |
 | `w_smell_density` | `0.10` | Re-uses information already captured by other heuristics, so weighted lowest — but a test that trips multiple smells should rank above one that trips none. |
@@ -101,10 +102,10 @@ saturates each saturating sub-metric reaches a score of 1.0.
   denominator is `1` — the result is the body height. This naturally
   pushes setup-heavy unverified tests up the ranking, complementing the
   `w_zero_asserts` term.
-- `patch_decorator_count` saturates at **5**: the term becomes `1.0`
-  once a test has five or more `@patch`-shaped decorators. Five is the
-  point past which incremental decorators add no new signal — the test
-  is already maximally mock-mediated.
+- `patches` saturates at **5**: the term becomes `1.0` once a test
+  installs five or more patches, by decorator or in the body. Five is the
+  point past which incremental patches add no new signal — the test is
+  already maximally mock-mediated.
 - `smell_hits.len()` saturates at **3**: three smell categories on a
   single test is enough to flag it; the term is the same at three and at
   ten.
@@ -133,32 +134,42 @@ Its v1 thresholds:
 
 ### `mocks` decomposition
 
-The numerator of `mock_overuse` is a sum of three independent signals:
+The numerator of `mock_overuse` is a sum of three **disjoint** counts. The
+same sum is used at test scope and at file scope (where each count is the
+sum over the file's tests).
 
-- `mock_construction_count` — bare constructor calls to
-  `Mock` / `MagicMock` / `AsyncMock` / `create_autospec` /
-  `patch(...)`-as-context-manager inside a test body. Counted at file
-  scope only; not stored per-test.
-- `patch_decorator_count` — `@patch` / `@mock.patch` / `@patch.object`
-  / `@<x>.patch` decorators on a test function. Counted both per-test
-  (decorators belong to a specific test) and per-file (sum across tests).
-- `stubs_count` — fixture-driven patch calls whose dotted call-head
-  matches `STUB_HEADS` (`monkeypatch.setattr`, `monkeypatch.setenv`,
+- `mock_construction_count` — calls in a test body whose head resolves,
+  through the file's imports, to `Mock` / `MagicMock` / `AsyncMock` /
+  `create_autospec` / `patch` / `patch.object` / `patch.dict` /
+  `patch.multiple` in `unittest.mock` or the `mock` backport. A bare name no
+  import binds (star import, conftest) is assumed to be `unittest.mock`'s
+  when it is itself one of those names; any other unbound head
+  (`factory.Mock`, a local `mock`) is not counted.
+- `patch_decorator_count` — `@patch`-shaped decorators on the test
+  function: `@patch`, `@<x>.patch`, `@patch.<attr>`, or any decorator
+  resolving to a `patch*` variant (`@mock.patch.object`).
+- `stubs_count` — fixture-driven calls whose dotted call-head matches
+  `STUB_HEADS` (`monkeypatch.setattr`, `monkeypatch.setenv`,
   `monkeypatch.delattr`, `monkeypatch.delenv`, `monkeypatch.context`,
   `monkeypatch.syspath_prepend`, `monkeypatch.chdir`, `mocker.patch`,
   `mocker.patch.object`, `mocker.patch.dict`, `mocker.patch.multiple`,
-  `mocker.spy`, `mocker.stub`, `mocker.MagicMock`). Counted both
-  per-test and per-file. Stubs are structurally distinct from
-  `unittest.mock` constructions: they rewire the system under test from
-  the outside via pytest's `monkeypatch` / `mocker` fixtures rather
-  than instantiating a `Mock()` directly.
+  `mocker.spy`, `mocker.stub`, `mocker.Mock`, `mocker.MagicMock`,
+  `mocker.AsyncMock`, `mocker.create_autospec`). The `mocker` fixture is
+  not an import, so these are matched as written and never overlap the
+  construction count.
 
-At file scope `mock_overuse` consumes
-`mock_construction_count + patch_decorator_count + stubs_count`. At
-per-test scope it consumes `patch_decorator_count + stubs_count` only —
-body-level `Mock()` constructions are not stored on `TestRecord`, so
-the per-test predicate intentionally covers decorator-driven and
-fixture-driven patching only.
+A fourth count, `patch_call_count`, feeds the **patch term** only. It is
+the body-level patches — the `patch*` subset of `mock_construction_count`
+plus the `mocker.patch*` subset of `stubs_count` — and is never added to
+`mocks`. That gives every patch the same footprint whatever its spelling:
+
+| Spelling | Patch term input | `mocks` term |
+|---|---|---|
+| `@patch("a.b")` | `patch_decorator_count` | `patch_decorator_count` |
+| `with patch("a.b"):` / `patch.object(...)` | `patch_call_count` | `mock_construction_count` |
+| `mocker.patch("a.b")` | `patch_call_count` | `stubs_count` |
+| `Mock()` / `mock.MagicMock()` | — | `mock_construction_count` |
+| `mocker.MagicMock()` / `monkeypatch.setattr(...)` | — | `stubs_count` |
 
 ## File-level score
 

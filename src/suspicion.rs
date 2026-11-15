@@ -66,7 +66,7 @@ pub const DEFAULT: SuspicionWeights = SuspicionWeights {
 ///
 /// ```text
 /// score = w_mock_only     * (only_asserts_on_mock ? 1.0 : 0.0)
-///       + w_patch_count   * min(patch_decorator_count / 5.0, 1.0)
+///       + w_patch_count   * min((patch_decorator_count + patch_call_count) / 5.0, 1.0)
 ///       + w_setup_ratio   * sigmoid((setup_to_assertion_ratio - SETUP_RATIO_INFLECTION)
 ///                                     / SETUP_RATIO_SCALE)
 ///       + w_zero_asserts  * (unverified ? 1.0 : 0.0)
@@ -90,7 +90,8 @@ pub const DEFAULT: SuspicionWeights = SuspicionWeights {
 pub fn score_test(test: &TestRecord, weights: &SuspicionWeights) -> f64 {
     let mock_only_term = if test.only_asserts_on_mock { weights.w_mock_only } else { 0.0 };
 
-    let patch_ratio = (test.patch_decorator_count as f64 / 5.0).min(1.0);
+    let patches = test.patch_decorator_count.saturating_add(test.patch_call_count);
+    let patch_ratio = (patches as f64 / 5.0).min(1.0);
     let patch_term = weights.w_patch_count * patch_ratio;
 
     let setup_term = weights.w_setup_ratio
@@ -177,6 +178,8 @@ mod tests {
             only_asserts_on_mock: false,
             mock_assertion_count: 0,
             patch_decorator_count: 0,
+            patch_call_count: 0,
+            mock_construction_count: 0,
             stubs_count: 0,
             setup_to_assertion_ratio: 0.0,
             external_verification_count: 0,
@@ -251,6 +254,32 @@ mod tests {
         let sa = score_test(&a, &DEFAULT);
         let sb = score_test(&b, &DEFAULT);
         assert!(approx_eq(sa, sb), "patch_count term must saturate at 5: {sa} vs {sb}");
+    }
+
+    #[test]
+    fn patch_calls_score_like_patch_decorators() {
+        // A `with patch(...)` / `mocker.patch(...)` contributes exactly what
+        // a `@patch` decorator does, and the two add up toward saturation.
+        let mut decorated = make_test("a");
+        decorated.patch_decorator_count = 2;
+        let mut called = make_test("b");
+        called.patch_call_count = 2;
+        let mut mixed = make_test("c");
+        mixed.patch_decorator_count = 1;
+        mixed.patch_call_count = 1;
+        let sd = score_test(&decorated, &DEFAULT);
+        assert!(approx_eq(sd, score_test(&called, &DEFAULT)));
+        assert!(approx_eq(sd, score_test(&mixed, &DEFAULT)));
+        let mut none = make_test("d");
+        none.patch_decorator_count = 0;
+        assert!(approx_eq(sd - score_test(&none, &DEFAULT), DEFAULT.w_patch_count * 2.0 / 5.0));
+
+        let mut saturated = make_test("e");
+        saturated.patch_decorator_count = 3;
+        saturated.patch_call_count = 7;
+        let mut five = make_test("f");
+        five.patch_decorator_count = 5;
+        assert!(approx_eq(score_test(&saturated, &DEFAULT), score_test(&five, &DEFAULT)));
     }
 
     #[test]

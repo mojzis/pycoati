@@ -66,6 +66,22 @@ pub(crate) const MOCK_ASSERTION_HELPERS: &[&str] = &["call", "ANY"];
 pub const MOCK_CONSTRUCTORS: &[&str] =
     &["Mock", "MagicMock", "AsyncMock", "create_autospec", "patch"];
 
+/// The Mock-API module a bare, import-unbound Mock-API name is assumed to
+/// come from — `Mock()` under `from unittest.mock import *`, or provided by
+/// a `conftest.py` the parser cannot see.
+const ASSUMED_MOCK_MODULE: &str = "unittest.mock";
+
+/// `patch` and the attribute forms of it that install a double at a target.
+/// Relative to a [`MOCK_MODULES`] module. `patch.stopall` and friends are
+/// deliberately absent: they install nothing.
+pub(crate) const PATCH_VARIANTS: &[&str] =
+    &["patch", "patch.object", "patch.dict", "patch.multiple"];
+
+/// The `pytest-mock` call-head every fixture-driven patch lives under:
+/// `mocker.patch`, `mocker.patch.object`, … — the [`STUB_HEADS`] entries at
+/// or under it are patches, the rest are not.
+const MOCKER_PATCH_HEAD: &str = "mocker.patch";
+
 /// Stub-API dotted call-heads.
 ///
 /// Fixture-driven patching is structurally distinct from `unittest.mock`
@@ -95,7 +111,10 @@ pub(crate) const STUB_HEADS: &[&str] = &[
     "mocker.patch.multiple",
     "mocker.spy",
     "mocker.stub",
+    "mocker.Mock",
     "mocker.MagicMock",
+    "mocker.AsyncMock",
+    "mocker.create_autospec",
 ];
 
 /// True iff `name` matches a Mock-API attribute (exact, case-sensitive).
@@ -144,6 +163,44 @@ pub(crate) fn chain_constructs_a_mock(chain: &str) -> bool {
 #[inline]
 pub fn is_mock_constructor(name: &str) -> bool {
     MOCK_CONSTRUCTORS.contains(&name)
+}
+
+/// Qualify a raw call chain whose head no import binds with
+/// [`ASSUMED_MOCK_MODULE`], when that head is itself a Mock-API export
+/// (`Mock`, `patch`, …). `None` for any other unbound head: `factory.Mock`
+/// or a local `mock` variable says nothing about the Mock API.
+pub(crate) fn qualify_unbound_mock_name(chain: &str) -> Option<String> {
+    let head = chain.split_once('.').map_or(chain, |(h, _)| h);
+    is_mock_constructor(head).then(|| format!("{ASSUMED_MOCK_MODULE}.{chain}"))
+}
+
+/// The part of a canonical name after its [`MOCK_MODULES`] prefix:
+/// `unittest.mock.patch.object` → `patch.object`, `mock.Mock` → `Mock`.
+fn strip_mock_module(canonical: &str) -> Option<&str> {
+    MOCK_MODULES
+        .iter()
+        .find_map(|module| canonical.strip_prefix(module).and_then(|r| r.strip_prefix('.')))
+}
+
+/// True iff a canonical call-head constructs a Mock-API object: a
+/// [`MOCK_CONSTRUCTORS`] entry or a [`PATCH_VARIANTS`] entry in a
+/// [`MOCK_MODULES`] module. `unittest.mock.Mock`, `mock.MagicMock`,
+/// `unittest.mock.patch.object` match; `myproj.Mock` does not.
+pub(crate) fn is_mock_construction_call(canonical: &str) -> bool {
+    strip_mock_module(canonical)
+        .is_some_and(|rest| is_mock_constructor(rest) || PATCH_VARIANTS.contains(&rest))
+}
+
+/// True iff a canonical call-head installs a patch: a [`PATCH_VARIANTS`]
+/// entry in a [`MOCK_MODULES`] module.
+pub(crate) fn is_patch_call(canonical: &str) -> bool {
+    strip_mock_module(canonical).is_some_and(|rest| PATCH_VARIANTS.contains(&rest))
+}
+
+/// True iff a raw call-head is a `pytest-mock` patch: a [`STUB_HEADS`]
+/// entry at or under [`MOCKER_PATCH_HEAD`].
+pub(crate) fn is_mocker_patch_head(head: &str) -> bool {
+    is_stub_call_head(head) && is_at_or_under(head, MOCKER_PATCH_HEAD)
 }
 
 /// True iff `head` matches one of the fixture-driven stub call-heads in
@@ -252,6 +309,51 @@ mod tests {
             "mocker.MagicMock",
         ] {
             assert!(is_stub_call_head(head), "{head} should be a stub call-head");
+        }
+    }
+
+    #[test]
+    fn construction_and_patch_calls_need_a_mock_module() {
+        for c in [
+            "unittest.mock.Mock",
+            "unittest.mock.MagicMock",
+            "unittest.mock.AsyncMock",
+            "unittest.mock.create_autospec",
+            "unittest.mock.patch",
+            "unittest.mock.patch.object",
+            "mock.Mock",
+            "mock.patch.dict",
+        ] {
+            assert!(is_mock_construction_call(c), "{c} constructs a mock");
+        }
+        for c in ["Mock", "myproj.Mock", "mockery.Mock", "unittest.mock.patch.stopall", "x.Mock"] {
+            assert!(!is_mock_construction_call(c), "{c} does not construct a mock");
+        }
+        assert!(is_patch_call("unittest.mock.patch.multiple"));
+        assert!(!is_patch_call("unittest.mock.Mock"));
+        assert!(!is_patch_call("requests.patch"));
+    }
+
+    #[test]
+    fn only_mock_api_heads_are_qualified_when_unbound() {
+        assert_eq!(qualify_unbound_mock_name("Mock").as_deref(), Some("unittest.mock.Mock"));
+        assert_eq!(
+            qualify_unbound_mock_name("patch.object").as_deref(),
+            Some("unittest.mock.patch.object")
+        );
+        assert_eq!(qualify_unbound_mock_name("mock.Mock"), None);
+        assert_eq!(qualify_unbound_mock_name("factory.Mock"), None);
+    }
+
+    #[test]
+    fn mocker_patch_heads_are_the_patch_subset_of_stubs() {
+        for h in
+            ["mocker.patch", "mocker.patch.object", "mocker.patch.dict", "mocker.patch.multiple"]
+        {
+            assert!(is_mocker_patch_head(h), "{h}");
+        }
+        for h in ["mocker.spy", "mocker.MagicMock", "monkeypatch.setattr", "mocker.patcher"] {
+            assert!(!is_mocker_patch_head(h), "{h}");
         }
     }
 

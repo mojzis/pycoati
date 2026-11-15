@@ -169,10 +169,24 @@ pub struct TestRecord {
     /// every non-literal argument is one (`self.assertEqual(m.call_count, 1)`).
     pub mock_assertion_count: u64,
     pub patch_decorator_count: u64,
+    /// Patches this test installs other than through a decorator: a call in
+    /// the body resolving to `unittest.mock.patch` / `patch.object` /
+    /// `patch.dict` / `patch.multiple` (or the `mock` backport's), typically
+    /// as a context manager, plus `mocker.patch*` fixture calls. Feeds the
+    /// patch term of `suspicion_score` beside `patch_decorator_count`, so a
+    /// patch scores the same whichever way it is spelled. Not part of the
+    /// `mock_overuse` sum: each of these sites is already counted there once,
+    /// through `mock_construction_count` or `stubs_count`.
+    pub patch_call_count: u64,
+    /// Mock-API constructions in this test's body: calls resolving, through
+    /// the file's imports, to `Mock` / `MagicMock` / `AsyncMock` /
+    /// `create_autospec` / `patch*` in `unittest.mock` or the `mock`
+    /// backport. Feeds the per-test `mock_overuse` smell.
+    pub mock_construction_count: u64,
     /// Number of fixture-driven stub-API call sites in this test's body.
     /// At per-test scope, `mock_overuse` consumes
-    /// `(patch_decorator_count + stubs_count)` — body-level Mock-API
-    /// constructions remain a file-scope signal only.
+    /// `(mock_construction_count + patch_decorator_count + stubs_count)`,
+    /// the same sum as at file scope.
     pub stubs_count: u64,
     pub setup_to_assertion_ratio: f64,
     /// Call sites in this test's body that verify an outcome the test body

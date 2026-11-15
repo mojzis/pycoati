@@ -52,12 +52,13 @@ pub fn derive_test_smells(test: &TestRecord, config: &MockSmellConfig) -> Vec<Sm
         });
     }
 
-    // Per-test `mock_overuse` consumes `(patch_decorator_count + stubs_count)`.
-    // Body-level `mock_construction_count` is deliberately a file-only signal
-    // (the AST count lives on `FileRecord`, not `TestRecord`); the per-test
-    // smell therefore covers decorator-driven and fixture-driven patching
-    // and leaves bare `Mock()`/`MagicMock()` constructions to the file scope.
-    let test_mocks = test.patch_decorator_count.saturating_add(test.stubs_count);
+    // Per-test `mock_overuse` consumes the same three disjoint counts as the
+    // file scope. `patch_call_count` is deliberately absent: every site it
+    // counts is already in `mock_construction_count` or `stubs_count`.
+    let test_mocks = test
+        .mock_construction_count
+        .saturating_add(test.patch_decorator_count)
+        .saturating_add(test.stubs_count);
     if mock_overuse_fires(test_mocks, test.assertion_count, config) {
         hits.push(SmellHit {
             category: "mock_overuse".to_string(),
@@ -140,6 +141,8 @@ mod tests {
             only_asserts_on_mock: false,
             mock_assertion_count: 0,
             patch_decorator_count: 0,
+            patch_call_count: 0,
+            mock_construction_count: 0,
             stubs_count: 0,
             setup_to_assertion_ratio: 0.0,
             external_verification_count: 0,
@@ -284,6 +287,29 @@ mod tests {
         let hits = derive_test_smells(&t, &MockSmellConfig::default());
         let mo = hits.iter().find(|h| h.category == "mock_overuse").expect("mock_overuse hit");
         assert_eq!(mo.evidence, "4 mocks, 1 assertions");
+    }
+
+    #[test]
+    fn per_test_mock_overuse_consumes_mock_construction_count() {
+        // Three body-level `Mock()` constructions, one assert, nothing else:
+        // the per-test sum matches the file-scope one.
+        let mut t = make_test("a::t");
+        t.mock_construction_count = 3;
+        t.assertion_count = 1;
+        let hits = derive_test_smells(&t, &MockSmellConfig::default());
+        let mo = hits.iter().find(|h| h.category == "mock_overuse").expect("mock_overuse hit");
+        assert_eq!(mo.evidence, "3 mocks, 1 assertions");
+    }
+
+    #[test]
+    fn per_test_mock_overuse_ignores_patch_call_count() {
+        // `patch_call_count` re-counts sites already in the construction and
+        // stub counts; adding it to the sum would count them twice.
+        let mut t = make_test("a::t");
+        t.patch_call_count = 10;
+        t.assertion_count = 1;
+        let hits = derive_test_smells(&t, &MockSmellConfig::default());
+        assert!(hits.iter().all(|h| h.category != "mock_overuse"), "{hits:?}");
     }
 
     #[test]
