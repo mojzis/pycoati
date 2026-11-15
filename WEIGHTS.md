@@ -2,8 +2,8 @@
 
 `pycoati`'s `suspicion_score` blends five static heuristics into a single
 number per test in `[0.0, 0.80)` (see [Reachable range](#reachable-range)),
-plus a small `mock_construction` bonus per file. The values below are the v1 defaults that ship in
-`src/suspicion.rs::DEFAULT`; they are **heuristic starting points**, not
+plus a small `mock_construction` bonus per file. The values below are the
+v1 defaults that ship in `src/suspicion.rs::DEFAULT`; they are **heuristic starting points**, not
 empirically tuned constants. Treat the formula as the contract and the
 numbers as defaults you may want to revise after running pycoati on a real
 project (see [How to revise](#how-to-revise)).
@@ -121,8 +121,10 @@ Changing a weight changes these bounds; recompute them from the table.
   `external_verification_count` it stays out of `assertion_count`; unlike
   it, each site is a full non-mock assertion: it switches off
   `w_zero_asserts`, disqualifies `only_asserts_on_mock` (so `w_mock_only`
-  is off), and is an assertion site for `setup_to_assertion_ratio`. It is
-  not part of the `mock_overuse` denominator.
+  is off), is an assertion site for `setup_to_assertion_ratio`, and counts
+  in the `mock_overuse` denominator (`asserts`, below). Sites inside a
+  nested `def` / `lambda` the test may never call are not counted, and a
+  local rebinding of a helper's name (`check = lambda x: None`) shadows it.
 - `setup_to_assertion_ratio` (locked, Run 3; extended to raises blocks
   and to external verification): when at least one effective assertion
   exists in the body, `(first_effective_line - def_line) /
@@ -171,6 +173,10 @@ Its v1 thresholds:
   sum defined below.
 - Both predicates use strict `>` semantics — a 2-mock-2-assert test sits
   on the boundary and does **not** fire.
+- `asserts` is `assertion_count + helper_assertion_count` — summed over the
+  file's tests at file scope. A test that verifies through
+  `assert_frame_equal` balances its mocks exactly as one using `assert`
+  does.
 
 ### `mocks` decomposition
 

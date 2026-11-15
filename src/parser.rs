@@ -170,13 +170,18 @@ struct ClassContext<'a> {
     /// Module-level classes that are `unittest.TestCase` subclasses,
     /// directly or through a same-file base chain.
     test_cases: &'a BTreeSet<String>,
+    /// Names of every module-level `def` and `class`. They shadow a
+    /// Mock-API name of the same spelling (`class Mock:` in the test file).
+    module_names: &'a BTreeSet<String>,
     /// Name prefix a function needs to be collected here: pytest's `test_`
     /// by default, unittest's `test` inside a `TestCase` subclass.
     test_prefix: &'static str,
 }
 
-/// Test-function name prefix pytest collects at module level and in
-/// `Test*` classes, as this parser applies it.
+/// Test-function name prefix collected at module level and in `Test*`
+/// classes. Deliberately narrower than pytest's own default
+/// (`python_functions = test`, which also takes `def testfoo()`); the
+/// historical rule, kept so existing inventories do not shift.
 const PYTEST_TEST_PREFIX: &str = "test_";
 
 /// Test-method name prefix `unittest`'s loader collects in a `TestCase`
@@ -202,13 +207,18 @@ static EMPTY_NAMES: BTreeSet<String> = BTreeSet::new();
 impl<'a> ClassContext<'a> {
     /// A module-level test: no nodeid prefix, no class-installed doubles,
     /// no methods — only the module's helpers.
-    fn module(module_helpers: &'a BTreeSet<String>, test_cases: &'a BTreeSet<String>) -> Self {
+    fn module(
+        module_helpers: &'a BTreeSet<String>,
+        test_cases: &'a BTreeSet<String>,
+        module_names: &'a BTreeSet<String>,
+    ) -> Self {
         Self {
             prefix: None,
             shadows: &EMPTY_NAMES,
             module_helpers,
             method_helpers: &EMPTY_NAMES,
             test_cases,
+            module_names,
             test_prefix: PYTEST_TEST_PREFIX,
         }
     }
@@ -227,7 +237,8 @@ fn collect_module_tests(
 ) {
     let module_helpers = verifying_helpers(module, source, imports, false);
     let test_cases = test_case_classes(module, source, imports);
-    let module_ctx = ClassContext::module(&module_helpers, &test_cases);
+    let module_names = module_level_names(module, source);
+    let module_ctx = ClassContext::module(&module_helpers, &test_cases, &module_names);
     let mut cursor = module.walk();
     for child in module.children(&mut cursor) {
         match child.kind() {
@@ -278,8 +289,8 @@ fn collect_module_tests(
 /// rule) or it subclasses `unittest.TestCase` (see [`class_is_test_case`]).
 /// In a `TestCase` subclass every `test*` method is collected, as unittest's
 /// loader does; elsewhere `test_*`. Nested classes are collected under the
-/// same rule, but only inside a collected class — pytest recurses no
-/// further — with the nodeid `<file>::Outer::Inner::test_x`.
+/// same rule, but only inside a collected non-`TestCase` class — pytest
+/// recurses no further — with the nodeid `<file>::Outer::Inner::test_x`.
 ///
 /// `parent` is the enclosing scope: the module context, or the outer class
 /// for a nested one. A nested class inherits nothing from its outer class
@@ -317,6 +328,7 @@ fn collect_class_tests(
         module_helpers: parent.module_helpers,
         method_helpers: &method_helpers,
         test_cases: parent.test_cases,
+        module_names: parent.module_names,
         test_prefix: if is_test_case { UNITTEST_TEST_PREFIX } else { PYTEST_TEST_PREFIX },
     };
     let mut cursor = body.walk();
@@ -332,7 +344,9 @@ fn collect_class_tests(
             "function_definition" => try_collect_test_function(
                 definition, decorated, source, file_path, class, imports, out,
             ),
-            "class_definition" => {
+            // pytest's unittest collector yields only the loader's test
+            // names and never recurses into nested classes.
+            "class_definition" if !is_test_case => {
                 collect_class_tests(definition, decorated, source, file_path, class, imports, out);
             }
             _ => {}
@@ -526,35 +540,112 @@ fn with_item_calls(with_stmt: Node<'_>) -> Vec<Node<'_>> {
 }
 
 /// True iff `call` invokes a same-file helper that verifies: a bare name
-/// bound to a verifying module-level function (and not shadowed by one of
-/// the test's own parameters), or `self.<name>` for a verifying method of
+/// bound to a verifying module-level function (and not rebound locally —
+/// see [`locally_bound_names`]), or `self.<name>` for a verifying method of
 /// the enclosing class.
 fn call_is_same_file_helper(
     call: Node<'_>,
     source: &[u8],
     class: ClassContext<'_>,
-    parameters: &BTreeSet<String>,
+    local_names: &BTreeSet<String>,
 ) -> bool {
     let Some(chain) = call_head_chain(call, source) else {
         return false;
     };
     match chain.strip_prefix("self.") {
         Some(method) => class.method_helpers.contains(method),
-        None => class.module_helpers.contains(&chain) && !parameters.contains(&chain),
+        None => class.module_helpers.contains(&chain) && !local_names.contains(&chain),
     }
 }
 
-/// The identifiers a function's parameters bind, `self` included.
-fn parameter_names(func: Node<'_>, source: &[u8]) -> BTreeSet<String> {
-    let Some(params) = func.child_by_field_name("parameters") else {
-        return BTreeSet::new();
+/// Names a test function binds for itself, which shadow any module-level
+/// or imported name of the same spelling: its parameters (`self`
+/// included), and every identifier its body binds — assignment, `for`,
+/// `with … as` / `except … as` and walrus targets, and nested `def` /
+/// `class` names.
+fn locally_bound_names(func: Node<'_>, source: &[u8]) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    if let Some(params) = func.child_by_field_name("parameters") {
+        let mut cursor = params.walk();
+        for param in params.named_children(&mut cursor) {
+            if let Some(name) = parameter_name(param, source) {
+                names.insert(name.to_string());
+            }
+        }
+    }
+    let Some(body) = func.child_by_field_name("body") else {
+        return names;
     };
-    let mut cursor = params.walk();
-    let names = params
-        .named_children(&mut cursor)
-        .filter_map(|p| parameter_name(p, source).map(String::from))
+    for (kind, field) in [
+        ("assignment", "left"),
+        ("for_statement", "left"),
+        ("named_expression", "name"),
+        ("as_pattern", "alias"),
+        ("function_definition", "name"),
+        ("class_definition", "name"),
+    ] {
+        let mut nodes = Vec::new();
+        collect_descendants(body, kind, &mut nodes);
+        for node in nodes {
+            if let Some(target) = node.child_by_field_name(field) {
+                collect_bound_identifiers(target, source, &mut names);
+            }
+        }
+    }
+    names
+}
+
+/// Every identifier a binding target binds: `x`, `a, b`, `(a, [b, c])`, an
+/// `as` target. Attribute and subscript targets (`self.x = …`) bind no
+/// local name and are skipped.
+fn collect_bound_identifiers(target: Node<'_>, source: &[u8], out: &mut BTreeSet<String>) {
+    match target.kind() {
+        "identifier" => {
+            if let Ok(name) = target.utf8_text(source) {
+                out.insert(name.to_string());
+            }
+        }
+        "pattern_list" | "tuple_pattern" | "list_pattern" | "as_pattern_target"
+        | "list_splat_pattern" => {
+            let mut cursor = target.walk();
+            for child in target.named_children(&mut cursor) {
+                collect_bound_identifiers(child, source, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Names of every module-level `def` and `class`, decorated or not.
+fn module_level_names(module: Node<'_>, source: &[u8]) -> BTreeSet<String> {
+    let mut cursor = module.walk();
+    let names = module
+        .children(&mut cursor)
+        .filter_map(|child| match child.kind() {
+            "decorated_definition" => child.child_by_field_name("definition"),
+            _ => Some(child),
+        })
+        .filter(|def| matches!(def.kind(), "function_definition" | "class_definition"))
+        .filter_map(|def| node_name(def, source).map(String::from))
         .collect();
     names
+}
+
+/// True iff `node` sits inside a `def`, `lambda` or `class` nested in the
+/// test body — code the test may define and never run. Scans ancestors up
+/// to `body`.
+fn is_in_nested_scope(node: Node<'_>, body: Node<'_>) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.id() == body.id() {
+            return false;
+        }
+        if matches!(parent.kind(), "function_definition" | "lambda" | "class_definition") {
+            return true;
+        }
+        current = parent;
+    }
+    false
 }
 
 /// Lifecycle hooks that run before a test method and therefore install
@@ -667,14 +758,18 @@ fn build_record(
     if let Some(body_node) = body {
         collect_calls(body_node, &mut calls);
     }
-    let tally = tally_assertions(func, body, &calls, class, source, imports);
+    let local_names = locally_bound_names(func, source);
+    let tally = tally_assertions(body, &calls, class, &local_names, source, imports);
     let only_asserts_on_mock = tally.assertion_count > 0
         && tally.mock_assertion_count == tally.assertion_count
         && tally.helper_assertion_count == 0;
 
     // Each call head resolved once to its Mock-API name, if it has one.
-    let mock_api_heads: Vec<String> =
-        calls.iter().filter_map(|c| mock_api_call_name(*c, source, imports)).collect();
+    let mock_api_heads: Vec<String> = calls
+        .iter()
+        .filter(|c| !call_head_is_local(**c, source, &local_names, class.module_names))
+        .filter_map(|c| mock_api_call_name(*c, source, imports))
+        .collect();
     let mock_construction_count =
         mock_api_heads.iter().filter(|h| is_mock_construction_call(h)).count() as u64;
 
@@ -787,10 +882,10 @@ struct AssertionTally<'a> {
 /// calls, checking `with` blocks, and same-file helpers that themselves
 /// assert. Each is a non-mock assertion.
 fn tally_assertions<'a>(
-    func: Node<'a>,
     body: Option<Node<'a>>,
     calls: &[Node<'a>],
     class: ClassContext<'_>,
+    local_names: &BTreeSet<String>,
     source: &[u8],
     imports: &ImportMap,
 ) -> AssertionTally<'a> {
@@ -819,15 +914,17 @@ fn tally_assertions<'a>(
                 .count()
             + bare_mock_asserts.len()) as u64;
 
-    let parameters = parameter_names(func, source);
+    // A helper site inside a nested `def` / `lambda` may never run, so it
+    // is not credited — the same rule external verification follows.
     let helper_sites: Vec<Node<'a>> = calls
         .iter()
         .copied()
         .filter(|c| {
             call_is_library_assertion(*c, source, imports)
-                || call_is_same_file_helper(*c, source, class, &parameters)
+                || call_is_same_file_helper(*c, source, class, local_names)
         })
         .chain(checking_blocks)
+        .filter(|site| body.is_none_or(|b| !is_in_nested_scope(*site, b)))
         .collect();
     let helper_assertion_count = helper_sites.len() as u64;
 
@@ -1385,6 +1482,21 @@ fn last_named_child_row(node: Node<'_>) -> Option<usize> {
 fn mock_api_call_name(call: Node<'_>, source: &[u8], imports: &ImportMap) -> Option<String> {
     let chain = call_head_chain(call, source)?;
     resolve_mock_api_chain(&chain, imports)
+}
+
+/// True iff a call's head names something the test file binds itself — a
+/// local of the test or a module-level `def` / `class` — so it is not the
+/// Mock API whatever it is called (`def test(patch): patch(...)`).
+fn call_head_is_local(
+    call: Node<'_>,
+    source: &[u8],
+    local_names: &BTreeSet<String>,
+    module_names: &BTreeSet<String>,
+) -> bool {
+    call_head_chain(call, source).is_some_and(|chain| {
+        let head = dotted_head(&chain);
+        local_names.contains(head) || module_names.contains(head)
+    })
 }
 
 /// [`mock_api_call_name`] for an already-rendered dotted chain.
@@ -3853,5 +3965,110 @@ class TestOuter:
         let recs = parse(src);
         assert_eq!(recs[0].nodeid, "synthetic.py::TestOuter::TestInner::test_b");
         assert_eq!(recs[0].helper_assertion_count, 0, "outer methods are not inner's");
+    }
+
+    // ---- Review regressions (collection, shadowing, nested defs) ----
+
+    #[test]
+    fn classes_nested_in_a_test_case_are_not_collected() {
+        // pytest's unittest collector yields only loader test names; it
+        // never recurses into nested classes the way the `Class` collector
+        // does.
+        let src = "\
+import unittest
+
+class CartChecks(unittest.TestCase):
+    def test_a(self):
+        self.assertTrue(True)
+
+    class TestInner:
+        def test_phantom(self):
+            assert True
+";
+        assert_eq!(nodeids(src), ["synthetic.py::CartChecks::test_a"]);
+    }
+
+    #[test]
+    fn locally_bound_mock_api_names_are_not_the_mock_api() {
+        // A fixture parameter, a module-level def and a module-level class
+        // named like Mock-API exports are the test's own objects.
+        let src = "\
+class Mock:
+    pass
+
+def test_param(patch):
+    patch('a.b')
+    patch('a.c')
+    patch('a.d')
+    assert True
+
+def test_module_class():
+    a = Mock()
+    assert a
+";
+        let recs = parse(src);
+        for t in &recs {
+            assert_eq!(t.mock_construction_count, 0, "{}", t.nodeid);
+            assert_eq!(t.patch_call_count, 0, "{}", t.nodeid);
+        }
+    }
+
+    #[test]
+    fn a_local_rebinding_shadows_a_helper() {
+        let src = "\
+def check(x):
+    assert x
+
+def test_lambda():
+    check = lambda x: None
+    check(1)
+
+def test_nested_def():
+    def check(x):
+        return x
+    check(1)
+
+def test_loop():
+    for check in handlers:
+        check(1)
+";
+        for t in parse(src) {
+            assert_eq!(t.helper_assertion_count, 0, "{}", t.nodeid);
+            assert!(t.verifies_nothing(), "{}", t.nodeid);
+        }
+    }
+
+    #[test]
+    fn a_helper_call_inside_a_nested_def_is_not_credited() {
+        // Like external verification: the test may never invoke `inner`.
+        let src = "\
+import pytest
+
+def check(x):
+    assert x
+
+def test_closure():
+    def inner():
+        check(1)
+        pytest.fail('x')
+    run(inner)
+";
+        let t = &parse(src)[0];
+        assert_eq!(t.helper_assertion_count, 0);
+        assert!(t.verifies_nothing());
+    }
+
+    #[test]
+    fn warning_blocks_count_once_per_statement() {
+        let src = "\
+import pytest
+
+def test_a():
+    with pytest.warns(UserWarning) as record:
+        warn()
+    with pytest.warns(UserWarning), pytest.warns(DeprecationWarning):
+        warn()
+";
+        assert_eq!(parse(src)[0].helper_assertion_count, 2);
     }
 }

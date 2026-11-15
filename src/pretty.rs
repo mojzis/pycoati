@@ -243,11 +243,9 @@ fn build_test_row(nodeid: &str, t: &TestRecord) -> TestRow {
         score: format!("{:.2}", t.suspicion_score),
         nodeid: nodeid.to_string(),
         asserts: asserts_cell(t),
-        // Test records don't carry `mock_construction_count`; use the
-        // patch-decorator count as the per-test mock proxy (matches the
-        // mock_overuse smell logic in `smells.rs`). `stubs_count` renders
-        // in its own column.
-        mocks: t.patch_decorator_count.to_string(),
+        // The per-test `mock_overuse` numerator minus `stubs_count`, which
+        // renders in its own column.
+        mocks: t.mock_construction_count.saturating_add(t.patch_decorator_count).to_string(),
         stubs: t.stubs_count.to_string(),
         smells,
     }
@@ -590,6 +588,23 @@ mod tests {
         );
         let plain_row = out.lines().find(|l| l.contains("test_empty")).expect("plain row rendered");
         assert!(!plain_row.contains('x'), "an unverified test keeps a bare count: {plain_row}");
+    }
+
+    #[test]
+    fn mocks_column_matches_the_mock_overuse_numerator() {
+        // `stubs_count` has its own column; `mocks` is the rest of the
+        // per-test `mock_overuse` sum.
+        let mut inv = empty_inv();
+        let mut t = make_test("tests/probe.py::test_mocky", 0.3, 1, 1);
+        t.mock_construction_count = 3;
+        inv.top_suspicious.test_functions = vec![t.nodeid.clone()];
+        inv.test_functions = vec![t];
+        let out = render(&inv, 20);
+        let row = out.lines().find(|l| l.contains("test_mocky")).expect("row rendered");
+        assert!(
+            row.split_whitespace().any(|cell| cell == "4"),
+            "3 constructions + 1 decorator: {row}"
+        );
     }
 
     #[test]

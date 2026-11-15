@@ -69,12 +69,16 @@ pub fn derive_test_smells(test: &TestRecord, config: &MockSmellConfig) -> Vec<Sm
         .mock_construction_count
         .saturating_add(test.patch_decorator_count)
         .saturating_add(test.stubs_count);
-    if mock_overuse_fires(test_mocks, test.assertion_count, config) {
+    // Helper sites are non-mock assertions too: three mocks checked by three
+    // `assert_frame_equal` calls are as balanced as three mocks and three
+    // `assert`s.
+    let test_asserts = test.assertion_count.saturating_add(test.helper_assertion_count);
+    if mock_overuse_fires(test_mocks, test_asserts, config) {
         hits.push(SmellHit {
             category: MOCK_OVERUSE.to_string(),
             test: Some(test.nodeid.clone()),
             line: test.line,
-            evidence: format!("{} mocks, {} assertions", test_mocks, test.assertion_count),
+            evidence: format!("{test_mocks} mocks, {test_asserts} assertions"),
         });
     }
 
@@ -89,7 +93,8 @@ pub fn derive_test_smells(test: &TestRecord, config: &MockSmellConfig) -> Vec<Sm
 /// of all-zero-assert tests does not fire `mock_only_assertions`.)
 ///
 /// `mock_overuse` at file level uses the per-file aggregates emitted by the
-/// parser.
+/// parser, plus the file's tests' `helper_assertion_count` in the
+/// denominator.
 pub fn derive_file_smells(
     file: &FileRecord,
     tests_in_file: &[&TestRecord],
@@ -97,8 +102,12 @@ pub fn derive_file_smells(
 ) -> Vec<SmellHit> {
     let mut hits = Vec::new();
 
-    let asserting: Vec<&&TestRecord> =
-        tests_in_file.iter().filter(|t| t.assertion_count > 0).collect();
+    // A test verifying only through helpers still verifies: it counts as an
+    // asserting test, and it is never mock-only.
+    let asserting: Vec<&&TestRecord> = tests_in_file
+        .iter()
+        .filter(|t| t.assertion_count > 0 || t.helper_assertion_count > 0)
+        .collect();
     if !asserting.is_empty() && asserting.iter().all(|t| t.only_asserts_on_mock) {
         hits.push(SmellHit {
             category: MOCK_ONLY_ASSERTIONS.to_string(),
@@ -112,12 +121,14 @@ pub fn derive_file_smells(
         .mock_construction_count
         .saturating_add(file.patch_decorator_count)
         .saturating_add(file.stubs_count);
-    if mock_overuse_fires(file_mocks, file.assertion_count, config) {
+    let file_helpers: u64 = tests_in_file.iter().map(|t| t.helper_assertion_count).sum();
+    let file_asserts = file.assertion_count.saturating_add(file_helpers);
+    if mock_overuse_fires(file_mocks, file_asserts, config) {
         hits.push(SmellHit {
             category: MOCK_OVERUSE.to_string(),
             test: None,
             line: 0,
-            evidence: format!("{} mocks, {} assertions", file_mocks, file.assertion_count),
+            evidence: format!("{file_mocks} mocks, {file_asserts} assertions"),
         });
     }
 
@@ -310,6 +321,52 @@ mod tests {
         let hits = derive_test_smells(&t, &MockSmellConfig::default());
         let mo = hits.iter().find(|h| h.category == "mock_overuse").expect("mock_overuse hit");
         assert_eq!(mo.evidence, "3 mocks, 1 assertions");
+    }
+
+    #[test]
+    fn helper_assertions_count_against_mock_overuse() {
+        // Three mocks verified by three `assert_frame_equal` calls is the
+        // same balance as three mocks and three `assert`s: no smell.
+        let mut t = make_test("a::t");
+        t.mock_construction_count = 3;
+        t.helper_assertion_count = 3;
+        assert!(derive_test_smells(&t, &MockSmellConfig::default())
+            .iter()
+            .all(|h| h.category != "mock_overuse"));
+        // And the evidence names every assertion it weighed.
+        t.mock_construction_count = 5;
+        t.assertion_count = 1;
+        t.helper_assertion_count = 1;
+        let hits = derive_test_smells(&t, &MockSmellConfig::default());
+        let mo = hits.iter().find(|h| h.category == "mock_overuse").expect("mock_overuse hit");
+        assert_eq!(mo.evidence, "5 mocks, 2 assertions");
+    }
+
+    #[test]
+    fn file_scope_counts_helper_assertions_too() {
+        let mut f = make_file("a");
+        f.mock_construction_count = 3;
+        f.assertion_count = 0;
+        let mut t = make_test("a::t");
+        t.helper_assertion_count = 3;
+        let refs = vec![&t];
+        let hits = derive_file_smells(&f, &refs, &MockSmellConfig::default());
+        assert!(hits.iter().all(|h| h.category != "mock_overuse"), "{hits:?}");
+    }
+
+    #[test]
+    fn helper_verified_test_breaks_file_level_mock_only() {
+        // One test asserts only on the mock, the other verifies through a
+        // helper: not every verifying test in the file is mock-only.
+        let f = make_file("a");
+        let mut mock_only = make_test("a::m");
+        mock_only.assertion_count = 1;
+        mock_only.only_asserts_on_mock = true;
+        let mut helped = make_test("a::h");
+        helped.helper_assertion_count = 1;
+        let refs = vec![&mock_only, &helped];
+        let hits = derive_file_smells(&f, &refs, &MockSmellConfig::default());
+        assert!(hits.iter().all(|h| h.category != "mock_only_assertions"), "{hits:?}");
     }
 
     #[test]

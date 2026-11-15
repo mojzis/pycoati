@@ -22,6 +22,10 @@ class CartChecks(unittest.TestCase):
     def helper(self):
         return [1]
 
+    class TestNestedInCase:
+        def test_not_collected(self):
+            raise AssertionError("pytest does not recurse into TestCase subclasses")
+
 
 class BaseCase(unittest.TestCase):
     def setUp(self):

@@ -22,7 +22,8 @@ smell as it is written, pycoati finds the ones already in the suite.
 ## Preconditions
 
 - `pycoati` is on PATH. Check with `pycoati --version`.
-- The project has a test directory. The default is `<path>/tests`.
+- The project has a test directory. The default is every `testpaths` entry in
+  `<path>/pyproject.toml`, else `<path>/tests`.
 - For runtime metrics (test count, runtime, coverage), `pytest` and
   `pytest-cov` must be importable by the interpreter pycoati picks:
   `uv add --dev pytest pytest-cov`. Without pytest the scan still succeeds
@@ -41,13 +42,16 @@ The one file of its own that pycoati reads is `.pycoati-accept.toml`, the
 accepted-findings baseline. It changes no threshold and no score — it records
 reviewed per-test exceptions. See "Accepted findings" below.
 
-It also reads three tables that other tools own, and only these:
+It also reads four tables that other tools own, and only these:
 
 - `[project].name` — seeds `project.name` and the coverage package.
 - `[tool.uv.workspace].members` — switches the scan into workspace mode.
 - `[tool.hatch.build.targets.wheel].packages`, `[tool.setuptools].packages`,
   `[tool.setuptools.packages.find].include` — declare which import names count
   as project-internal for `sut_calls`.
+- `[tool.pytest.ini_options].testpaths` (or the pytest 9 native
+  `[tool.pytest].testpaths`) — the default test directories when
+  `--tests-dir` is not given.
 
 If `sut_calls` comes back empty on a project that clearly calls its own code,
 the cause is almost always that none of these package tables are present. Pass
@@ -85,11 +89,13 @@ pycoati . --format pretty
   format this guide can read. `pretty` is an aligned-column terminal view for
   humans. Default: `json`.
 - `--tests-dir <PATH>` — override test discovery root. Default: every entry of
-  `[tool.pytest.ini_options].testpaths` in `<path>/pyproject.toml` (list or
-  single string, relative to `<path>`; entries that do not exist are skipped
-  with a warning), else `<path>/tests`. Workspace members use their own
-  `pyproject.toml` the same way. `pytest.ini`, `tox.ini` and `setup.cfg` are
-  not read.
+  `testpaths` in `<path>/pyproject.toml`, relative to `<path>` — a list, or a
+  string split on whitespace as pytest does. Glob entries (`src/*/tests`) are
+  not expanded; they are skipped with a warning. Entries that do not exist are
+  skipped with a warning, and when none exists `<path>/tests` is used if it
+  does. With no `testpaths` setting the default is `<path>/tests`. Workspace
+  members use their own `pyproject.toml` the same way. `pytest.ini`,
+  `tox.ini` and `setup.cfg` are not read.
   Directory input only; rejected for single-file input and for workspace roots.
 - `--static-only` — skip every pytest subprocess. The scan becomes pure AST
   analysis: fast, no test execution, and every `suite.*` field stays `null`.
@@ -208,8 +214,13 @@ qualifies when its basename matches `test_*.py` or `*_test.py`. Hidden files,
 gitignored files, and symlinks are skipped.
 
 Within a file, pycoati collects top-level `def test_*` and `async def test_*`,
-plus `test_*` methods on classes whose name starts with `Test`. Functions nested
-inside other functions are not collected.
+plus `test_*` methods on classes whose name starts with `Test`, plus every
+`test*` method on a class that subclasses `unittest.TestCase` or
+`IsolatedAsyncioTestCase` (directly or through same-file base classes),
+whatever the class is called. Classes nested inside a collected `Test*` class
+are collected too, with nodeid `<file>::Outer::Inner::test_x`; classes nested
+in a `TestCase` subclass are not, matching pytest. Functions nested inside
+other functions are not collected.
 
 ## Scan behaviour you must not misread
 

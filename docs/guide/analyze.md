@@ -122,8 +122,14 @@ analysis reads from here.
   (`<file>::TestOuter::TestInner::test_x`). Classes are collected when named
   `Test*` or when they subclass `unittest.TestCase` /
   `IsolatedAsyncioTestCase` (directly or through same-file base classes),
-  matching what pytest collects; in a `TestCase` subclass every `test*`
-  method counts, in other classes and at module level every `test_*`.
+  matching what pytest collects. Classes nested inside a `TestCase` subclass
+  are not collected, as pytest does not. In a `TestCase` subclass every
+  `test*` method counts, as unittest's loader does; in other classes and at
+  module level only `test_*` counts — narrower than pytest's own default,
+  which would also collect `def testfoo()`. Two known gaps: test methods
+  inherited from a same-file base class are not collected on the subclass,
+  and only `unittest`'s own base classes are recognised (a `django.test.
+  TestCase` subclass is collected only when it is named `Test*`).
   **Parametrize is not expanded**, so there is never a `[...]` suffix.
 - `file` — path to the file containing this test. Joins to `files[].path`.
 - `line` — line of the `def`. **1-indexed**, matching what an editor shows.
@@ -244,8 +250,11 @@ analysis reads from here.
   `external_verification_count`. Each site counts as a non-mock assertion
   everywhere else: it switches off `zero_asserts`, makes
   `only_asserts_on_mock` `false`, and is an assertion site for
-  `setup_to_assertion_ratio`. It does not enter the `mock_overuse`
-  denominator, which stays `assertion_count`.
+  `setup_to_assertion_ratio`, and it counts as an assertion in the
+  `mock_overuse` ratio. Two shapes are never credited: a helper call inside a
+  nested `def` or `lambda` the test may never call, and a call to a name the
+  test rebinds itself (a parameter, `check = lambda x: None`, a nested `def`
+  of the same name).
 - `called_names` — sorted, deduplicated, dot-joined names of calls in this test
   body, **filtered to project-internal names only**. Calls into the standard
   library, into third-party packages, and `self.*` calls are all excluded. An
@@ -437,10 +446,13 @@ about the test being empty — read the field, not just the score.
 
 - `mock_only_assertions` fires per test when `only_asserts_on_mock` is `true`
   and `assertion_count > 0`. It fires per file when **every** test in the file
-  that has at least one assertion has `only_asserts_on_mock` true; assertionless
-  tests are excluded from that predicate.
-- `mock_overuse` fires when `mocks > max(assertion_count, 2)` **and**
-  `mocks / max(assertion_count, 1) > 2.0`. Both comparisons strict. `mocks` is
+  that verifies (`assertion_count > 0` or `helper_assertion_count > 0`) has
+  `only_asserts_on_mock` true; tests that verify nothing are excluded from that
+  predicate.
+- `mock_overuse` fires when `mocks > max(asserts, 2)` **and**
+  `mocks / max(asserts, 1) > 2.0`, where `asserts` is
+  `assertion_count + helper_assertion_count` (summed over the file's tests at
+  file scope). Both comparisons strict. `mocks` is
   `mock_construction_count + patch_decorator_count + stubs_count` at both test
   and file scope. Each patch lands in exactly one of those three, whatever its
   spelling: a decorator in `patch_decorator_count`, `with patch(...)` in
