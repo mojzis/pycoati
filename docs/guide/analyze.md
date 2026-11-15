@@ -118,7 +118,13 @@ One record per collected test function. This is the primary array; most of your
 analysis reads from here.
 
 - `nodeid` — `<file>::<test>`, or `<file>::<Class>::<method>` for class-based
-  tests. **Parametrize is not expanded**, so there is never a `[...]` suffix.
+  tests, with one `::<Class>` segment per level for nested classes
+  (`<file>::TestOuter::TestInner::test_x`). Classes are collected when named
+  `Test*` or when they subclass `unittest.TestCase` /
+  `IsolatedAsyncioTestCase` (directly or through same-file base classes),
+  matching what pytest collects; in a `TestCase` subclass every `test*`
+  method counts, in other classes and at module level every `test_*`.
+  **Parametrize is not expanded**, so there is never a `[...]` suffix.
 - `file` — path to the file containing this test. Joins to `files[].path`.
 - `line` — line of the `def`. **1-indexed**, matching what an editor shows.
 - `assertion_count` — effective assertion sites in this test body, one each:

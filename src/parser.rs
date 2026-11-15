@@ -10,6 +10,12 @@
 //! * Methods named `test_*` inside classes whose name starts with `Test`,
 //!   matching pytest's default collection rule. Nodeid is
 //!   `<file>::<ClassName>::<method>` to align with pytest's output.
+//! * Methods named `test*` inside any class that subclasses
+//!   `unittest.TestCase` / `IsolatedAsyncioTestCase` — resolved through the
+//!   import map, directly or through a chain of same-file base classes —
+//!   whatever the class is called, as unittest's loader collects them.
+//! * The same, recursively, for classes nested inside a collected class:
+//!   pytest collects them too, with nodeid `<file>::Outer::Inner::<method>`.
 //!
 //! Functions nested inside other functions are deliberately not collected —
 //! pytest does not collect them either.
@@ -161,7 +167,34 @@ struct ClassContext<'a> {
     /// Methods of the enclosing class whose body holds a non-mock
     /// assertion, reached as `self.<name>(...)`. Empty at module level.
     method_helpers: &'a BTreeSet<String>,
+    /// Module-level classes that are `unittest.TestCase` subclasses,
+    /// directly or through a same-file base chain.
+    test_cases: &'a BTreeSet<String>,
+    /// Name prefix a function needs to be collected here: pytest's `test_`
+    /// by default, unittest's `test` inside a `TestCase` subclass.
+    test_prefix: &'static str,
 }
+
+/// Test-function name prefix pytest collects at module level and in
+/// `Test*` classes, as this parser applies it.
+const PYTEST_TEST_PREFIX: &str = "test_";
+
+/// Test-method name prefix `unittest`'s loader collects in a `TestCase`
+/// subclass — `testLegacyName` included.
+const UNITTEST_TEST_PREFIX: &str = "test";
+
+/// Class-name prefix pytest collects (`python_classes` default).
+const PYTEST_CLASS_PREFIX: &str = "Test";
+
+/// Canonical names of the `unittest` base classes whose subclasses pytest
+/// collects regardless of name. Matched after canonicalizing a base
+/// expression through the import map.
+const UNITTEST_CASE_BASES: &[&str] = &[
+    "unittest.TestCase",
+    "unittest.IsolatedAsyncioTestCase",
+    "unittest.case.TestCase",
+    "unittest.async_case.IsolatedAsyncioTestCase",
+];
 
 /// Shared empty set for scopes that contribute nothing.
 static EMPTY_NAMES: BTreeSet<String> = BTreeSet::new();
@@ -169,8 +202,15 @@ static EMPTY_NAMES: BTreeSet<String> = BTreeSet::new();
 impl<'a> ClassContext<'a> {
     /// A module-level test: no nodeid prefix, no class-installed doubles,
     /// no methods — only the module's helpers.
-    fn module(module_helpers: &'a BTreeSet<String>) -> Self {
-        Self { prefix: None, shadows: &EMPTY_NAMES, module_helpers, method_helpers: &EMPTY_NAMES }
+    fn module(module_helpers: &'a BTreeSet<String>, test_cases: &'a BTreeSet<String>) -> Self {
+        Self {
+            prefix: None,
+            shadows: &EMPTY_NAMES,
+            module_helpers,
+            method_helpers: &EMPTY_NAMES,
+            test_cases,
+            test_prefix: PYTEST_TEST_PREFIX,
+        }
     }
 }
 
@@ -186,7 +226,8 @@ fn collect_module_tests(
     out: &mut ParsedFile,
 ) {
     let module_helpers = verifying_helpers(module, source, imports, false);
-    let module_ctx = ClassContext::module(&module_helpers);
+    let test_cases = test_case_classes(module, source, imports);
+    let module_ctx = ClassContext::module(&module_helpers, &test_cases);
     let mut cursor = module.walk();
     for child in module.children(&mut cursor) {
         match child.kind() {
@@ -230,59 +271,134 @@ fn collect_module_tests(
     }
 }
 
-/// Walk a `class_definition`'s body collecting `test_*` methods. Skips
-/// classes whose name does not start with `Test` (pytest's default rule).
-/// Nested classes inside the body are intentionally not recursed into —
-/// pytest does not collect them, and joining their names would diverge
-/// from pytest's nodeid shape.
+/// Walk a `class_definition`'s body collecting its test methods, then
+/// recurse into nested classes.
+///
+/// A class is collected when its name starts with `Test` (pytest's default
+/// rule) or it subclasses `unittest.TestCase` (see [`class_is_test_case`]).
+/// In a `TestCase` subclass every `test*` method is collected, as unittest's
+/// loader does; elsewhere `test_*`. Nested classes are collected under the
+/// same rule, but only inside a collected class — pytest recurses no
+/// further — with the nodeid `<file>::Outer::Inner::test_x`.
+///
+/// `parent` is the enclosing scope: the module context, or the outer class
+/// for a nested one. A nested class inherits nothing from its outer class
+/// but the nodeid prefix: a class-level `@patch` or a `setUp` applies only
+/// to the class it is written on, and `self.<helper>` resolves on the
+/// inner class.
 fn collect_class_tests(
     class_node: Node<'_>,
     class_decorated: Option<Node<'_>>,
     source: &[u8],
     file_path: &Path,
-    module: ClassContext<'_>,
+    parent: ClassContext<'_>,
     imports: &ImportMap,
     out: &mut ParsedFile,
 ) {
     let Some(class_name) = node_name(class_node, source) else {
         return;
     };
-    if !class_name.starts_with("Test") {
+    let is_test_case = class_is_test_case(class_node, source, imports, parent.test_cases);
+    if !class_name.starts_with(PYTEST_CLASS_PREFIX) && !is_test_case {
         return;
     }
     let Some(body) = class_node.child_by_field_name("body") else {
         return;
     };
+    let prefix = match parent.prefix {
+        Some(outer) => format!("{outer}::{class_name}"),
+        None => class_name.to_string(),
+    };
     let shadows = class_installed_doubles(body, class_decorated, source, imports);
     let method_helpers = verifying_helpers(body, source, imports, true);
     let class = ClassContext {
-        prefix: Some(class_name),
+        prefix: Some(&prefix),
         shadows: &shadows,
-        module_helpers: module.module_helpers,
+        module_helpers: parent.module_helpers,
         method_helpers: &method_helpers,
+        test_cases: parent.test_cases,
+        test_prefix: if is_test_case { UNITTEST_TEST_PREFIX } else { PYTEST_TEST_PREFIX },
     };
     let mut cursor = body.walk();
     for child in body.children(&mut cursor) {
-        match child.kind() {
-            "function_definition" => {
-                try_collect_test_function(child, None, source, file_path, class, imports, out);
-            }
-            "decorated_definition" => {
-                if let Some(inner) = child.child_by_field_name("definition") {
-                    if inner.kind() == "function_definition" {
-                        try_collect_test_function(
-                            inner,
-                            Some(child),
-                            source,
-                            file_path,
-                            class,
-                            imports,
-                            out,
-                        );
-                    }
-                }
+        let (definition, decorated) = match child.kind() {
+            "decorated_definition" => match child.child_by_field_name("definition") {
+                Some(inner) => (inner, Some(child)),
+                None => continue,
+            },
+            _ => (child, None),
+        };
+        match definition.kind() {
+            "function_definition" => try_collect_test_function(
+                definition, decorated, source, file_path, class, imports, out,
+            ),
+            "class_definition" => {
+                collect_class_tests(definition, decorated, source, file_path, class, imports, out);
             }
             _ => {}
+        }
+    }
+}
+
+/// The dotted names of a class's base-class expressions, in source order.
+/// Keyword arguments (`metaclass=...`) and computed bases are skipped.
+fn base_class_chains(class_node: Node<'_>, source: &[u8]) -> Vec<String> {
+    let Some(bases) = class_node.child_by_field_name("superclasses") else {
+        return Vec::new();
+    };
+    let mut cursor = bases.walk();
+    let chains = bases
+        .named_children(&mut cursor)
+        .filter_map(|base| attribute_chain_text(base, source))
+        .collect();
+    chains
+}
+
+/// True iff a class subclasses `unittest.TestCase` /
+/// `IsolatedAsyncioTestCase`: one of its bases canonicalizes to a
+/// [`UNITTEST_CASE_BASES`] entry, or names a module-level class already
+/// known to be one (`known`, see [`test_case_classes`]).
+fn class_is_test_case(
+    class_node: Node<'_>,
+    source: &[u8],
+    imports: &ImportMap,
+    known: &BTreeSet<String>,
+) -> bool {
+    base_class_chains(class_node, source).iter().any(|base| {
+        known.contains(base)
+            || UNITTEST_CASE_BASES.contains(&canonicalize_called_name(base, imports).as_str())
+    })
+}
+
+/// Names of the module-level classes that subclass `unittest.TestCase`,
+/// directly or through a chain of same-file base classes
+/// (`class Base(TestCase)`, `class Leaf(Base)`). Iterated to a fixpoint so
+/// definition order does not matter; bases imported from another module are
+/// resolved only when they are a `unittest` base themselves.
+fn test_case_classes(module: Node<'_>, source: &[u8], imports: &ImportMap) -> BTreeSet<String> {
+    let mut cursor = module.walk();
+    let classes: Vec<Node<'_>> = module
+        .children(&mut cursor)
+        .filter_map(|child| match child.kind() {
+            "class_definition" => Some(child),
+            "decorated_definition" => child
+                .child_by_field_name("definition")
+                .filter(|inner| inner.kind() == "class_definition"),
+            _ => None,
+        })
+        .collect();
+    let mut known = BTreeSet::new();
+    loop {
+        let before = known.len();
+        for class_node in &classes {
+            if class_is_test_case(*class_node, source, imports, &known) {
+                if let Some(name) = node_name(*class_node, source) {
+                    known.insert(name.to_string());
+                }
+            }
+        }
+        if known.len() == before {
+            return known;
         }
     }
 }
@@ -505,7 +621,7 @@ fn try_collect_test_function(
     out: &mut ParsedFile,
 ) {
     if let Some(name) = node_name(func, source) {
-        if name.starts_with("test_") {
+        if name.starts_with(class.test_prefix) {
             let record = build_record(func, decorated, name, source, file_path, class, imports);
             out.mock_construction_count =
                 out.mock_construction_count.saturating_add(record.mock_construction_count);
@@ -3611,5 +3727,131 @@ def test_a():
         assert_eq!(t.mock_assertion_count, 1);
         assert_eq!(t.helper_assertion_count, 1);
         assert!(!t.only_asserts_on_mock);
+    }
+
+    // ---- Collection: unittest subclasses and nested classes ----
+
+    fn nodeids(src: &str) -> Vec<String> {
+        parse(src).into_iter().map(|t| t.nodeid).collect()
+    }
+
+    #[test]
+    fn unittest_subclasses_are_collected_whatever_their_name() {
+        let src = "\
+import unittest
+from unittest import TestCase, IsolatedAsyncioTestCase as AsyncCase
+
+class CartTests(unittest.TestCase):
+    def test_a(self):
+        self.assertEqual(1, 1)
+
+    def testLegacyName(self):
+        self.assertTrue(True)
+
+    def helper(self):
+        pass
+
+class AsyncCartChecks(AsyncCase):
+    async def test_b(self):
+        self.assertTrue(True)
+
+class PlainChecks(TestCase):
+    def test_c(self):
+        self.assertTrue(True)
+";
+        assert_eq!(
+            nodeids(src),
+            [
+                "synthetic.py::CartTests::test_a",
+                "synthetic.py::CartTests::testLegacyName",
+                "synthetic.py::AsyncCartChecks::test_b",
+                "synthetic.py::PlainChecks::test_c",
+            ]
+        );
+    }
+
+    #[test]
+    fn same_file_base_class_chains_reach_test_case() {
+        let src = "\
+import unittest
+
+class BaseCase(unittest.TestCase):
+    def setUp(self):
+        self.x = 1
+
+class MidCase(BaseCase):
+    pass
+
+class LeafChecks(MidCase, SomeMixin):
+    def test_x(self):
+        self.assertEqual(self.x, 1)
+";
+        assert_eq!(nodeids(src), ["synthetic.py::LeafChecks::test_x"]);
+    }
+
+    #[test]
+    fn unrelated_base_classes_are_not_test_cases() {
+        let src = "\
+from myproj import TestCase
+
+class Checks(TestCase):
+    def test_x(self):
+        assert True
+
+class Other(object):
+    def test_y(self):
+        assert True
+";
+        assert!(nodeids(src).is_empty());
+    }
+
+    #[test]
+    fn nested_test_classes_are_collected_with_joined_nodeids() {
+        let src = "\
+class TestOuter:
+    def test_a(self):
+        assert True
+
+    class TestInner:
+        def test_b(self):
+            assert True
+
+        class TestDeep:
+            def test_c(self):
+                assert True
+
+    class Helper:
+        def test_d(self):
+            assert True
+
+class Other:
+    class TestHidden:
+        def test_e(self):
+            assert True
+";
+        assert_eq!(
+            nodeids(src),
+            [
+                "synthetic.py::TestOuter::test_a",
+                "synthetic.py::TestOuter::TestInner::test_b",
+                "synthetic.py::TestOuter::TestInner::TestDeep::test_c",
+            ]
+        );
+    }
+
+    #[test]
+    fn nested_class_has_its_own_method_helpers() {
+        let src = "\
+class TestOuter:
+    def _check(self, v):
+        assert v
+
+    class TestInner:
+        def test_b(self):
+            self._check(1)
+";
+        let recs = parse(src);
+        assert_eq!(recs[0].nodeid, "synthetic.py::TestOuter::TestInner::test_b");
+        assert_eq!(recs[0].helper_assertion_count, 0, "outer methods are not inner's");
     }
 }
