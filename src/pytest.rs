@@ -17,7 +17,7 @@
 //! `Command::output()`, or unparseable stdout each produce `None`/empty data
 //! and a `tracing::warn!` so the rest of the inventory still serializes.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::Context;
@@ -68,7 +68,7 @@ pub(crate) fn pytest_available(
     }
 }
 
-/// Invoke `pytest --collect-only -q <tests_dir>` and parse the test count.
+/// Invoke `pytest --collect-only -q <tests_dirs…>` and parse the test count.
 ///
 /// Returns an outcome with `test_count = None` (rather than an `Err`) when
 /// the subprocess fails or output is unparseable — the higher-level run
@@ -77,7 +77,7 @@ pub fn run_collection(
     program: &str,
     extra_python_args: &[String],
     project_root: &Path,
-    tests_dir: &Path,
+    tests_dirs: &[PathBuf],
     pytest_args: &[String],
 ) -> CollectionOutcome {
     let mut args: Vec<String> = extra_python_args.to_vec();
@@ -94,7 +94,7 @@ pub fn run_collection(
         "--collect-only".into(),
         "-q".into(),
     ]);
-    args.push(tests_dir.display().to_string());
+    args.extend(tests_dirs.iter().map(|d| d.display().to_string()));
     args.extend(pytest_args.iter().cloned());
 
     let Some((stdout, _exit_code)) = run_pytest(program, &args, project_root, "collection") else {
@@ -110,13 +110,13 @@ pub fn run_collection(
     CollectionOutcome { test_count }
 }
 
-/// Invoke `pytest --durations=0 -q <tests_dir>` and parse runtime + the
+/// Invoke `pytest --durations=0 -q <tests_dirs…>` and parse runtime + the
 /// slowest-tests section.
 pub fn run_durations(
     program: &str,
     extra_python_args: &[String],
     project_root: &Path,
-    tests_dir: &Path,
+    tests_dirs: &[PathBuf],
     pytest_args: &[String],
 ) -> DurationsOutcome {
     let mut args: Vec<String> = extra_python_args.to_vec();
@@ -138,7 +138,7 @@ pub fn run_durations(
         "--durations-min=0".into(),
         "-q".into(),
     ]);
-    args.push(tests_dir.display().to_string());
+    args.extend(tests_dirs.iter().map(|d| d.display().to_string()));
     args.extend(pytest_args.iter().cloned());
 
     let Some((stdout, _exit_code)) = run_pytest(program, &args, project_root, "durations") else {

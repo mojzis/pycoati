@@ -9,7 +9,7 @@
 //! Failures degrade to `None` plus a `tracing::warn!` so the rest of the
 //! inventory still serializes.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::Value;
@@ -24,7 +24,7 @@ pub fn run_coverage(
     program: &str,
     extra_python_args: &[String],
     project_root: &Path,
-    tests_dir: &Path,
+    tests_dirs: &[PathBuf],
     pytest_args: &[String],
     package: &str,
 ) -> Option<f64> {
@@ -52,7 +52,7 @@ pub fn run_coverage(
         format!("--cov-report=json:{}", report_file.path().display()),
         "-q".into(),
     ]);
-    args.push(tests_dir.display().to_string());
+    args.extend(tests_dirs.iter().map(|d| d.display().to_string()));
     args.extend(pytest_args.iter().cloned());
 
     let output = Command::new(program).args(&args).current_dir(project_root).output();

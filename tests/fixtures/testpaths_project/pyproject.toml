@@ -1,0 +1,6 @@
+[project]
+name = "testpathsproj"
+version = "0.0.0"
+
+[tool.pytest.ini_options]
+testpaths = ["checks/unit", "integration"]

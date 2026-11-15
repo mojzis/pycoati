@@ -26,6 +26,15 @@ struct Tool {
     hatch: Option<Hatch>,
     setuptools: Option<Setuptools>,
     uv: Option<Uv>,
+    pytest: Option<PytestTool>,
+}
+
+/// `[tool.pytest]`. Only `ini_options` is consumed, and it is kept as a raw
+/// TOML value so that a pytest setting of an unexpected type can never make
+/// the whole file unparseable for the other readers here.
+#[derive(Debug, Default, Deserialize)]
+struct PytestTool {
+    ini_options: Option<toml::Value>,
 }
 
 /// `[tool.uv]` table. Today we only consume the optional `workspace`
@@ -203,6 +212,27 @@ pub fn read_uv_workspace_members(root: &Path) -> Option<Vec<String>> {
     Some(workspace.members.unwrap_or_default())
 }
 
+/// Read `[tool.pytest.ini_options].testpaths` from `<root>/pyproject.toml`.
+///
+/// Accepts the list form pytest documents and a single string. Entries are
+/// returned verbatim, relative to `root`; pytest's glob expansion is not
+/// applied. Non-string list items are dropped. `None` when the file, the
+/// key, or every usable entry is missing — callers then fall back to
+/// `<root>/tests`.
+///
+/// `pytest.ini`, `tox.ini` and `setup.cfg` are not read.
+pub fn read_testpaths(root: &Path) -> Option<Vec<String>> {
+    let ini = read_pyproject_silent(root)?.tool?.pytest?.ini_options?;
+    let entries: Vec<String> = match ini.get("testpaths")? {
+        toml::Value::String(one) => vec![one.clone()],
+        toml::Value::Array(items) => {
+            items.iter().filter_map(|v| v.as_str().map(String::from)).collect()
+        }
+        _ => Vec::new(),
+    };
+    (!entries.is_empty()).then_some(entries)
+}
+
 /// Read + parse `pyproject.toml` without surfacing errors. Used by the
 /// `Option`-returning public helpers. Missing file is silent; every other
 /// failure logs at `warn` with enough context for a user to find the
@@ -264,6 +294,51 @@ fn package_basename(path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_pyproject(contents: &str) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("pyproject.toml"), contents).expect("write fixture");
+        tmp
+    }
+
+    #[test]
+    fn testpaths_list_is_read_in_order() {
+        let tmp = write_pyproject(
+            "[tool.pytest.ini_options]\ntestpaths = [\"tests/unit\", \"integration\"]\n",
+        );
+        assert_eq!(
+            read_testpaths(tmp.path()),
+            Some(vec!["tests/unit".to_string(), "integration".to_string()])
+        );
+    }
+
+    #[test]
+    fn testpaths_single_string_is_one_entry() {
+        let tmp = write_pyproject("[tool.pytest.ini_options]\ntestpaths = \"checks\"\n");
+        assert_eq!(read_testpaths(tmp.path()), Some(vec!["checks".to_string()]));
+    }
+
+    #[test]
+    fn missing_or_empty_testpaths_is_none() {
+        assert_eq!(read_testpaths(write_pyproject("[project]\nname = \"x\"\n").path()), None);
+        let empty = write_pyproject("[tool.pytest.ini_options]\ntestpaths = []\n");
+        assert_eq!(read_testpaths(empty.path()), None);
+        let no_file = tempfile::tempdir().expect("tempdir");
+        assert_eq!(read_testpaths(no_file.path()), None);
+    }
+
+    #[test]
+    fn malformed_testpaths_does_not_break_other_readers() {
+        // A wrong type under `testpaths` must not make the whole file
+        // unparseable: the project name still reads.
+        let tmp = write_pyproject(
+            "[project]\nname = \"proj\"\n[tool.pytest.ini_options]\ntestpaths = 3\n",
+        );
+        assert_eq!(read_testpaths(tmp.path()), None);
+        assert_eq!(read_project_name(tmp.path()), Some("proj".to_string()));
+        let mixed = write_pyproject("[tool.pytest.ini_options]\ntestpaths = [\"ok\", 3]\n");
+        assert_eq!(read_testpaths(mixed.path()), Some(vec!["ok".to_string()]));
+    }
 
     #[test]
     fn reads_name_from_fixture_pyproject() {

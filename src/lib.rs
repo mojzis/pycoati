@@ -631,8 +631,7 @@ pub fn run_with_pytest(
         &detected
     };
     let (program, extra_python_args) = split_python_cmd(resolved_cmd);
-    let tests_dir =
-        tests_dir_override.map_or_else(|| inv.project.path.join("tests"), Path::to_path_buf);
+    let tests_dirs = existing_tests_dirs(&tests_dirs(&inv.project.path, tests_dir_override));
     let project_root = inv.project.path.clone();
     let pkg = project_package_override.map_or_else(
         || single_project_cov_package(&inv.project.path, &inv.project.name),
@@ -644,7 +643,7 @@ pub fn run_with_pytest(
         &program,
         &extra_python_args,
         &project_root,
-        &tests_dir,
+        &tests_dirs,
         &pkg,
         pytest_args,
         no_coverage,
@@ -669,7 +668,7 @@ fn invoke_pytest_for_inventory(
     program: &str,
     extra_python_args: &[String],
     subprocess_cwd: &Path,
-    tests_dir: &Path,
+    tests_dirs: &[PathBuf],
     project_package: &str,
     pytest_args: &[String],
     no_coverage: bool,
@@ -689,9 +688,9 @@ fn invoke_pytest_for_inventory(
     }
 
     let collection =
-        pytest::run_collection(program, extra_python_args, subprocess_cwd, tests_dir, pytest_args);
+        pytest::run_collection(program, extra_python_args, subprocess_cwd, tests_dirs, pytest_args);
     let durations =
-        pytest::run_durations(program, extra_python_args, subprocess_cwd, tests_dir, pytest_args);
+        pytest::run_durations(program, extra_python_args, subprocess_cwd, tests_dirs, pytest_args);
 
     let ran_pytest = collection.test_count.is_some()
         || !durations.slowest_tests.is_empty()
@@ -710,7 +709,7 @@ fn invoke_pytest_for_inventory(
                 program,
                 extra_python_args,
                 subprocess_cwd,
-                tests_dir,
+                tests_dirs,
                 pytest_args,
                 project_package,
             );
@@ -850,21 +849,28 @@ fn run_workspace_with_pytest(
         let mut inv = run_static_dir_with_options(member, None, None, top_n, false, accept_opts)
             .with_context(|| format!("auditing workspace member {}", member.display()))?;
 
-        // Workspace member without a `tests/` dir was skipped with a warn
-        // and a zero-test inventory. Don't fire pytest at a member that
-        // has nothing to run.
-        if !member.join("tests").is_dir() {
+        // Workspace member without a tests dir (its `testpaths`, else
+        // `tests/`) was skipped with a warn and a zero-test inventory.
+        // Don't fire pytest at a member that has nothing to run.
+        let member_dirs = existing_tests_dirs(&tests_dirs(member, None));
+        if member_dirs.is_empty() {
             members.push(inv);
             continue;
         }
 
         // Per-member cwd is either the workspace root (default) or the
-        // member dir, per `--member-cwd`. The tests path is rendered
+        // member dir, per `--member-cwd`. The tests paths are rendered
         // relative to whichever cwd we picked so pytest's
         // collection/durations/coverage all see the same paths.
-        let (subprocess_cwd, tests_dir) = match member_cwd {
-            MemberCwd::Root => (ws.root.clone(), member.join("tests")),
-            MemberCwd::Member => (member.clone(), PathBuf::from("tests")),
+        let (subprocess_cwd, tests_dirs) = match member_cwd {
+            MemberCwd::Root => (ws.root.clone(), member_dirs),
+            MemberCwd::Member => (
+                member.clone(),
+                member_dirs
+                    .iter()
+                    .map(|d| d.strip_prefix(member).map_or_else(|_| d.clone(), Path::to_path_buf))
+                    .collect(),
+            ),
         };
 
         // Each member declares its own importable package via its
@@ -877,7 +883,7 @@ fn run_workspace_with_pytest(
             &program,
             &extra_python_args,
             &subprocess_cwd,
-            &tests_dir,
+            &tests_dirs,
             &pkg,
             pytest_args,
             no_coverage,
@@ -897,6 +903,44 @@ fn run_workspace_with_pytest(
         members,
         tool: ToolInfo::with_runtime(any_ran_pytest, any_ran_coverage),
     })
+}
+
+/// Directory scanned for tests when neither `--tests-dir` nor
+/// `[tool.pytest.ini_options].testpaths` names one.
+const DEFAULT_TESTS_DIR: &str = "tests";
+
+/// The directories to discover tests in for a project rooted at
+/// `project_root`, in order: the `--tests-dir` override when given; else
+/// every `[tool.pytest.ini_options].testpaths` entry in its
+/// `pyproject.toml`, joined to the root; else `<root>/tests`.
+fn tests_dirs(project_root: &Path, tests_dir_override: Option<&Path>) -> Vec<PathBuf> {
+    if let Some(dir) = tests_dir_override {
+        return vec![dir.to_path_buf()];
+    }
+    pyproject::read_testpaths(project_root).map_or_else(
+        || vec![project_root.join(DEFAULT_TESTS_DIR)],
+        |entries| entries.iter().map(|e| project_root.join(e)).collect(),
+    )
+}
+
+/// The entries of `candidates` that are directories. Each missing entry is
+/// reported at `warn` when at least one other entry exists — a stale
+/// `testpaths` line should be visible, not silently dropped. When none
+/// exists the caller reports that instead.
+fn existing_tests_dirs(candidates: &[PathBuf]) -> Vec<PathBuf> {
+    let (existing, missing): (Vec<&PathBuf>, Vec<&PathBuf>) =
+        candidates.iter().partition(|d| d.is_dir());
+    if !existing.is_empty() {
+        for dir in missing {
+            tracing::warn!(tests_dir = %dir.display(), "tests directory not found; skipping it");
+        }
+    }
+    existing.into_iter().cloned().collect()
+}
+
+/// `a, b, c` rendering of a path list for messages.
+fn display_paths(paths: &[PathBuf]) -> String {
+    paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
 }
 
 /// Pick the `--cov=<pkg>` argument for a workspace member from its
@@ -1012,18 +1056,18 @@ fn run_static_dir_with_options(
     // fails fast, rather than after a full parse pass.
     let baseline = accept_opts.resolve(&inv.project.path)?;
 
-    let tests_dir =
-        tests_dir_override.map_or_else(|| inv.project.path.join("tests"), Path::to_path_buf);
+    let candidates = tests_dirs(&inv.project.path, tests_dir_override);
+    let existing = existing_tests_dirs(&candidates);
+    let tests_dir = display_paths(&candidates);
 
-    if !tests_dir.exists() {
+    if existing.is_empty() {
         if strict_missing_tests {
             anyhow::bail!(
-                "no tests directory at {}; not a workspace either (no [tool.uv.workspace] in pyproject.toml)",
-                tests_dir.display()
+                "no tests directory at {tests_dir}; not a workspace either (no [tool.uv.workspace] in pyproject.toml)",
             );
         }
         tracing::warn!(
-            tests_dir = %tests_dir.display(),
+            tests_dir = %tests_dir,
             "tests directory not found; emitting empty inventory"
         );
         inv.accepted =
@@ -1031,8 +1075,17 @@ fn run_static_dir_with_options(
         return Ok(inv);
     }
 
-    let files = walker::discover_test_files(&tests_dir)
-        .with_context(|| format!("failed to walk {}", tests_dir.display()))?;
+    let mut files = Vec::new();
+    for dir in &existing {
+        files.extend(
+            walker::discover_test_files(dir)
+                .with_context(|| format!("failed to walk {}", dir.display()))?,
+        );
+    }
+    // Overlapping entries (`tests` and `tests/unit`) must not parse a file
+    // twice; sorting also keeps the inventory order deterministic.
+    files.sort();
+    files.dedup();
 
     // Symmetric counterpart to the "tests directory not found" WARN above:
     // when the dir exists but the walker returns zero `test_*.py` files,
@@ -1041,7 +1094,7 @@ fn run_static_dir_with_options(
     // logs an info-level breadcrumb for the same reason.
     if files.is_empty() {
         tracing::warn!(
-            tests_dir = %tests_dir.display(),
+            tests_dir = %tests_dir,
             "no python test files under tests dir; emitting empty inventory"
         );
     } else {
@@ -1049,7 +1102,7 @@ fn run_static_dir_with_options(
         // the fmt subscriber renders both, so interpolating the same data
         // into the message would double-stamp it in user-visible output.
         tracing::info!(
-            tests_dir = %tests_dir.display(),
+            tests_dir = %tests_dir,
             count = files.len(),
             "discovered python test files"
         );

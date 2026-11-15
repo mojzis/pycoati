@@ -84,7 +84,12 @@ pycoati . --format pretty
 - `--format <json|pretty>` — `json` is the structured inventory and the only
   format this guide can read. `pretty` is an aligned-column terminal view for
   humans. Default: `json`.
-- `--tests-dir <PATH>` — override test discovery root. Default: `<path>/tests`.
+- `--tests-dir <PATH>` — override test discovery root. Default: every entry of
+  `[tool.pytest.ini_options].testpaths` in `<path>/pyproject.toml` (list or
+  single string, relative to `<path>`; entries that do not exist are skipped
+  with a warning), else `<path>/tests`. Workspace members use their own
+  `pyproject.toml` the same way. `pytest.ini`, `tox.ini` and `setup.cfg` are
+  not read.
   Directory input only; rejected for single-file input and for workspace roots.
 - `--static-only` — skip every pytest subprocess. The scan becomes pure AST
   analysis: fast, no test execution, and every `suite.*` field stays `null`.
