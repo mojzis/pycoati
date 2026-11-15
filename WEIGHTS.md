@@ -20,6 +20,7 @@ score = w_mock_only      * (only_asserts_on_mock ? 1.0 : 0.0)
       + w_smell_density  * min(smell_hits.len() / 3.0, 1.0)
 
 unverified = assertion_count == 0 && external_verification_count == 0
+             && helper_assertion_count == 0
 patches    = patch_decorator_count + patch_call_count
 ```
 
@@ -32,7 +33,7 @@ patches    = patch_decorator_count + patch_call_count
 | `w_mock_only` | `0.35` | Strongest single signal — a test whose only assertions target the Mock API is exercising the test double itself, not production logic. |
 | `w_patch_count` | `0.20` | High patch density flags tests where the System Under Test has been replaced wholesale; saturates at 5 to avoid runaway scores on extreme outliers. Counts every patch the test installs — `@patch` decorators, `with patch(...)` / `patch.object(...)` in the body, `mocker.patch*` — so the spelling does not change the score. |
 | `w_setup_ratio` | `0.15` | Long setup before the first assertion correlates with brittle tests that drift from their intent; sigmoid keeps the term smooth and bounded. |
-| `w_zero_asserts` | `0.20` | A test that verifies nothing cannot fail by intent — it survives only by not raising. Weight is high but slightly below `w_mock_only` because such tests are often vestigial smoke tests rather than mock-theater. The term is gated on `unverified`, not on `assertion_count` alone: a test that checks a child process's exit status does fail by intent. |
+| `w_zero_asserts` | `0.20` | A test that verifies nothing cannot fail by intent — it survives only by not raising. Weight is high but slightly below `w_mock_only` because such tests are often vestigial smoke tests rather than mock-theater. The term is gated on `unverified`, not on `assertion_count` alone: a test that checks a child process's exit status, or verifies through an assertion helper, does fail by intent. |
 | `w_smell_density` | `0.10` | Re-uses information already captured by other heuristics, so weighted lowest — but a test that trips multiple smells should rank above one that trips none. |
 
 Sum of the weight values: **1.00** — a test that fires every term and
@@ -88,12 +89,26 @@ saturates each saturating sub-metric reaches a score of 1.0.
   that has an `except`, or inside `with contextlib.suppress(...)`. Evidence the test manufactured, or that cannot
   escape, is not evidence. `from subprocess import *` is never matched
   at all, which under-counts; that is the safe direction.
+- `helper_assertion_count` counts verification delegated to a call:
+  a call canonicalizing to `numpy.testing.assert_*` /
+  `pandas.testing.assert_*` / `polars.testing.assert_*` / `pytest.fail`;
+  a `with pytest.warns(...)` / `with pytest.deprecated_call()` block; and a
+  call to a same-file helper (module-level function by bare name, or
+  `self.<method>` on the test's class) whose body holds a non-mock
+  effective assertion — one level deep, no imports, no `conftest.py`. The
+  closed lists live in `src/assertion_helpers.rs`. Like
+  `external_verification_count` it stays out of `assertion_count`; unlike
+  it, each site is a full non-mock assertion: it switches off
+  `w_zero_asserts`, disqualifies `only_asserts_on_mock` (so `w_mock_only`
+  is off), and is an assertion site for `setup_to_assertion_ratio`. It is
+  not part of the `mock_overuse` denominator.
 - `setup_to_assertion_ratio` (locked, Run 3; extended to raises blocks
   and to external verification): when at least one effective assertion
   exists in the body, `(first_effective_line - def_line) /
   effective_count` measured in tree-sitter `start_position().row`
   deltas, where an effective assertion is an `assert_statement`, a
-  `with pytest.raises(...)` block or a bare Mock-API assertion call. When the body has no effective
+  `with pytest.raises(...)` block, a bare Mock-API assertion call or a
+  `helper_assertion_count` site. When the body has no effective
   assertion but does carry external verification, the first verification
   call site takes the assertion's place: `(first_verification_line -
   def_line) / external_verification_count` — the body is not "setup with

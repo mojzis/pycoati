@@ -75,6 +75,7 @@ use anyhow::{Context, Result};
 use tree_sitter::{Node, Parser};
 
 use crate::accept::fingerprint;
+use crate::assertion_helpers::{is_checking_context_manager, is_library_assertion_call};
 use crate::mock_api::{
     chain_constructs_a_mock, is_mock_api_attribute, is_mock_assert_method,
     is_mock_assertion_helper, is_mock_construction_call, is_mocker_patch_head, is_patch_call,
@@ -144,21 +145,33 @@ pub fn parse_python_file(source: &str, file_path: &Path) -> Result<ParsedFile> {
     Ok(parsed)
 }
 
-/// What an enclosing `class` contributes to one of its test methods:
-/// pytest's nodeid prefix, plus the names the class replaced with a test
-/// double for every method in it — a class-level `@patch`, or a `setUp`
-/// that starts a patcher. Module-level tests carry [`ClassContext::NONE`].
+/// What the enclosing scope contributes to one test: pytest's nodeid
+/// prefix, the names the class replaced with a test double for every method
+/// in it — a class-level `@patch`, or a `setUp` that starts a patcher — and
+/// the same-file helpers a call may verify through. Module-level tests carry
+/// [`ClassContext::module`].
 #[derive(Clone, Copy)]
 struct ClassContext<'a> {
     prefix: Option<&'a str>,
     /// Dotted names the class installed doubles for. Borrowed because the
     /// set is computed once per class and shared by every method in it.
     shadows: &'a BTreeSet<String>,
+    /// Module-level functions whose body holds a non-mock assertion.
+    module_helpers: &'a BTreeSet<String>,
+    /// Methods of the enclosing class whose body holds a non-mock
+    /// assertion, reached as `self.<name>(...)`. Empty at module level.
+    method_helpers: &'a BTreeSet<String>,
 }
 
-impl ClassContext<'_> {
-    /// A module-level test: no nodeid prefix, no class-installed doubles.
-    const NONE: Self = Self { prefix: None, shadows: &BTreeSet::new() };
+/// Shared empty set for scopes that contribute nothing.
+static EMPTY_NAMES: BTreeSet<String> = BTreeSet::new();
+
+impl<'a> ClassContext<'a> {
+    /// A module-level test: no nodeid prefix, no class-installed doubles,
+    /// no methods — only the module's helpers.
+    fn module(module_helpers: &'a BTreeSet<String>) -> Self {
+        Self { prefix: None, shadows: &EMPTY_NAMES, module_helpers, method_helpers: &EMPTY_NAMES }
+    }
 }
 
 /// Iterate the immediate children of the module and dispatch on node kind:
@@ -172,19 +185,13 @@ fn collect_module_tests(
     imports: &ImportMap,
     out: &mut ParsedFile,
 ) {
+    let module_helpers = verifying_helpers(module, source, imports, false);
+    let module_ctx = ClassContext::module(&module_helpers);
     let mut cursor = module.walk();
     for child in module.children(&mut cursor) {
         match child.kind() {
             "function_definition" => {
-                try_collect_test_function(
-                    child,
-                    None,
-                    source,
-                    file_path,
-                    ClassContext::NONE,
-                    imports,
-                    out,
-                );
+                try_collect_test_function(child, None, source, file_path, module_ctx, imports, out);
             }
             "decorated_definition" => {
                 if let Some(inner) = child.child_by_field_name("definition") {
@@ -195,7 +202,7 @@ fn collect_module_tests(
                                 Some(child),
                                 source,
                                 file_path,
-                                ClassContext::NONE,
+                                module_ctx,
                                 imports,
                                 out,
                             );
@@ -206,6 +213,7 @@ fn collect_module_tests(
                                 Some(child),
                                 source,
                                 file_path,
+                                module_ctx,
                                 imports,
                                 out,
                             );
@@ -215,7 +223,7 @@ fn collect_module_tests(
                 }
             }
             "class_definition" => {
-                collect_class_tests(child, None, source, file_path, imports, out);
+                collect_class_tests(child, None, source, file_path, module_ctx, imports, out);
             }
             _ => {}
         }
@@ -232,6 +240,7 @@ fn collect_class_tests(
     class_decorated: Option<Node<'_>>,
     source: &[u8],
     file_path: &Path,
+    module: ClassContext<'_>,
     imports: &ImportMap,
     out: &mut ParsedFile,
 ) {
@@ -245,7 +254,13 @@ fn collect_class_tests(
         return;
     };
     let shadows = class_installed_doubles(body, class_decorated, source, imports);
-    let class = ClassContext { prefix: Some(class_name), shadows: &shadows };
+    let method_helpers = verifying_helpers(body, source, imports, true);
+    let class = ClassContext {
+        prefix: Some(class_name),
+        shadows: &shadows,
+        module_helpers: module.module_helpers,
+        method_helpers: &method_helpers,
+    };
     let mut cursor = body.walk();
     for child in body.children(&mut cursor) {
         match child.kind() {
@@ -270,6 +285,160 @@ fn collect_class_tests(
             _ => {}
         }
     }
+}
+
+/// Every `function_definition` directly in `container` — a module or a
+/// class body — unwrapping `decorated_definition`s.
+fn direct_function_defs(container: Node<'_>) -> Vec<Node<'_>> {
+    let mut cursor = container.walk();
+    let defs = container
+        .children(&mut cursor)
+        .filter_map(|child| match child.kind() {
+            "function_definition" => Some(child),
+            "decorated_definition" => child
+                .child_by_field_name("definition")
+                .filter(|inner| inner.kind() == "function_definition"),
+            _ => None,
+        })
+        .collect();
+    defs
+}
+
+/// Names of the functions directly in `container` whose body holds a
+/// non-mock effective assertion (see [`body_has_real_assertion`]). These
+/// are the same-file helpers a test call can verify through.
+fn verifying_helpers(
+    container: Node<'_>,
+    source: &[u8],
+    imports: &ImportMap,
+    in_class: bool,
+) -> BTreeSet<String> {
+    direct_function_defs(container)
+        .into_iter()
+        .filter(|func| {
+            func.child_by_field_name("body")
+                .is_some_and(|body| body_has_real_assertion(body, source, imports, in_class))
+        })
+        .filter_map(|func| node_name(func, source).map(String::from))
+        .collect()
+}
+
+/// True iff a helper body holds at least one non-mock effective assertion:
+/// an `assert` that does not target the Mock API, a raises block, a library
+/// assertion helper or checking `with` block, or — inside a class — a
+/// `self.assertXxx(...)` call that does not target the Mock API.
+///
+/// Calls to *other* same-file helpers are not followed: one level of
+/// indirection is the whole rule. Bare mock `assert_*` calls are mock
+/// assertions and do not qualify a helper.
+fn body_has_real_assertion(
+    body: Node<'_>,
+    source: &[u8],
+    imports: &ImportMap,
+    in_class: bool,
+) -> bool {
+    let mut asserts = Vec::new();
+    collect_asserts(body, &mut asserts);
+    if asserts.iter().any(|a| !assert_targets_mock_api(*a, source)) {
+        return true;
+    }
+    let mut blocks = Vec::new();
+    collect_raises_blocks(body, source, &mut blocks);
+    collect_checking_blocks(body, source, imports, &mut blocks);
+    if !blocks.is_empty() {
+        return true;
+    }
+    let mut calls = Vec::new();
+    collect_calls(body, &mut calls);
+    if calls.iter().any(|c| call_is_library_assertion(*c, source, imports)) {
+        return true;
+    }
+    if !in_class {
+        return false;
+    }
+    let mut unittest = Vec::new();
+    collect_unittest_asserts(&calls, true, source, &mut unittest);
+    unittest.iter().any(|c| !unittest_assert_targets_mock_api(*c, source, imports))
+}
+
+/// True iff `call`'s head canonicalizes to a library assertion helper or a
+/// failing call (`numpy.testing.assert_allclose`, `pytest.fail`).
+fn call_is_library_assertion(call: Node<'_>, source: &[u8], imports: &ImportMap) -> bool {
+    call_head_chain(call, source)
+        .is_some_and(|chain| is_library_assertion_call(&canonicalize_called_name(&chain, imports)))
+}
+
+/// Collect every `with_statement` in the subtree that opens a checking
+/// context manager (`pytest.warns(...)`, `pytest.deprecated_call()`) on one
+/// of its items, resolved through the import map. Each block counts once.
+fn collect_checking_blocks<'a>(
+    node: Node<'a>,
+    source: &[u8],
+    imports: &ImportMap,
+    out: &mut Vec<Node<'a>>,
+) {
+    let mut withs: Vec<Node<'a>> = Vec::new();
+    collect_descendants(node, "with_statement", &mut withs);
+    out.extend(withs.into_iter().filter(|w| {
+        with_item_calls(*w).into_iter().any(|call| {
+            call_head_chain(call, source).is_some_and(|chain| {
+                is_checking_context_manager(&canonicalize_called_name(&chain, imports))
+            })
+        })
+    }));
+}
+
+/// The context-manager calls a `with_statement` opens, one per item,
+/// unwrapping `as` targets: `with a(), b() as x:` yields `a()` and `b()`.
+fn with_item_calls(with_stmt: Node<'_>) -> Vec<Node<'_>> {
+    let mut cursor = with_stmt.walk();
+    let Some(clause) = with_stmt.children(&mut cursor).find(|c| c.kind() == "with_clause") else {
+        return Vec::new();
+    };
+    let mut item_cursor = clause.walk();
+    let calls = clause
+        .named_children(&mut item_cursor)
+        .filter(|item| item.kind() == "with_item")
+        .filter_map(|item| item.child_by_field_name("value"))
+        .filter_map(|value| match value.kind() {
+            "call" => Some(value),
+            "as_pattern" => value.named_child(0).filter(|n| n.kind() == "call"),
+            _ => None,
+        })
+        .collect();
+    calls
+}
+
+/// True iff `call` invokes a same-file helper that verifies: a bare name
+/// bound to a verifying module-level function (and not shadowed by one of
+/// the test's own parameters), or `self.<name>` for a verifying method of
+/// the enclosing class.
+fn call_is_same_file_helper(
+    call: Node<'_>,
+    source: &[u8],
+    class: ClassContext<'_>,
+    parameters: &BTreeSet<String>,
+) -> bool {
+    let Some(chain) = call_head_chain(call, source) else {
+        return false;
+    };
+    match chain.strip_prefix("self.") {
+        Some(method) => class.method_helpers.contains(method),
+        None => class.module_helpers.contains(&chain) && !parameters.contains(&chain),
+    }
+}
+
+/// The identifiers a function's parameters bind, `self` included.
+fn parameter_names(func: Node<'_>, source: &[u8]) -> BTreeSet<String> {
+    let Some(params) = func.child_by_field_name("parameters") else {
+        return BTreeSet::new();
+    };
+    let mut cursor = params.walk();
+    let names = params
+        .named_children(&mut cursor)
+        .filter_map(|p| parameter_name(p, source).map(String::from))
+        .collect();
+    names
 }
 
 /// Lifecycle hooks that run before a test method and therefore install
@@ -378,39 +547,14 @@ fn build_record(
 
     let body = func.child_by_field_name("body");
 
-    let mut asserts: Vec<Node<'_>> = Vec::new();
     let mut calls: Vec<Node<'_>> = Vec::new();
-    let mut raises_blocks: Vec<Node<'_>> = Vec::new();
-    let mut unittest_asserts: Vec<Node<'_>> = Vec::new();
-    let mut bare_mock_asserts: Vec<Node<'_>> = Vec::new();
     if let Some(body_node) = body {
-        collect_asserts(body_node, &mut asserts);
         collect_calls(body_node, &mut calls);
-        collect_bare_mock_asserts(&calls, source, &mut bare_mock_asserts);
-        collect_raises_blocks(body_node, source, &mut raises_blocks);
-        // Reuse the `calls` vector already walked above instead of rewalking
-        // the body — keeps the parse pass single-walk per node kind.
-        collect_unittest_asserts(&calls, class.prefix, source, &mut unittest_asserts);
     }
-
-    // Four kinds of assertion site, each counted once:
-    // * `assert` statements — mock-targeting when the asserted expression
-    //   reads a Mock-API attribute;
-    // * `with pytest.raises(...)` blocks — never mock-targeting;
-    // * `self.assertXxx(...)` calls inside a class — mock-targeting when every
-    //   non-literal argument reads a Mock-API attribute;
-    // * bare `m.assert_*(...)` statements — always mock-targeting.
-    let assertion_count =
-        (asserts.len() + raises_blocks.len() + unittest_asserts.len() + bare_mock_asserts.len())
-            as u64;
-    let mock_assertion_count =
-        (asserts.iter().filter(|a| assert_targets_mock_api(**a, source)).count()
-            + unittest_asserts
-                .iter()
-                .filter(|c| unittest_assert_targets_mock_api(**c, source, imports))
-                .count()
-            + bare_mock_asserts.len()) as u64;
-    let only_asserts_on_mock = assertion_count > 0 && mock_assertion_count == assertion_count;
+    let tally = tally_assertions(func, body, &calls, class, source, imports);
+    let only_asserts_on_mock = tally.assertion_count > 0
+        && tally.mock_assertion_count == tally.assertion_count
+        && tally.helper_assertion_count == 0;
 
     // Each call head resolved once to its Mock-API name, if it has one.
     let mock_api_heads: Vec<String> =
@@ -447,10 +591,8 @@ fn build_record(
 
     let patch_decorator_count = decorated.map_or(0, |d| count_patch_decorators(d, source, imports));
 
-    let assertion_sites: Vec<Node<'_>> =
-        asserts.iter().chain(&raises_blocks).chain(&bare_mock_asserts).copied().collect();
     let setup_to_assertion_ratio =
-        compute_setup_to_assertion_ratio(func, body, &assertion_sites, &verification_sites);
+        compute_setup_to_assertion_ratio(func, body, &tally.sites, &verification_sites);
 
     let nodeid = match class.prefix {
         Some(cls) => format!("{}::{}::{}", file_path.display(), cls, name),
@@ -483,15 +625,16 @@ fn build_record(
         nodeid,
         file: file_path.to_path_buf(),
         line,
-        assertion_count,
+        assertion_count: tally.assertion_count,
         only_asserts_on_mock,
-        mock_assertion_count,
+        mock_assertion_count: tally.mock_assertion_count,
         patch_decorator_count,
         patch_call_count,
         mock_construction_count,
         stubs_count,
         setup_to_assertion_ratio,
         external_verification_count,
+        helper_assertion_count: tally.helper_assertion_count,
         called_names,
         smell_hits: Vec::new(),
         suspicion_score: 0.0,
@@ -500,12 +643,93 @@ fn build_record(
     }
 }
 
-/// Compute `setup_to_assertion_ratio` per the locked Run 3 definition,
-/// extended to treat `with pytest.raises(...)` blocks and bare Mock-API
-/// assertion calls as effective assertions.
+/// The assertion sites of one test body, classified.
+struct AssertionTally<'a> {
+    /// Syntactic assertion sites: `assert` statements, raises blocks,
+    /// `self.assertXxx(...)` calls, bare mock `assert_*` statements.
+    assertion_count: u64,
+    /// The subset of `assertion_count` that targets the Mock API.
+    mock_assertion_count: u64,
+    /// Verification delegated to a helper call or checking `with` block.
+    helper_assertion_count: u64,
+    /// Every site that counts toward `setup_to_assertion_ratio`: all of the
+    /// above except `self.assertXxx(...)` calls.
+    sites: Vec<Node<'a>>,
+}
+
+/// Collect and classify every assertion site in a test body.
 ///
-/// With at least one effective assertion (assert statement, raises block or
-/// bare `m.assert_*(...)` call):
+/// Four kinds of syntactic site, each counted once:
+/// * `assert` statements — mock-targeting when the asserted expression
+///   reads a Mock-API attribute;
+/// * `with pytest.raises(...)` blocks — never mock-targeting;
+/// * `self.assertXxx(...)` calls inside a class — mock-targeting when every
+///   non-literal argument reads a Mock-API attribute;
+/// * bare `m.assert_*(...)` statements — always mock-targeting.
+///
+/// Plus helper sites, kept out of `assertion_count`: library assertion
+/// calls, checking `with` blocks, and same-file helpers that themselves
+/// assert. Each is a non-mock assertion.
+fn tally_assertions<'a>(
+    func: Node<'a>,
+    body: Option<Node<'a>>,
+    calls: &[Node<'a>],
+    class: ClassContext<'_>,
+    source: &[u8],
+    imports: &ImportMap,
+) -> AssertionTally<'a> {
+    let mut asserts: Vec<Node<'a>> = Vec::new();
+    let mut raises_blocks: Vec<Node<'a>> = Vec::new();
+    let mut checking_blocks: Vec<Node<'a>> = Vec::new();
+    if let Some(body_node) = body {
+        collect_asserts(body_node, &mut asserts);
+        collect_raises_blocks(body_node, source, &mut raises_blocks);
+        collect_checking_blocks(body_node, source, imports, &mut checking_blocks);
+    }
+    // Both reuse the body's `calls` vector instead of rewalking the tree.
+    let mut unittest_asserts: Vec<Node<'a>> = Vec::new();
+    collect_unittest_asserts(calls, class.prefix.is_some(), source, &mut unittest_asserts);
+    let mut bare_mock_asserts: Vec<Node<'a>> = Vec::new();
+    collect_bare_mock_asserts(calls, source, &mut bare_mock_asserts);
+
+    let assertion_count =
+        (asserts.len() + raises_blocks.len() + unittest_asserts.len() + bare_mock_asserts.len())
+            as u64;
+    let mock_assertion_count =
+        (asserts.iter().filter(|a| assert_targets_mock_api(**a, source)).count()
+            + unittest_asserts
+                .iter()
+                .filter(|c| unittest_assert_targets_mock_api(**c, source, imports))
+                .count()
+            + bare_mock_asserts.len()) as u64;
+
+    let parameters = parameter_names(func, source);
+    let helper_sites: Vec<Node<'a>> = calls
+        .iter()
+        .copied()
+        .filter(|c| {
+            call_is_library_assertion(*c, source, imports)
+                || call_is_same_file_helper(*c, source, class, &parameters)
+        })
+        .chain(checking_blocks)
+        .collect();
+    let helper_assertion_count = helper_sites.len() as u64;
+
+    let sites = asserts
+        .into_iter()
+        .chain(raises_blocks)
+        .chain(bare_mock_asserts)
+        .chain(helper_sites)
+        .collect();
+    AssertionTally { assertion_count, mock_assertion_count, helper_assertion_count, sites }
+}
+
+/// Compute `setup_to_assertion_ratio` per the locked Run 3 definition,
+/// extended to treat `with pytest.raises(...)` blocks, bare Mock-API
+/// assertion calls and assertion-helper sites as effective assertions.
+///
+/// With at least one effective assertion (assert statement, raises block,
+/// bare `m.assert_*(...)` call or helper site):
 ///   `(first_effective_row - def_row) / effective_count`
 ///
 /// With zero effective assertions but at least one external-verification
@@ -1422,7 +1646,7 @@ fn collect_raises_blocks<'a>(node: Node<'a>, source: &[u8], out: &mut Vec<Node<'
 /// `self.assertTrue`, `self.assertIn`, the bare `self.assert`, …). These
 /// count as effective assertions just like a bare `assert`.
 ///
-/// Gated on `class_prefix.is_some()` because outside a class context
+/// Gated on `in_class` because outside a class context
 /// `self.*` cannot bind to a `TestCase` receiver. Inside `Test*` classes
 /// pytest happily collects unittest subclasses, so we accept any
 /// `camelCase` `self.assert*` head without further static checks.
@@ -1436,11 +1660,11 @@ fn collect_raises_blocks<'a>(node: Node<'a>, source: &[u8], out: &mut Vec<Node<'
 /// the tree.
 fn collect_unittest_asserts<'a>(
     calls: &[Node<'a>],
-    class_prefix: Option<&str>,
+    in_class: bool,
     source: &[u8],
     out: &mut Vec<Node<'a>>,
 ) {
-    if class_prefix.is_none() {
+    if !in_class {
         return;
     }
     for &call in calls {
@@ -3210,5 +3434,182 @@ def test_x(mocker):
         assert_eq!(t.stubs_count, 4);
         assert_eq!(t.mock_construction_count, 0, "stubs and constructions stay disjoint");
         assert_eq!(t.patch_call_count, 0);
+    }
+
+    // ---- Helper-based verification ----
+
+    #[test]
+    fn library_assertion_helpers_resolve_through_the_import_map() {
+        let src = "\
+import numpy as np
+import pandas.testing as pdt
+from polars.testing import assert_frame_equal
+
+def test_a():
+    result = compute()
+    np.testing.assert_allclose(result, 1.0)
+    pdt.assert_series_equal(result, result)
+    assert_frame_equal(result, result)
+";
+        let t = &parse(src)[0];
+        assert_eq!(t.assertion_count, 0, "helpers stay out of the syntactic count");
+        assert_eq!(t.helper_assertion_count, 3);
+        assert!(!t.verifies_nothing());
+        assert!(!t.only_asserts_on_mock);
+        // def row 5, first helper row 7, three sites → 2 / 3.
+        assert!(
+            (t.setup_to_assertion_ratio - 2.0 / 3.0).abs() < 1e-9,
+            "ratio {}",
+            t.setup_to_assertion_ratio
+        );
+    }
+
+    #[test]
+    fn pytest_fail_and_warning_blocks_are_helper_assertions() {
+        let src = "\
+import pytest
+from pytest import deprecated_call
+
+def test_a():
+    with pytest.warns(UserWarning):
+        warn()
+    with deprecated_call():
+        old()
+    with pytest.warns(DeprecationWarning) as record:
+        old()
+    if broken():
+        pytest.fail('broken')
+";
+        let t = &parse(src)[0];
+        assert_eq!(t.helper_assertion_count, 4);
+        assert_eq!(t.assertion_count, 0);
+    }
+
+    #[test]
+    fn non_assertion_library_calls_are_not_helpers() {
+        // `np.allclose` returns a bool; `makeDataFrame` builds data; a
+        // `testing` module of your own is not a known library; a bare
+        // `warns` that no import binds is not pytest's.
+        let src = "\
+import numpy as np
+import pandas as pd
+import myproj.testing
+
+def test_a():
+    np.allclose(a, b)
+    pd.testing.makeDataFrame()
+    myproj.testing.assert_ok(a)
+    with warns(UserWarning):
+        warn()
+";
+        let t = &parse(src)[0];
+        assert_eq!(t.helper_assertion_count, 0);
+        assert!(t.verifies_nothing());
+    }
+
+    #[test]
+    fn same_file_function_with_a_real_assertion_is_a_helper() {
+        let src = "\
+import numpy as np
+
+def check_total(cart, expected):
+    assert cart.total == expected
+
+def check_close(a, b):
+    np.testing.assert_allclose(a, b)
+
+def check_called(m):
+    m.assert_called_once()
+
+def build():
+    return Cart()
+
+def test_a():
+    cart = build()
+    check_total(cart, 1)
+    check_close(cart.total, 1.0)
+    check_called(m)
+";
+        let t = &parse(src)[0];
+        // `check_called` asserts only on the mock and `build` asserts
+        // nothing: neither is verification.
+        assert_eq!(t.helper_assertion_count, 2);
+        assert!(!t.verifies_nothing());
+    }
+
+    #[test]
+    fn helper_indirection_is_followed_one_level_only() {
+        let src = "\
+def inner(x):
+    assert x
+
+def outer(x):
+    inner(x)
+
+def test_a():
+    outer(1)
+";
+        let t = &parse(src)[0];
+        assert_eq!(t.helper_assertion_count, 0);
+        assert!(t.verifies_nothing());
+    }
+
+    #[test]
+    fn same_class_method_with_a_real_assertion_is_a_helper() {
+        let src = "\
+class TestX(unittest.TestCase):
+    def _check(self, value):
+        assert value == 1
+
+    def assert_valid(self, value):
+        self.assertTrue(value.ok)
+
+    def _setup(self):
+        return 1
+
+    def test_a(self):
+        v = self._setup()
+        self._check(v)
+        self.assert_valid(v)
+
+class TestY:
+    def test_b(self):
+        self._check(1)
+";
+        let recs = parse(src);
+        assert_eq!(recs[0].helper_assertion_count, 2);
+        assert_eq!(recs[0].assertion_count, 0);
+        // Another class's method of the same name is not this class's.
+        assert_eq!(recs[1].helper_assertion_count, 0);
+    }
+
+    #[test]
+    fn a_parameter_shadowing_a_helper_name_is_not_the_helper() {
+        let src = "\
+def check(x):
+    assert x
+
+def test_a(check):
+    check(1)
+";
+        assert_eq!(parse(src)[0].helper_assertion_count, 0);
+    }
+
+    #[test]
+    fn a_helper_beside_mock_assertions_disqualifies_mock_only() {
+        let src = "\
+def check_total(cart, expected):
+    assert cart.total == expected
+
+def test_a():
+    cart = run(m)
+    m.assert_called_once()
+    check_total(cart, 1)
+";
+        let t = &parse(src)[0];
+        assert_eq!(t.assertion_count, 1);
+        assert_eq!(t.mock_assertion_count, 1);
+        assert_eq!(t.helper_assertion_count, 1);
+        assert!(!t.only_asserts_on_mock);
     }
 }

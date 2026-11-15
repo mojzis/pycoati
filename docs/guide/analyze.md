@@ -186,8 +186,9 @@ analysis reads from here.
   Computed as
   `(first_effective_assertion_line - def_line) / effective_assertion_count`,
   where an effective assertion is an `assert` statement, a
-  `with pytest.raises(...)` block or a bare mock-API assertion call
-  (`m.assert_called_once_with(1)`). `self.assertXxx(...)` calls raise
+  `with pytest.raises(...)` block, a bare mock-API assertion call
+  (`m.assert_called_once_with(1)`) or a `helper_assertion_count` site.
+  `self.assertXxx(...)` calls raise
   `assertion_count` without feeding this denominator.
   When the body has no effective assertion but does carry external
   verification, the first such call site stands in for the first assertion:
@@ -218,6 +219,27 @@ analysis reads from here.
   `from subprocess import *`, which binds an unknown set of names; and every
   `check_returncode()` in a test that patched any `subprocess` name at all,
   including one on a real `CompletedProcess`.
+- `helper_assertion_count` — verification this test delegates to a call
+  rather than writing as an assertion site. Three closed sources, one each:
+  - a call resolving through the file's imports to `numpy.testing.assert_*`,
+    `pandas.testing.assert_*`, `polars.testing.assert_*` or `pytest.fail` —
+    `np.testing.assert_allclose(...)` under `import numpy as np` counts;
+  - a `with pytest.warns(...):` or `with pytest.deprecated_call():` block,
+    one per block, like a raises block;
+  - a call to a **same-file helper** whose own body holds a non-mock
+    assertion: a module-level function called by bare name (and not shadowed
+    by one of the test's parameters), or `self.<method>(...)` for a method of
+    the test's own class. One level only: a helper that verifies by calling
+    another helper does not count, nor does anything imported or defined in
+    `conftest.py`. A helper whose only assertions target the mock API does
+    not count either.
+
+  **Not part of `assertion_count`** — read the two together, like
+  `external_verification_count`. Each site counts as a non-mock assertion
+  everywhere else: it switches off `zero_asserts`, makes
+  `only_asserts_on_mock` `false`, and is an assertion site for
+  `setup_to_assertion_ratio`. It does not enter the `mock_overuse`
+  denominator, which stays `assertion_count`.
 - `called_names` — sorted, deduplicated, dot-joined names of calls in this test
   body, **filtered to project-internal names only**. Calls into the standard
   library, into third-party packages, and `self.*` calls are all excluded. An
@@ -310,9 +332,10 @@ is removed from `files`, `test_functions`, `smell_hits`, or any count.
   `mock_only_assertions`, `mock_overuse`, `zero_asserts`, `high_setup_ratio`.
   The first two mirror `smell_hits[].category`; the last two are score-bearing
   signals that produce no smell hit. `zero_asserts` fires on the same
-  condition as the score's term — `assertion_count == 0` **and**
-  `external_verification_count == 0` — so a test that checks a child process
-  never offers it, and an entry accepting it on such a test goes `stale`.
+  condition as the score's term — `assertion_count == 0`,
+  `external_verification_count == 0` **and** `helper_assertion_count == 0` —
+  so a test that checks a child process or verifies through a helper never
+  offers it, and an entry accepting it on such a test goes `stale`.
 - `reason` — the reviewer's recorded justification. Always non-empty; the file
   will not parse without it. **Quote it in your report** — it is the whole
   content of the review decision, and re-deriving it is what this block
@@ -360,6 +383,7 @@ suspicion_score = 0.35 * (only_asserts_on_mock ? 1 : 0)
                 + 0.10 * min(len(smell_hits) / 3, 1)
 
 unverified = assertion_count == 0 and external_verification_count == 0
+             and helper_assertion_count == 0
 ```
 
 `sigmoid(x) = 1 / (1 + e^-x)`. Weights sum to `1.00`.
@@ -384,8 +408,8 @@ body and `0.35` for a long one — `0.35` is the ceiling of those two terms
 together and is approached, never reached. Do not read a score in that band as
 mock abuse.
 
-A test with `assertion_count == 0` and `external_verification_count > 0` does
-not reach that band *for those reasons*: the `w_zero_asserts` term is off, and
+A test with `assertion_count == 0` and `external_verification_count > 0` or
+`helper_assertion_count > 0` does not reach that band *for those reasons*: the `w_zero_asserts` term is off, and
 the setup ratio is measured to the first verification call site instead of the
 whole body height, so it is no longer inflated — though it still contributes,
 exactly as it does for a test with a real assertion. The mock, patch and smell
@@ -623,12 +647,12 @@ assertions, or it exercises no project code, so it survives on the absence of an
 exception.
 
 **Signals.**
-- `assertion_count == 0` **and** `external_verification_count == 0`. Definitive
-  for the assertionless variant. Note this contributes `0.20` to the score on
+- `assertion_count == 0`, `external_verification_count == 0` **and**
+  `helper_assertion_count == 0`. Definitive for the assertionless variant. Note this contributes `0.20` to the score on
   its own and inflates `setup_to_assertion_ratio` to the full body height, so
   these tests cluster near the top of `top_suspicious.test_functions`.
-- `assertion_count == 0`, `external_verification_count == 0` **and**
-  `called_names` empty: the test neither asserts nor calls project code.
+- The same three zeros **and** `called_names` empty: the test neither asserts
+  nor calls project code.
 - The test's nodeid appears in no `sut_calls.by_name[].test_nodeids` list
   **and** `external_verification_count == 0` — a test that shells out calls no
   project code by construction, so this signal fires on it by default.
@@ -650,14 +674,20 @@ you have. A subprocess call with no `check=True` proves nothing at all and does
 not set this field: it needs its own evidence, such as an `assert
 completed.returncode == 0`, which is a normal assertion and counts as one.
 
-**Verify by reading.** Three legitimate shapes look identical here. A smoke test
-that asserts nothing but would raise on failure is doing real work — importing a
-module, constructing an object, running a migration. A test whose assertions are
-made through a helper function will show `assertion_count == 0` because pycoati
-counts assertion sites — `assert` statements, raises blocks,
-`self.assertXxx(...)` calls and bare mock `assert_*` calls — syntactically in
-the test body and does not follow calls into helpers. And a test that verifies in a child process, as above. Check
-for all three before reporting.
+**Not this pattern: verification through a helper.** A test with
+`assertion_count == 0` and `helper_assertion_count > 0` verifies through a call
+that raises on failure — a `pandas.testing.assert_frame_equal`, a
+`pytest.warns` block, or a same-file `check_*` helper that asserts. Do not
+report it as assertionless.
+
+**Verify by reading.** Three legitimate shapes still look identical here. A
+smoke test that asserts nothing but would raise on failure is doing real work —
+importing a module, constructing an object, running a migration. A test whose
+assertions live in a helper pycoati cannot see — imported from another module,
+defined in `conftest.py`, or reached through a second helper — shows all three
+counts at zero, because helpers are followed one level deep within the file
+only. And a test that verifies in a child process the parser could not prove,
+as above. Check for all three before reporting.
 
 There is no per-test coverage in this schema, so "this test covers nothing" is
 not something the inventory can tell you. Do not claim it.

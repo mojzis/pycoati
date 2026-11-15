@@ -73,6 +73,7 @@ pub const DEFAULT: SuspicionWeights = SuspicionWeights {
 ///       + w_smell_density * min(smell_hits.len() / 3.0, 1.0)
 ///
 /// unverified = assertion_count == 0 && external_verification_count == 0
+///              && helper_assertion_count == 0
 ///              (`TestRecord::verifies_nothing`)
 /// ```
 ///
@@ -183,6 +184,7 @@ mod tests {
             stubs_count: 0,
             setup_to_assertion_ratio: 0.0,
             external_verification_count: 0,
+            helper_assertion_count: 0,
             called_names: Vec::new(),
             smell_hits: Vec::new(),
             suspicion_score: 0.0,
@@ -254,6 +256,17 @@ mod tests {
         let sa = score_test(&a, &DEFAULT);
         let sb = score_test(&b, &DEFAULT);
         assert!(approx_eq(sa, sb), "patch_count term must saturate at 5: {sa} vs {sb}");
+    }
+
+    #[test]
+    fn zero_asserts_term_is_off_when_a_helper_verifies() {
+        let mut t = make_test("a");
+        t.assertion_count = 0;
+        t.helper_assertion_count = 1;
+        let verified = score_test(&t, &DEFAULT);
+        t.helper_assertion_count = 0;
+        let unverified = score_test(&t, &DEFAULT);
+        assert!(approx_eq(unverified - verified, DEFAULT.w_zero_asserts));
     }
 
     #[test]

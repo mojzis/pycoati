@@ -252,6 +252,7 @@ mod tests {
             stubs_count: 0,
             setup_to_assertion_ratio: 0.0,
             external_verification_count: 0,
+            helper_assertion_count: 0,
             called_names: called.iter().map(|s| (*s).to_string()).collect(),
             smell_hits: Vec::new(),
             suspicion_score: 0.0,

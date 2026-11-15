@@ -24,6 +24,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 pub mod accept;
+pub(crate) mod assertion_helpers;
 pub mod coverage;
 pub mod guide;
 pub mod mock_api;
@@ -203,6 +204,21 @@ pub struct TestRecord {
     /// replaced with a double, or one nested in a `def` the test may never
     /// invoke, does not count.
     pub external_verification_count: u64,
+    /// Verification delegated to a helper call rather than written as an
+    /// assertion site in the body: a known library assertion helper
+    /// (`numpy.testing.assert_*`, `pandas.testing.assert_*`,
+    /// `polars.testing.assert_*`, `pytest.fail`), a `with pytest.warns(...)`
+    /// / `with pytest.deprecated_call()` block, or a call to a same-file
+    /// helper — a module-level function, or a method of this test's class —
+    /// whose own body holds a non-mock assertion. See
+    /// `assertion_helpers.rs` for the closed lists.
+    ///
+    /// Kept separate from `assertion_count`, like
+    /// `external_verification_count`. Each site counts as an effective
+    /// non-mock assertion: it switches off the zero-assert signal,
+    /// disqualifies `only_asserts_on_mock`, and is an assertion site for
+    /// `setup_to_assertion_ratio`.
+    pub helper_assertion_count: u64,
     pub called_names: Vec<String>,
     pub smell_hits: Vec<SmellHit>,
     pub suspicion_score: f64,
@@ -232,9 +248,9 @@ impl TestRecord {
 }
 
 impl TestRecord {
-    /// True when the test verifies nothing: no `assert`-shaped construct in
-    /// its body **and** no external-verification call site, so it can only
-    /// fail by raising.
+    /// True when the test verifies nothing: no assertion site in its body,
+    /// no external-verification call site **and** no assertion-helper call,
+    /// so it can only fail by raising.
     ///
     /// The one definition of "assertionless" in the crate. Both consumers —
     /// the `w_zero_asserts` term of `suspicion_score` and the `zero_asserts`
@@ -242,7 +258,9 @@ impl TestRecord {
     /// the acceptance baseline can never disagree about which tests the
     /// signal covers.
     pub fn verifies_nothing(&self) -> bool {
-        self.assertion_count == 0 && self.external_verification_count == 0
+        self.assertion_count == 0
+            && self.external_verification_count == 0
+            && self.helper_assertion_count == 0
     }
 }
 
