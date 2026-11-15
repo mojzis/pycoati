@@ -1,8 +1,8 @@
 # Suspicion-score weights
 
 `pycoati`'s `suspicion_score` blends five static heuristics into a single
-[0.0, ~0.9]-bounded number per test, plus a small `mock_construction`
-bonus per file. The values below are the v1 defaults that ship in
+number per test in `[0.0, 0.80)` (see [Reachable range](#reachable-range)),
+plus a small `mock_construction` bonus per file. The values below are the v1 defaults that ship in
 `src/suspicion.rs::DEFAULT`; they are **heuristic starting points**, not
 empirically tuned constants. Treat the formula as the contract and the
 numbers as defaults you may want to revise after running pycoati on a real
@@ -17,7 +17,7 @@ score = w_mock_only      * (only_asserts_on_mock ? 1.0 : 0.0)
       + w_patch_count    * min(patches / 5.0, 1.0)
       + w_setup_ratio    * sigmoid((setup_to_assertion_ratio - 8.0) / 4.0)
       + w_zero_asserts   * (unverified ? 1.0 : 0.0)
-      + w_smell_density  * min(smell_hits.len() / 3.0, 1.0)
+      + w_smell_density  * min(smell_hits.len() / 2.0, 1.0)
 
 unverified = assertion_count == 0 && external_verification_count == 0
              && helper_assertion_count == 0
@@ -36,8 +36,29 @@ patches    = patch_decorator_count + patch_call_count
 | `w_zero_asserts` | `0.20` | A test that verifies nothing cannot fail by intent — it survives only by not raising. Weight is high but slightly below `w_mock_only` because such tests are often vestigial smoke tests rather than mock-theater. The term is gated on `unverified`, not on `assertion_count` alone: a test that checks a child process's exit status, or verifies through an assertion helper, does fail by intent. |
 | `w_smell_density` | `0.10` | Re-uses information already captured by other heuristics, so weighted lowest — but a test that trips multiple smells should rank above one that trips none. |
 
-Sum of the weight values: **1.00** — a test that fires every term and
-saturates each saturating sub-metric reaches a score of 1.0.
+Sum of the weight values: **1.00**. That sum is **not** a reachable
+score — see the next section.
+
+## Reachable range
+
+Two of the five terms can never fire together. `w_mock_only` requires
+`only_asserts_on_mock`, which requires `assertion_count > 0`; `w_zero_asserts`
+requires `assertion_count == 0`. So the highest-scoring test is one of two
+shapes:
+
+| Branch | mock-only | patch | setup | zero-asserts | smells | Supremum |
+|---|---|---|---|---|---|---|
+| Mock-only (asserts only on the double) | 0.35 | 0.20 | → 0.15 | 0 | 0.10 (both smells) | **0.80** |
+| Unverified (no verification at all) | 0 | 0.20 | → 0.15 | 0.20 | 0.05 (`mock_overuse` only) | 0.60 |
+
+The unverified branch can carry only one smell: `mock_only_assertions`
+needs an assertion. The setup term is a sigmoid, which approaches
+`w_setup_ratio` without reaching it, so both bounds are approached and never
+attained: **every test score lies in `[0.0, 0.80)`**, and in practice in
+`(0.018, 0.80)`, because the setup term is never zero either. A file score
+adds at most `0.10` to a mean of test scores, so it lies in `[0.0, 0.90)`.
+
+Changing a weight changes these bounds; recompute them from the table.
 
 ## Sub-metric definitions
 
@@ -121,9 +142,13 @@ saturates each saturating sub-metric reaches a score of 1.0.
   installs five or more patches, by decorator or in the body. Five is the
   point past which incremental patches add no new signal — the test is
   already maximally mock-mediated.
-- `smell_hits.len()` saturates at **3**: three smell categories on a
-  single test is enough to flag it; the term is the same at three and at
-  ten.
+- `smell_hits.len()` saturates at **2**, the number of per-test smell
+  categories (`mock_only_assertions`, `mock_overuse`). The saturation point
+  is derived from that category list in `src/smells.rs`, so a test that
+  trips every per-test smell gets the full `w_smell_density`; a third
+  category would move it to 3 automatically. Before this was tied to the
+  category count it sat at 3 and the term could only reach two thirds of
+  its weight.
 - The setup-ratio sigmoid uses `(setup_to_assertion_ratio - 8.0) / 4.0`
   as its argument. The `-8.0` term places the **inflection point at 8
   setup lines** — the row delta at which a test is becoming suspect (eight

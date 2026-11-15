@@ -37,6 +37,16 @@ impl Default for MockSmellConfig {
     }
 }
 
+/// Smell category: every assertion targets the Mock API.
+const MOCK_ONLY_ASSERTIONS: &str = "mock_only_assertions";
+/// Smell category: more mocks than the assertions can justify.
+const MOCK_OVERUSE: &str = "mock_overuse";
+
+/// Every category [`derive_test_smells`] can emit for one test. Its length
+/// is the most smell hits a test can carry, which is where the score's
+/// smell-density term saturates (`suspicion::score_test`).
+pub const PER_TEST_SMELL_CATEGORIES: &[&str] = &[MOCK_ONLY_ASSERTIONS, MOCK_OVERUSE];
+
 /// Derive the per-test smell hits for one [`TestRecord`].
 ///
 /// Returns a fresh list; callers append it into `test.smell_hits`.
@@ -45,7 +55,7 @@ pub fn derive_test_smells(test: &TestRecord, config: &MockSmellConfig) -> Vec<Sm
 
     if test.only_asserts_on_mock && test.assertion_count > 0 {
         hits.push(SmellHit {
-            category: "mock_only_assertions".to_string(),
+            category: MOCK_ONLY_ASSERTIONS.to_string(),
             test: Some(test.nodeid.clone()),
             line: test.line,
             evidence: format!("all {} asserts on Mock API", test.assertion_count),
@@ -61,7 +71,7 @@ pub fn derive_test_smells(test: &TestRecord, config: &MockSmellConfig) -> Vec<Sm
         .saturating_add(test.stubs_count);
     if mock_overuse_fires(test_mocks, test.assertion_count, config) {
         hits.push(SmellHit {
-            category: "mock_overuse".to_string(),
+            category: MOCK_OVERUSE.to_string(),
             test: Some(test.nodeid.clone()),
             line: test.line,
             evidence: format!("{} mocks, {} assertions", test_mocks, test.assertion_count),
@@ -91,7 +101,7 @@ pub fn derive_file_smells(
         tests_in_file.iter().filter(|t| t.assertion_count > 0).collect();
     if !asserting.is_empty() && asserting.iter().all(|t| t.only_asserts_on_mock) {
         hits.push(SmellHit {
-            category: "mock_only_assertions".to_string(),
+            category: MOCK_ONLY_ASSERTIONS.to_string(),
             test: None,
             line: 0,
             evidence: "all asserting tests assert only on Mock API".to_string(),
@@ -104,7 +114,7 @@ pub fn derive_file_smells(
         .saturating_add(file.stubs_count);
     if mock_overuse_fires(file_mocks, file.assertion_count, config) {
         hits.push(SmellHit {
-            category: "mock_overuse".to_string(),
+            category: MOCK_OVERUSE.to_string(),
             test: None,
             line: 0,
             evidence: format!("{} mocks, {} assertions", file_mocks, file.assertion_count),

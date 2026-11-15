@@ -93,9 +93,9 @@ fn bare_mock_assertions_score_the_mock_only_term_not_the_zero_assert_term() {
     );
     // Weights from WEIGHTS.md, duplicated on purpose: this asserts on the
     // score a consumer of the inventory sees. Terms: mock-only (0.35),
-    // patch (0), setup sigmoid, zero-asserts (0), one smell of three.
+    // patch (0), setup sigmoid, zero-asserts (0), one smell of two.
     let setup = 0.15 / (1.0 + (-(0.75_f64 - 8.0) / 4.0).exp());
-    let expected = 0.35 + setup + 0.10 / 3.0;
+    let expected = 0.35 + setup + 0.10 / 2.0;
     assert!(
         (bare.suspicion_score - expected).abs() < 1e-9,
         "expected {expected}, got {}",

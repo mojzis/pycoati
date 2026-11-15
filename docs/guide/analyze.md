@@ -254,7 +254,8 @@ analysis reads from here.
   canonicalized: `from myproj.repo import Repository` used as `Repository.save`
   appears as `myproj.repo.Repository.save`.
 - `smell_hits` — array of smell hits at test scope. See below.
-- `suspicion_score` — float in `0.0`–`1.0`. Composite; see the formula below.
+- `suspicion_score` — float, always below `0.80`. Composite; see the formula
+  and its reachable range below.
   Higher is more suspicious. This is a ranking device, not a measurement — the
   absolute value has no meaning beyond ordering.
 - `fingerprint` — 16 hex digits identifying this test's current source,
@@ -386,27 +387,36 @@ suspicion_score = 0.35 * (only_asserts_on_mock ? 1 : 0)
                 + 0.20 * min((patch_decorator_count + patch_call_count) / 5, 1)
                 + 0.15 * sigmoid((setup_to_assertion_ratio - 8) / 4)
                 + 0.20 * (unverified ? 1 : 0)
-                + 0.10 * min(len(smell_hits) / 3, 1)
+                + 0.10 * min(len(smell_hits) / 2, 1)
 
 unverified = assertion_count == 0 and external_verification_count == 0
              and helper_assertion_count == 0
 ```
 
-`sigmoid(x) = 1 / (1 + e^-x)`. Weights sum to `1.00`.
+`sigmoid(x) = 1 / (1 + e^-x)`. Weights sum to `1.00`, but no test can score
+`1.00`: the `0.35` mock-only term needs at least one assertion and the `0.20`
+zero-assert term needs none, so they never fire together.
 
 Consequences you need when reading scores:
 
 - The setup term is never zero. Even a test with a ratio of `0` contributes
   `0.15 * sigmoid(-2)` ≈ `0.018`, so scores are never exactly `0.00`.
 - Patches (`patch_decorator_count + patch_call_count`) saturate at **5** and
-  `len(smell_hits)` at **3**. Ten patches score the same as five, and a `with
-  patch(...)` scores the same as a `@patch`.
+  `len(smell_hits)` at **2** — the number of per-test smell categories, so a
+  test with both smells gets the full `0.10`. Ten patches score the same as
+  five, and a `with patch(...)` scores the same as a `@patch`.
+- **The highest reachable score is just under `0.80`**: mock-only assertions
+  (`0.35`), five or more patches (`0.20`), both smells (`0.10`) and a very long
+  setup (approaching `0.15`). A test that verifies nothing tops out just under
+  `0.60` (`0.20` zero-assert, `0.20` patches, `0.05` for its one possible
+  smell, approaching `0.15` setup). Read scores against those ceilings, not
+  against `1.0`.
 - The setup sigmoid inflects at a ratio of **8.0** with scale **4.0**: ratio 8
   contributes exactly half the setup weight.
 - File scores are the mean of their tests' scores plus a bonus that grows at
   `0.05` per unit once `mock_construction_count / max(assertion_count, 1)`
-  exceeds `1.0`, capped at `0.10`. File scores are therefore not directly
-  comparable to test scores.
+  exceeds `1.0`, capped at `0.10`, so they stay below `0.90`. File scores are
+  therefore not directly comparable to test scores.
 
 Two of the five terms fire on unverified tests (`w_zero_asserts` plus an
 inflated setup ratio), so an empty test lands between about `0.22` for a short
