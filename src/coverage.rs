@@ -36,6 +36,20 @@ pub fn run_coverage(
         }
     };
 
+    // coverage.py writes its `.coverage` data file into the cwd (the user's
+    // project) by default, and pytest-cov erases it at session start. Point
+    // it at a private temp dir instead: two pycoati runs on the same project
+    // (or parallel integration tests sharing a fixture) would otherwise
+    // clobber each other's data and yield a null coverage figure, and we
+    // leave no `.coverage` litter behind in the user's tree.
+    let data_dir = match tempfile::tempdir() {
+        Ok(d) => d,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to create tempdir for coverage data");
+            return None;
+        }
+    };
+
     let mut args: Vec<String> = extra_python_args.to_vec();
     // `-o addopts=` neutralises any `addopts = …` line in the project's
     // pytest.ini / pyproject.toml for this invocation — see the same
@@ -55,7 +69,11 @@ pub fn run_coverage(
     args.push(tests_dir.display().to_string());
     args.extend(pytest_args.iter().cloned());
 
-    let output = Command::new(program).args(&args).current_dir(project_root).output();
+    let output = Command::new(program)
+        .args(&args)
+        .env("COVERAGE_FILE", data_dir.path().join(".coverage"))
+        .current_dir(project_root)
+        .output();
 
     // Hoist exit code + stderr out of the debug-only branch so the
     // post-parse WARNs can name *why* coverage failed. Without this, the
