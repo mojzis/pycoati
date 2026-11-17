@@ -2869,6 +2869,39 @@ def test_a():
         assert!(recs[0].only_asserts_on_mock);
     }
 
+    /// Regression for #35: `AsyncMock` await assertions are mock assertions
+    /// exactly like their `assert_called*` counterparts.
+    #[test]
+    fn bare_async_mock_await_assert_is_a_mock_assertion() {
+        let src = "\
+def test_awaited():
+    m = mock.AsyncMock()
+    m.assert_awaited_once()
+";
+        let recs = parse(src);
+        assert_eq!(recs[0].assertion_count, 1);
+        assert_eq!(recs[0].mock_assertion_count, 1);
+        assert!(recs[0].only_asserts_on_mock);
+    }
+
+    /// Regression for #35: reading `await_count` / `mock_calls` in an
+    /// `assert` targets the mock.
+    #[test]
+    fn await_and_mock_calls_attributes_are_mock_assertions() {
+        let src = "\
+def test_a():
+    m = AsyncMock()
+    assert m.await_count == 1
+    assert m.mock_calls == [call(1)]
+    assert m.method_calls == []
+    assert m.await_args_list == []
+";
+        let recs = parse(src);
+        assert_eq!(recs[0].assertion_count, 4);
+        assert_eq!(recs[0].mock_assertion_count, 4);
+        assert!(recs[0].only_asserts_on_mock);
+    }
+
     #[test]
     fn every_assert_method_in_the_mock_api_counts_as_a_bare_assertion() {
         let src = "\
