@@ -126,13 +126,17 @@ analysis reads from here.
   are not collected, as pytest does not. In a `TestCase` subclass every
   `test*` method counts, as unittest's loader does; in other classes and at
   module level only `test_*` counts — narrower than pytest's own default,
-  which would also collect `def testfoo()`. Two known gaps: test methods
-  inherited from a same-file base class are not collected on the subclass,
-  and only `unittest`'s own base classes are recognised (a `django.test.
-  TestCase` subclass is collected only when it is named `Test*`).
+  which would also collect `def testfoo()`. Test methods a same-file base
+  class defines and the subclass does not override are collected on the
+  subclass too (`<file>::Leaf::test_x`), as pytest does; bases imported from
+  another module are not followed. Known gap: only `unittest`'s own base
+  classes are recognised (a `django.test.TestCase` subclass is collected
+  only when it is named `Test*`).
   **Parametrize is not expanded**, so there is never a `[...]` suffix.
 - `file` — path to the file containing this test. Joins to `files[].path`.
 - `line` — line of the `def`. **1-indexed**, matching what an editor shows.
+  An inherited test reports the base class's `def` line, so the copies on
+  each subclass share one `line` (and one `fingerprint`).
 - `assertion_count` — effective assertion sites in this test body, one each:
   `assert` statements, `with pytest.raises(...)` blocks, `self.assertXxx(...)`
   calls inside a test class, and bare mock-API assertion calls written as a
@@ -241,7 +245,9 @@ analysis reads from here.
   - a call to a **same-file helper** whose own body holds a non-mock
     assertion: a module-level function called by bare name (and not shadowed
     by one of the test's parameters), or `self.<method>(...)` for a method of
-    the test's own class. One level only: a helper that verifies by calling
+    the test's class or of a base class defined in the same file (the
+    nearest definition wins, so a non-asserting override does not count).
+    One level only: a helper that verifies by calling
     another helper does not count, nor does anything imported or defined in
     `conftest.py`. A helper whose only assertions target the mock API does
     not count either.

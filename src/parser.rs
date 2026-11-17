@@ -16,6 +16,9 @@
 //!   whatever the class is called, as unittest's loader collects them.
 //! * The same, recursively, for classes nested inside a collected class:
 //!   pytest collects them too, with nodeid `<file>::Outer::Inner::<method>`.
+//! * Test methods inherited from a base class defined in the same file and
+//!   not overridden, collected on each subclass as
+//!   `<file>::<Subclass>::<method>` at the base's line, as pytest does.
 //!
 //! Functions nested inside other functions are deliberately not collected —
 //! pytest does not collect them either.
@@ -74,7 +77,8 @@
 //!   anywhere in the file (counted on any `decorated_definition`, not just
 //!   tests).
 
-use std::collections::BTreeSet;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -159,13 +163,17 @@ pub fn parse_python_file(source: &str, file_path: &Path) -> Result<ParsedFile> {
 #[derive(Clone, Copy)]
 struct ClassContext<'a> {
     prefix: Option<&'a str>,
-    /// Dotted names the class installed doubles for. Borrowed because the
-    /// set is computed once per class and shared by every method in it.
+    /// Dotted names replaced with a double for this method by its class or
+    /// a same-file base: a class `@patch` that covers the method, or a
+    /// setup hook that runs before it. Borrowed because the set is computed
+    /// once per class (and defining base) and shared by those methods.
     shadows: &'a BTreeSet<String>,
     /// Module-level functions whose body holds a non-mock assertion.
     module_helpers: &'a BTreeSet<String>,
-    /// Methods of the enclosing class whose body holds a non-mock
-    /// assertion, reached as `self.<name>(...)`. Empty at module level.
+    /// Methods reachable on the enclosing class — its own or inherited from
+    /// a same-file base, each name resolved to its nearest definition —
+    /// whose body holds a non-mock assertion, reached as
+    /// `self.<name>(...)`. Empty at module level.
     method_helpers: &'a BTreeSet<String>,
     /// Module-level classes that are `unittest.TestCase` subclasses,
     /// directly or through a same-file base chain.
@@ -224,10 +232,19 @@ impl<'a> ClassContext<'a> {
     }
 }
 
+/// What stays fixed while one file is walked: its bytes, the path nodeids
+/// are built from, its import map and its module-level classes.
+#[derive(Clone, Copy)]
+struct FileCtx<'a> {
+    source: &'a [u8],
+    file_path: &'a Path,
+    imports: &'a ImportMap,
+    classes: &'a ModuleClasses<'a>,
+}
+
 /// Iterate the immediate children of the module and dispatch on node kind:
-/// bare `function_definition`s (top-level tests), `decorated_definition`s
-/// (wrapping a function or a class), and `class_definition`s (pytest test
-/// containers when named `Test*`).
+/// `function_definition`s (top-level tests) and `class_definition`s (test
+/// containers), either one possibly wrapped by a `decorated_definition`.
 fn collect_module_tests(
     module: Node<'_>,
     source: &[u8],
@@ -235,51 +252,34 @@ fn collect_module_tests(
     imports: &ImportMap,
     out: &mut ParsedFile,
 ) {
-    let module_helpers = verifying_helpers(module, source, imports, false);
-    let test_cases = test_case_classes(module, source, imports);
+    let module_helpers = verifying_helpers(module, source, imports);
+    let classes = module_classes(module, source);
+    let file = FileCtx { source, file_path, imports, classes: &classes };
+    let test_cases = test_case_classes(&classes, source, imports);
     let module_names = module_level_names(module, source);
     let module_ctx = ClassContext::module(&module_helpers, &test_cases, &module_names);
     let mut cursor = module.walk();
     for child in module.children(&mut cursor) {
-        match child.kind() {
-            "function_definition" => {
-                try_collect_test_function(child, None, source, file_path, module_ctx, imports, out);
-            }
-            "decorated_definition" => {
-                if let Some(inner) = child.child_by_field_name("definition") {
-                    match inner.kind() {
-                        "function_definition" => {
-                            try_collect_test_function(
-                                inner,
-                                Some(child),
-                                source,
-                                file_path,
-                                module_ctx,
-                                imports,
-                                out,
-                            );
-                        }
-                        "class_definition" => {
-                            collect_class_tests(
-                                inner,
-                                Some(child),
-                                source,
-                                file_path,
-                                module_ctx,
-                                imports,
-                                out,
-                            );
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            "class_definition" => {
-                collect_class_tests(child, None, source, file_path, module_ctx, imports, out);
-            }
-            _ => {}
+        if let Some((func, decorated)) = unwrap_definition(child, "function_definition") {
+            try_collect_test_function(func, decorated, file, module_ctx, out);
+        } else if let Some((class, decorated)) = unwrap_definition(child, "class_definition") {
+            collect_class_tests(class, decorated, file, module_ctx, out);
         }
     }
+}
+
+/// `child` as a definition of `kind` (`function_definition` or
+/// `class_definition`), paired with the `decorated_definition` wrapping it,
+/// if any.
+fn unwrap_definition<'t>(child: Node<'t>, kind: &str) -> Option<(Node<'t>, Option<Node<'t>>)> {
+    if child.kind() == kind {
+        return Some((child, None));
+    }
+    if child.kind() != "decorated_definition" {
+        return None;
+    }
+    let inner = child.child_by_field_name("definition")?;
+    (inner.kind() == kind).then_some((inner, Some(child)))
 }
 
 /// Walk a `class_definition`'s body collecting its test methods, then
@@ -292,6 +292,14 @@ fn collect_module_tests(
 /// same rule, but only inside a collected non-`TestCase` class — pytest
 /// recurses no further — with the nodeid `<file>::Outer::Inner::test_x`.
 ///
+/// Same-file base classes are resolved through [`same_file_mro`]. A test
+/// method a base defines and no nearer class rebinds is collected under
+/// this class (`<file>::Leaf::test_inherited`, at the base's line), named
+/// by this class's prefix rule. `self.<helper>` resolves to the nearest
+/// definition, setup hooks follow `super()` (see [`setup_hook_doubles`]),
+/// and a class `@patch` covers the methods its class has when it runs (see
+/// [`class_decorator_doubles`]). Inherited nested classes are not followed.
+///
 /// `parent` is the enclosing scope: the module context, or the outer class
 /// for a nested one. A nested class inherits nothing from its outer class
 /// but the nodeid prefix: a class-level `@patch` or a `setUp` applies only
@@ -300,12 +308,11 @@ fn collect_module_tests(
 fn collect_class_tests(
     class_node: Node<'_>,
     class_decorated: Option<Node<'_>>,
-    source: &[u8],
-    file_path: &Path,
+    file: FileCtx<'_>,
     parent: ClassContext<'_>,
-    imports: &ImportMap,
     out: &mut ParsedFile,
 ) {
+    let FileCtx { source, imports, .. } = file;
     let Some(class_name) = node_name(class_node, source) else {
         return;
     };
@@ -320,38 +327,233 @@ fn collect_class_tests(
         Some(outer) => format!("{outer}::{class_name}"),
         None => class_name.to_string(),
     };
-    let shadows = class_installed_doubles(body, class_decorated, source, imports);
-    let method_helpers = verifying_helpers(body, source, imports, true);
+    let leaf = ModuleClass { node: class_node, decorated: class_decorated };
+    let mro = same_file_mro(leaf, file.classes, source);
+    let methods = resolved_methods(&mro, source);
+    let method_helpers: BTreeSet<String> = methods
+        .iter()
+        .filter(|m| m.body_verifies(source, imports))
+        .map(|m| m.name.clone())
+        .collect();
+    // The doubles a test runs under depend on which class defines it: a
+    // class `@patch` does not reach methods added by a subclass.
+    let setup_doubles = setup_hook_doubles(&mro, source, imports);
+    let shadows_at: Vec<BTreeSet<String>> = (0..mro.len())
+        .map(|depth| {
+            let mut shadows = setup_doubles.clone();
+            shadows.extend(class_decorator_doubles(&mro, depth, file));
+            shadows
+        })
+        .collect();
+    let Some(leaf_shadows) = shadows_at.first() else {
+        return;
+    };
     let class = ClassContext {
         prefix: Some(&prefix),
-        shadows: &shadows,
+        shadows: leaf_shadows,
         module_helpers: parent.module_helpers,
         method_helpers: &method_helpers,
         test_cases: parent.test_cases,
         module_names: parent.module_names,
         test_prefix: if is_test_case { UNITTEST_TEST_PREFIX } else { PYTEST_TEST_PREFIX },
     };
+
+    // Inherited methods first, the farthest base first, as pytest emits a
+    // `Test*` hierarchy. Not load-bearing: `lib.rs` re-sorts each file's
+    // records by line.
+    let mut inherited: Vec<&ResolvedMethod<'_>> = methods.iter().filter(|m| m.depth > 0).collect();
+    inherited.sort_by_key(|m| Reverse(m.depth));
+    for method in inherited {
+        let Some(shadows) = shadows_at.get(method.depth) else {
+            continue;
+        };
+        let ctx = ClassContext { shadows, ..class };
+        try_collect_test_function(method.definition, method.decorated, file, ctx, out);
+    }
+
     let mut cursor = body.walk();
     for child in body.children(&mut cursor) {
-        let (definition, decorated) = match child.kind() {
-            "decorated_definition" => match child.child_by_field_name("definition") {
-                Some(inner) => (inner, Some(child)),
-                None => continue,
-            },
-            _ => (child, None),
-        };
-        match definition.kind() {
-            "function_definition" => try_collect_test_function(
-                definition, decorated, source, file_path, class, imports, out,
-            ),
+        if let Some((func, decorated)) = unwrap_definition(child, "function_definition") {
+            try_collect_test_function(func, decorated, file, class, out);
+        } else if let Some((nested, decorated)) = unwrap_definition(child, "class_definition") {
             // pytest's unittest collector yields only the loader's test
             // names and never recurses into nested classes.
-            "class_definition" if !is_test_case => {
-                collect_class_tests(definition, decorated, source, file_path, class, imports, out);
+            if !is_test_case {
+                collect_class_tests(nested, decorated, file, class, out);
             }
-            _ => {}
         }
     }
+}
+
+/// A module-level class: its `class_definition` and the
+/// `decorated_definition` wrapping it, if any.
+#[derive(Clone, Copy, Debug)]
+struct ModuleClass<'t> {
+    node: Node<'t>,
+    decorated: Option<Node<'t>>,
+}
+
+/// Module-level classes by name, every binding of a name in source order.
+type ModuleClasses<'t> = BTreeMap<String, Vec<ModuleClass<'t>>>;
+
+/// Every class defined directly in the module, keyed by name.
+fn module_classes<'t>(module: Node<'t>, source: &[u8]) -> ModuleClasses<'t> {
+    let mut cursor = module.walk();
+    let mut classes: ModuleClasses<'t> = BTreeMap::new();
+    for child in module.children(&mut cursor) {
+        let Some((node, decorated)) = unwrap_definition(child, "class_definition") else {
+            continue;
+        };
+        if let Some(name) = node_name(node, source) {
+            classes.entry(name.to_string()).or_default().push(ModuleClass { node, decorated });
+        }
+    }
+    classes
+}
+
+/// The module-level class `name` is bound to where a class statement
+/// starting at byte `at` evaluates its bases: the last binding before it.
+/// `class TestX(TestX):` thus extends the earlier `TestX`.
+fn resolve_class<'t>(
+    classes: &ModuleClasses<'t>,
+    name: &str,
+    at: usize,
+) -> Option<ModuleClass<'t>> {
+    classes.get(name)?.iter().rev().find(|c| c.node.start_byte() < at).copied()
+}
+
+/// `leaf` followed by the same-file classes it inherits from, nearest
+/// first: a depth-first, left-to-right walk of plain-name bases that
+/// resolve to a module-level class (see [`resolve_class`]). Each class
+/// appears once. Imported and dotted bases end the walk on their branch.
+/// Depth-first matches Python's C3 MRO except in diamond hierarchies,
+/// where it can visit a shared base before a sibling.
+fn same_file_mro<'t>(
+    leaf: ModuleClass<'t>,
+    classes: &ModuleClasses<'t>,
+    source: &[u8],
+) -> Vec<ModuleClass<'t>> {
+    fn visit<'t>(
+        class: ModuleClass<'t>,
+        classes: &ModuleClasses<'t>,
+        source: &[u8],
+        seen: &mut BTreeSet<usize>,
+        out: &mut Vec<ModuleClass<'t>>,
+    ) {
+        if !seen.insert(class.node.id()) {
+            return;
+        }
+        out.push(class);
+        let at = class.node.start_byte();
+        for base in base_class_chains(class.node, source) {
+            if let Some(base_class) = resolve_class(classes, &base, at) {
+                visit(base_class, classes, source, seen, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    visit(leaf, classes, source, &mut BTreeSet::new(), &mut out);
+    out
+}
+
+/// The definition a method name resolves to on the leaf of an MRO: the one
+/// in the nearest class, at `depth` (0 is the leaf).
+struct ResolvedMethod<'t> {
+    depth: usize,
+    name: String,
+    definition: Node<'t>,
+    decorated: Option<Node<'t>>,
+}
+
+impl ResolvedMethod<'_> {
+    /// True iff the body holds a non-mock assertion, making the method a
+    /// helper a `self.<name>(...)` call verifies through.
+    fn body_verifies(&self, source: &[u8], imports: &ImportMap) -> bool {
+        self.definition
+            .child_by_field_name("body")
+            .is_some_and(|body| body_has_real_assertion(body, source, imports, true))
+    }
+}
+
+/// Every method name reachable on the leaf of `mro`, resolved to its
+/// nearest definition, in MRO order and source order within a class.
+/// Within one class body the last definition of a name wins, as Python
+/// rebinds it. A nearer non-function binding of the name (`test_x = None`,
+/// a nested class) hides a base method and resolves to nothing here.
+fn resolved_methods<'t>(mro: &[ModuleClass<'t>], source: &[u8]) -> Vec<ResolvedMethod<'t>> {
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut out = Vec::new();
+    for (depth, class) in mro.iter().enumerate() {
+        let Some(body) = class.node.child_by_field_name("body") else {
+            continue;
+        };
+        let mut cursor = body.walk();
+        let children: Vec<Node<'t>> = body.children(&mut cursor).collect();
+        let mut class_methods = Vec::new();
+        for child in children.into_iter().rev() {
+            if let Some((definition, decorated)) = unwrap_definition(child, "function_definition") {
+                let Some(name) = node_name(definition, source) else {
+                    continue;
+                };
+                if seen.insert(name.to_string()) {
+                    class_methods.push(ResolvedMethod {
+                        depth,
+                        name: name.to_string(),
+                        definition,
+                        decorated,
+                    });
+                }
+            } else if let Some(name) = non_function_binding(child, source) {
+                seen.insert(name.to_string());
+            }
+        }
+        class_methods.reverse();
+        out.extend(class_methods);
+    }
+    out
+}
+
+/// The name a class-body statement binds to something other than a
+/// function: a nested class, or a plain `name = ...` assignment.
+fn non_function_binding<'s>(child: Node<'_>, source: &'s [u8]) -> Option<&'s str> {
+    if let Some((class, _)) = unwrap_definition(child, "class_definition") {
+        return node_name(class, source);
+    }
+    if child.kind() != "expression_statement" {
+        return None;
+    }
+    let assignment = child.named_child(0).filter(|n| n.kind() == "assignment")?;
+    let left = assignment.child_by_field_name("left").filter(|n| n.kind() == "identifier")?;
+    left.utf8_text(source).ok()
+}
+
+/// Targets of the class-level `@patch` decorators in `mro` that wrap a
+/// method defined on `mro[depth]`. `mock.patch` as a class decorator wraps
+/// the test methods its class has when the decorator runs — its own and
+/// inherited ones — so the decorator on `mro[i]` covers `mro[depth]` iff
+/// `mro[depth]` is `mro[i]` or one of its same-file bases.
+fn class_decorator_doubles(
+    mro: &[ModuleClass<'_>],
+    depth: usize,
+    file: FileCtx<'_>,
+) -> Vec<String> {
+    let Some(defining) = mro.get(depth) else {
+        return Vec::new();
+    };
+    let mut targets = Vec::new();
+    for class in mro {
+        let Some(decorated) = class.decorated else {
+            continue;
+        };
+        let covers = class.node.id() == defining.node.id()
+            || same_file_mro(*class, file.classes, file.source)
+                .iter()
+                .any(|ancestor| ancestor.node.id() == defining.node.id());
+        if covers {
+            targets.extend(decorator_patch_targets(decorated, file.source, file.imports));
+        }
+    }
+    targets
 }
 
 /// The dotted names of a class's base-class expressions, in source order.
@@ -389,26 +591,17 @@ fn class_is_test_case(
 /// (`class Base(TestCase)`, `class Leaf(Base)`). Iterated to a fixpoint so
 /// definition order does not matter; bases imported from another module are
 /// resolved only when they are a `unittest` base themselves.
-fn test_case_classes(module: Node<'_>, source: &[u8], imports: &ImportMap) -> BTreeSet<String> {
-    let mut cursor = module.walk();
-    let classes: Vec<Node<'_>> = module
-        .children(&mut cursor)
-        .filter_map(|child| match child.kind() {
-            "class_definition" => Some(child),
-            "decorated_definition" => child
-                .child_by_field_name("definition")
-                .filter(|inner| inner.kind() == "class_definition"),
-            _ => None,
-        })
-        .collect();
+fn test_case_classes(
+    classes: &ModuleClasses<'_>,
+    source: &[u8],
+    imports: &ImportMap,
+) -> BTreeSet<String> {
     let mut known = BTreeSet::new();
     loop {
         let before = known.len();
-        for class_node in &classes {
-            if class_is_test_case(*class_node, source, imports, &known) {
-                if let Some(name) = node_name(*class_node, source) {
-                    known.insert(name.to_string());
-                }
+        for (name, bindings) in classes {
+            if bindings.iter().any(|c| class_is_test_case(c.node, source, imports, &known)) {
+                known.insert(name.clone());
             }
         }
         if known.len() == before {
@@ -423,31 +616,21 @@ fn direct_function_defs(container: Node<'_>) -> Vec<Node<'_>> {
     let mut cursor = container.walk();
     let defs = container
         .children(&mut cursor)
-        .filter_map(|child| match child.kind() {
-            "function_definition" => Some(child),
-            "decorated_definition" => child
-                .child_by_field_name("definition")
-                .filter(|inner| inner.kind() == "function_definition"),
-            _ => None,
-        })
+        .filter_map(|child| unwrap_definition(child, "function_definition").map(|(def, _)| def))
         .collect();
     defs
 }
 
-/// Names of the functions directly in `container` whose body holds a
-/// non-mock effective assertion (see [`body_has_real_assertion`]). These
-/// are the same-file helpers a test call can verify through.
-fn verifying_helpers(
-    container: Node<'_>,
-    source: &[u8],
-    imports: &ImportMap,
-    in_class: bool,
-) -> BTreeSet<String> {
-    direct_function_defs(container)
+/// Names of the module-level functions whose body holds a non-mock
+/// effective assertion (see [`body_has_real_assertion`]). These are the
+/// same-file helpers a test call can verify through; class methods resolve
+/// through [`resolved_methods`] instead.
+fn verifying_helpers(module: Node<'_>, source: &[u8], imports: &ImportMap) -> BTreeSet<String> {
+    direct_function_defs(module)
         .into_iter()
         .filter(|func| {
             func.child_by_field_name("body")
-                .is_some_and(|body| body_has_real_assertion(body, source, imports, in_class))
+                .is_some_and(|body| body_has_real_assertion(body, source, imports, false))
         })
         .filter_map(|func| node_name(func, source).map(String::from))
         .collect()
@@ -542,7 +725,7 @@ fn with_item_calls(with_stmt: Node<'_>) -> Vec<Node<'_>> {
 /// True iff `call` invokes a same-file helper that verifies: a bare name
 /// bound to a verifying module-level function (and not rebound locally —
 /// see [`locally_bound_names`]), or `self.<name>` for a verifying method of
-/// the enclosing class.
+/// the enclosing class or a same-file base (see [`resolved_methods`]).
 fn call_is_same_file_helper(
     call: Node<'_>,
     source: &[u8],
@@ -654,49 +837,62 @@ fn is_in_nested_scope(node: Node<'_>, body: Node<'_>) -> bool {
 /// out of reach of a single-file parser.
 const SETUP_METHODS: &[&str] = &["setUp", "setUpClass", "setup_method", "setup_class"];
 
-/// Names a class replaced with a test double for all of its methods: the
-/// targets of a class-level `@patch`, and of any patch-shaped call in a
-/// setup hook (`self.patcher = patch("a.b"); self.patcher.start()`).
-fn class_installed_doubles(
-    class_body: Node<'_>,
-    class_decorated: Option<Node<'_>>,
+/// Names the setup hooks a test of `mro[0]` runs replace with a test
+/// double: the targets of any patch-shaped call
+/// (`self.patcher = patch("a.b"); self.patcher.start()`). Each hook name
+/// resolves to its nearest definition in `mro`; the walk continues to the
+/// next definition up only while the current one calls
+/// `super().<hook>(...)`, since an override that does not hides the base's.
+fn setup_hook_doubles(
+    mro: &[ModuleClass<'_>],
     source: &[u8],
     imports: &ImportMap,
 ) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
-
-    if let Some(decorated) = class_decorated {
-        names.extend(decorator_patch_targets(decorated, source, imports));
+    for hook in SETUP_METHODS {
+        for class in mro {
+            let Some(func) = class_method(*class, hook, source) else {
+                continue;
+            };
+            let Some(hook_body) = func.child_by_field_name("body") else {
+                break;
+            };
+            let mut calls: Vec<Node<'_>> = Vec::new();
+            collect_calls(hook_body, &mut calls);
+            names.extend(patch_call_targets(&calls, source, imports));
+            if !calls.iter().any(|call| is_super_call_of(*call, hook, source)) {
+                break;
+            }
+        }
     }
-
-    let mut cursor = class_body.walk();
-    for child in class_body.children(&mut cursor) {
-        let Some(func) = setup_method(child, source) else {
-            continue;
-        };
-        let Some(hook_body) = func.child_by_field_name("body") else {
-            continue;
-        };
-        let mut calls: Vec<Node<'_>> = Vec::new();
-        collect_calls(hook_body, &mut calls);
-        names.extend(patch_call_targets(&calls, source, imports));
-    }
-
     names
 }
 
-/// The `function_definition` behind a class-body child when it is a setup
-/// hook, unwrapping a `decorated_definition` first.
-fn setup_method<'a>(child: Node<'a>, source: &[u8]) -> Option<Node<'a>> {
-    let func = match child.kind() {
-        "function_definition" => child,
-        "decorated_definition" => child
-            .child_by_field_name("definition")
-            .filter(|inner| inner.kind() == "function_definition")?,
-        _ => return None,
+/// The definition `name` is bound to in `class`'s own body — the last one,
+/// as Python rebinds it.
+fn class_method<'t>(class: ModuleClass<'t>, name: &str, source: &[u8]) -> Option<Node<'t>> {
+    let body = class.node.child_by_field_name("body")?;
+    direct_function_defs(body).into_iter().rev().find(|func| node_name(*func, source) == Some(name))
+}
+
+/// True iff `call` is `super().<method>(...)` (with or without arguments
+/// to `super`).
+fn is_super_call_of(call: Node<'_>, method: &str, source: &[u8]) -> bool {
+    let Some(function) = call.child_by_field_name("function").filter(|f| f.kind() == "attribute")
+    else {
+        return false;
     };
-    let name = node_name(func, source)?;
-    SETUP_METHODS.contains(&name).then_some(func)
+    let attr_matches = function
+        .child_by_field_name("attribute")
+        .and_then(|attr| attr.utf8_text(source).ok())
+        .is_some_and(|attr| attr == method);
+    let on_super = function
+        .child_by_field_name("object")
+        .filter(|object| object.kind() == "call")
+        .and_then(|object| object.child_by_field_name("function"))
+        .and_then(|head| head.utf8_text(source).ok())
+        .is_some_and(|head| head == "super");
+    attr_matches && on_super
 }
 
 /// Push one record if the `function_definition` is a `test_*`. When the
@@ -705,15 +901,21 @@ fn setup_method<'a>(child: Node<'a>, source: &[u8]) -> Option<Node<'a>> {
 fn try_collect_test_function(
     func: Node<'_>,
     decorated: Option<Node<'_>>,
-    source: &[u8],
-    file_path: &Path,
+    file: FileCtx<'_>,
     class: ClassContext<'_>,
-    imports: &ImportMap,
     out: &mut ParsedFile,
 ) {
-    if let Some(name) = node_name(func, source) {
+    if let Some(name) = node_name(func, file.source) {
         if name.starts_with(class.test_prefix) {
-            let record = build_record(func, decorated, name, source, file_path, class, imports);
+            let record = build_record(
+                func,
+                decorated,
+                name,
+                file.source,
+                file.file_path,
+                class,
+                file.imports,
+            );
             out.mock_construction_count =
                 out.mock_construction_count.saturating_add(record.mock_construction_count);
             out.patch_decorator_count =
@@ -4070,5 +4272,396 @@ def test_a():
         warn()
 ";
         assert_eq!(parse(src)[0].helper_assertion_count, 2);
+    }
+
+    // ---- Same-file base classes (issue #34) ----
+
+    #[test]
+    fn assert_helper_on_a_same_file_base_is_credited() {
+        let src = "\
+from unittest import TestCase
+
+class Base(TestCase):
+    def check_one(self, x):
+        self.assertEqual(x, 1)
+
+class Checks(Base):
+    def test_it(self):
+        self.check_one(1)
+";
+        let recs = parse(src);
+        assert_eq!(nodeids(src), ["synthetic.py::Checks::test_it"]);
+        assert_eq!(recs[0].assertion_count, 0);
+        assert_eq!(recs[0].helper_assertion_count, 1);
+        assert!(!recs[0].verifies_nothing());
+    }
+
+    #[test]
+    fn assert_helper_on_a_mixin_base_is_credited() {
+        let src = "\
+class _Checks:
+    def _check(self, v):
+        assert v
+
+class TestA(_Checks):
+    def test_a(self):
+        self._check(1)
+";
+        assert_eq!(parse(src)[0].helper_assertion_count, 1);
+    }
+
+    #[test]
+    fn helper_resolves_through_a_grandparent() {
+        let src = "\
+class _Root:
+    def _check(self, v):
+        assert v
+
+class _Mid(_Root):
+    pass
+
+class TestA(_Mid):
+    def test_a(self):
+        self._check(1)
+";
+        assert_eq!(parse(src)[0].helper_assertion_count, 1);
+    }
+
+    #[test]
+    fn non_asserting_override_hides_the_base_helper() {
+        let src = "\
+class _Base:
+    def _check(self, v):
+        assert v
+
+class TestA(_Base):
+    def _check(self, v):
+        return v
+
+    def test_a(self):
+        self._check(1)
+";
+        assert_eq!(parse(src)[0].helper_assertion_count, 0);
+    }
+
+    #[test]
+    fn test_methods_inherited_from_a_same_file_base_are_collected() {
+        let src = "\
+class _Contract:
+    def test_roundtrip(self):
+        assert self.make().roundtrip()
+
+class TestA(_Contract):
+    def make(self):
+        return A()
+
+class TestB(_Contract):
+    def make(self):
+        return B()
+
+    def test_b_only(self):
+        assert True
+";
+        let recs = parse(src);
+        assert_eq!(
+            nodeids(src),
+            [
+                "synthetic.py::TestA::test_roundtrip",
+                "synthetic.py::TestB::test_roundtrip",
+                "synthetic.py::TestB::test_b_only",
+            ]
+        );
+        assert_eq!(recs[0].line, 2, "inherited test keeps the base's line");
+        assert_eq!(recs[0].assertion_count, 1);
+    }
+
+    #[test]
+    fn a_test_base_is_collected_itself_and_in_each_subclass() {
+        let src = "\
+import unittest
+
+class BaseTests(unittest.TestCase):
+    def test_shared(self):
+        self.assertTrue(True)
+
+class Sub(BaseTests):
+    def testOwn(self):
+        self.assertTrue(True)
+";
+        assert_eq!(
+            nodeids(src),
+            [
+                "synthetic.py::BaseTests::test_shared",
+                "synthetic.py::Sub::test_shared",
+                "synthetic.py::Sub::testOwn",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_overridden_test_method_is_collected_once_from_the_subclass() {
+        let src = "\
+class _Base:
+    def test_a(self):
+        assert True
+
+class TestA(_Base):
+    def test_a(self):
+        pass
+";
+        let recs = parse(src);
+        assert_eq!(nodeids(src), ["synthetic.py::TestA::test_a"]);
+        assert_eq!(recs[0].line, 6);
+        assert!(recs[0].verifies_nothing());
+    }
+
+    #[test]
+    fn inherited_tests_use_the_leaf_class_prefix() {
+        // `testLegacy` is a unittest name: collected in the TestCase leaf,
+        // not in a pytest-style `Test*` leaf.
+        let src = "\
+import unittest
+
+class _Mixin:
+    def testLegacy(self):
+        assert True
+
+class Case(_Mixin, unittest.TestCase):
+    pass
+
+class TestPlain(_Mixin):
+    pass
+";
+        assert_eq!(nodeids(src), ["synthetic.py::Case::testLegacy"]);
+    }
+
+    #[test]
+    fn setup_patches_on_a_base_shadow_inherited_tests() {
+        let src = "\
+import subprocess
+from unittest import mock
+
+class _Base:
+    def setup_method(self):
+        self.p = mock.patch('subprocess.run')
+        self.p.start()
+
+class TestA(_Base):
+    def test_a(self):
+        subprocess.run(['x'], check=True)
+";
+        assert_eq!(parse(src)[0].external_verification_count, 0);
+    }
+
+    #[test]
+    fn bases_bound_later_or_imported_are_not_followed() {
+        // `A(B)` names a `B` bound only later (a NameError at import), so
+        // the chain stops at `A`; `Remote` is imported and never followed.
+        let src = "\
+from elsewhere import Remote
+
+class A(B):
+    def test_a(self):
+        assert True
+
+class B(A):
+    def _remote_check(self):
+        assert True
+
+class TestC(Remote, A):
+    def test_c(self):
+        self._remote_check()
+";
+        let recs = parse(src);
+        assert_eq!(nodeids(src), ["synthetic.py::TestC::test_a", "synthetic.py::TestC::test_c"]);
+        assert_eq!(recs[1].helper_assertion_count, 0);
+    }
+
+    #[test]
+    fn a_class_extending_its_own_earlier_binding_inherits_from_it() {
+        let src = "\
+class TestX:
+    def test_first(self):
+        assert True
+
+class TestX(TestX):
+    def test_second(self):
+        assert True
+";
+        assert_eq!(
+            nodeids(src),
+            [
+                "synthetic.py::TestX::test_first",
+                "synthetic.py::TestX::test_first",
+                "synthetic.py::TestX::test_second",
+            ]
+        );
+    }
+
+    #[test]
+    fn multi_level_inheritance_emits_the_farthest_base_first() {
+        let src = "\
+class _Root:
+    def test_root(self):
+        assert True
+
+class _Mid(_Root):
+    def test_mid(self):
+        assert True
+
+class TestLeaf(_Mid):
+    def test_leaf(self):
+        assert True
+";
+        assert_eq!(
+            nodeids(src),
+            [
+                "synthetic.py::TestLeaf::test_root",
+                "synthetic.py::TestLeaf::test_mid",
+                "synthetic.py::TestLeaf::test_leaf",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_test_case_leaf_collects_unittest_names_from_a_pytest_style_base() {
+        let src = "\
+import unittest
+
+class TestShared:
+    def testCamel(self):
+        assert True
+
+    def test_snake(self):
+        assert True
+
+class Case(TestShared, unittest.TestCase):
+    pass
+";
+        assert_eq!(
+            nodeids(src),
+            [
+                "synthetic.py::TestShared::test_snake",
+                "synthetic.py::Case::testCamel",
+                "synthetic.py::Case::test_snake",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_nested_class_inherits_from_a_module_level_base() {
+        let src = "\
+class _Contract:
+    def _check(self, v):
+        assert v
+
+    def test_contract(self):
+        assert True
+
+class TestOuter:
+    class TestInner(_Contract):
+        def test_inner(self):
+            self._check(1)
+";
+        let recs = parse(src);
+        assert_eq!(
+            nodeids(src),
+            [
+                "synthetic.py::TestOuter::TestInner::test_contract",
+                "synthetic.py::TestOuter::TestInner::test_inner",
+            ]
+        );
+        assert_eq!(recs[1].helper_assertion_count, 1);
+    }
+
+    #[test]
+    fn a_non_function_binding_hides_an_inherited_test() {
+        let src = "\
+class _Base:
+    def test_d(self):
+        assert True
+
+    def test_kept(self):
+        assert True
+
+class TestDisabled(_Base):
+    test_d = None
+";
+        assert_eq!(nodeids(src), ["synthetic.py::TestDisabled::test_kept"]);
+    }
+
+    #[test]
+    fn a_base_class_patch_does_not_reach_methods_the_leaf_defines() {
+        // `mock.patch` as a class decorator wraps only the methods its own
+        // class has when it runs; `test_leaf` calls the real `run`.
+        let src = "\
+import subprocess
+from unittest import mock
+
+@mock.patch('subprocess.run')
+class _Base:
+    def test_base(self, m):
+        subprocess.run(['x'], check=True)
+
+class TestLeaf(_Base):
+    def test_leaf(self):
+        subprocess.run(['x'], check=True)
+";
+        let recs = parse(src);
+        assert_eq!(
+            nodeids(src),
+            ["synthetic.py::TestLeaf::test_base", "synthetic.py::TestLeaf::test_leaf"]
+        );
+        assert_eq!(recs[0].external_verification_count, 0, "base method is patched");
+        assert_eq!(recs[1].external_verification_count, 1, "leaf method is not");
+    }
+
+    #[test]
+    fn a_leaf_class_patch_reaches_inherited_methods() {
+        let src = "\
+import subprocess
+from unittest import mock
+
+class _Base:
+    def test_base(self, m):
+        subprocess.run(['x'], check=True)
+
+@mock.patch('subprocess.run')
+class TestLeaf(_Base):
+    pass
+";
+        assert_eq!(parse(src)[0].external_verification_count, 0);
+    }
+
+    #[test]
+    fn a_setup_override_without_super_drops_the_base_patches() {
+        let src = "\
+import subprocess
+from unittest import mock
+
+class _Base:
+    def setup_method(self):
+        self.p = mock.patch('subprocess.run')
+        self.p.start()
+
+class TestOverride(_Base):
+    def setup_method(self):
+        pass
+
+    def test_o(self):
+        subprocess.run(['x'], check=True)
+
+class TestChained(_Base):
+    def setup_method(self):
+        super().setup_method()
+
+    def test_c(self):
+        subprocess.run(['x'], check=True)
+";
+        let recs = parse(src);
+        assert_eq!(recs[0].nodeid, "synthetic.py::TestOverride::test_o");
+        assert_eq!(recs[0].external_verification_count, 1);
+        assert_eq!(recs[1].nodeid, "synthetic.py::TestChained::test_c");
+        assert_eq!(recs[1].external_verification_count, 0);
     }
 }
