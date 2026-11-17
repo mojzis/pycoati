@@ -219,8 +219,10 @@ plus `test_*` methods on classes whose name starts with `Test`, plus every
 `IsolatedAsyncioTestCase` (directly or through same-file base classes),
 whatever the class is called. Classes nested inside a collected `Test*` class
 are collected too, with nodeid `<file>::Outer::Inner::test_x`; classes nested
-in a `TestCase` subclass are not, matching pytest. Functions nested inside
-other functions are not collected.
+in a `TestCase` subclass are not, matching pytest. Test methods inherited
+from a base class in the same file are collected on each subclass, as
+pytest does (`<file>::Leaf::test_x`); bases imported from another module are
+not followed. Functions nested inside other functions are not collected.
 
 ## Scan behaviour you must not misread
 
