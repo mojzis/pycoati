@@ -35,6 +35,20 @@ pub const MOCK_API_ATTRIBUTES: &[&str] = &[
     "assert_not_called",
     "assert_any_call",
     "assert_has_calls",
+    // `AsyncMock` await-tracking counterparts of the names above.
+    "await_count",
+    "await_args",
+    "await_args_list",
+    "assert_awaited",
+    "assert_awaited_once",
+    "assert_awaited_with",
+    "assert_awaited_once_with",
+    "assert_any_await",
+    "assert_has_awaits",
+    "assert_not_awaited",
+    // Full call records, including calls on child mocks.
+    "mock_calls",
+    "method_calls",
 ];
 
 /// Prefix that marks a [`MOCK_API_ATTRIBUTES`] entry as an assertion
@@ -243,11 +257,28 @@ mod tests {
             "assert_not_called",
             "assert_any_call",
             "assert_has_calls",
+            "assert_awaited",
+            "assert_awaited_once",
+            "assert_awaited_with",
+            "assert_awaited_once_with",
+            "assert_any_await",
+            "assert_has_awaits",
+            "assert_not_awaited",
         ] {
             assert!(is_mock_assert_method(name), "{name} should be a mock assert method");
         }
         // Attributes that are read, not called, are not assertion methods.
-        for name in ["called", "call_count", "call_args", "call_args_list"] {
+        for name in [
+            "called",
+            "call_count",
+            "call_args",
+            "call_args_list",
+            "await_count",
+            "await_args",
+            "await_args_list",
+            "mock_calls",
+            "method_calls",
+        ] {
             assert!(!is_mock_assert_method(name), "{name} is read, not called");
         }
         // The prefix alone is not enough: the name must be in the API.
@@ -269,8 +300,10 @@ mod tests {
     }
 
     #[test]
-    fn attribute_set_has_eleven_entries() {
-        assert_eq!(MOCK_API_ATTRIBUTES.len(), 11);
+    fn attribute_set_has_twenty_three_entries() {
+        // 11 sync-call names + 10 `AsyncMock` await names + `mock_calls`
+        // and `method_calls`.
+        assert_eq!(MOCK_API_ATTRIBUTES.len(), 23);
     }
 
     #[test]

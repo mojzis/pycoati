@@ -154,7 +154,11 @@ analysis reads from here.
   attribute set is closed and exact: `called`, `call_count`, `call_args`,
   `call_args_list`, `assert_called`, `assert_called_with`,
   `assert_called_once`, `assert_called_once_with`, `assert_not_called`,
-  `assert_any_call`, `assert_has_calls`. A site counts here when it is:
+  `assert_any_call`, `assert_has_calls`, their `AsyncMock` counterparts
+  `await_count`, `await_args`, `await_args_list`, `assert_awaited`,
+  `assert_awaited_once`, `assert_awaited_with`, `assert_awaited_once_with`,
+  `assert_any_await`, `assert_has_awaits`, `assert_not_awaited`, and the call
+  records `mock_calls`, `method_calls`. A site counts here when it is:
   - a bare call to one of the `assert_*` names on any receiver except bare
     `self` — `m.assert_called_once_with(1)`, `self.client.send.assert_called()`;
   - an `assert` whose expression reads one of those attributes, directly or
