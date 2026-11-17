@@ -1,7 +1,7 @@
 //! Suspicion scoring (Run 3 step 10).
 //!
 //! Per-test score blends five heuristic signals — mock-only assertions,
-//! patch-decorator density, setup-to-assertion ratio, zero-assert tests, and
+//! patch density, setup-to-assertion ratio, zero-assert tests, and
 //! smell density — each weighted by a tunable constant. File-level scores are
 //! the mean of their tests' scores plus a small mock-overuse bonus.
 //!
@@ -34,7 +34,8 @@ pub struct SuspicionWeights {
     /// Bonus when the test has zero `assert_statement` nodes **and** no
     /// external-verification evidence.
     pub w_zero_asserts: f64,
-    /// Density term over `smell_hits.len()` (saturates at three).
+    /// Density term over `smell_hits.len()` (saturates at
+    /// [`SMELL_DENSITY_SATURATION`], the per-test category count).
     pub w_smell_density: f64,
 }
 
@@ -60,19 +61,25 @@ pub const DEFAULT: SuspicionWeights = SuspicionWeights {
     w_smell_density: 0.10,
 };
 
+/// Smell count at which the smell-density term reaches its full weight:
+/// the number of distinct per-test smell categories, so a test that trips
+/// every one saturates the term.
+const SMELL_DENSITY_SATURATION: f64 = crate::smells::PER_TEST_SMELL_CATEGORIES.len() as f64;
+
 /// Score one [`TestRecord`] against the weighted formula.
 ///
 /// The formula (verbatim from `WEIGHTS.md`):
 ///
 /// ```text
 /// score = w_mock_only     * (only_asserts_on_mock ? 1.0 : 0.0)
-///       + w_patch_count   * min(patch_decorator_count / 5.0, 1.0)
+///       + w_patch_count   * min((patch_decorator_count + patch_call_count) / 5.0, 1.0)
 ///       + w_setup_ratio   * sigmoid((setup_to_assertion_ratio - SETUP_RATIO_INFLECTION)
 ///                                     / SETUP_RATIO_SCALE)
 ///       + w_zero_asserts  * (unverified ? 1.0 : 0.0)
-///       + w_smell_density * min(smell_hits.len() / 3.0, 1.0)
+///       + w_smell_density * min(smell_hits.len() / SMELL_DENSITY_SATURATION, 1.0)
 ///
 /// unverified = assertion_count == 0 && external_verification_count == 0
+///              && helper_assertion_count == 0
 ///              (`TestRecord::verifies_nothing`)
 /// ```
 ///
@@ -90,7 +97,8 @@ pub const DEFAULT: SuspicionWeights = SuspicionWeights {
 pub fn score_test(test: &TestRecord, weights: &SuspicionWeights) -> f64 {
     let mock_only_term = if test.only_asserts_on_mock { weights.w_mock_only } else { 0.0 };
 
-    let patch_ratio = (test.patch_decorator_count as f64 / 5.0).min(1.0);
+    let patches = test.patch_decorator_count.saturating_add(test.patch_call_count);
+    let patch_ratio = (patches as f64 / 5.0).min(1.0);
     let patch_term = weights.w_patch_count * patch_ratio;
 
     let setup_term = weights.w_setup_ratio
@@ -98,7 +106,7 @@ pub fn score_test(test: &TestRecord, weights: &SuspicionWeights) -> f64 {
 
     let zero_asserts_term = if test.verifies_nothing() { weights.w_zero_asserts } else { 0.0 };
 
-    let smell_ratio = (test.smell_hits.len() as f64 / 3.0).min(1.0);
+    let smell_ratio = (test.smell_hits.len() as f64 / SMELL_DENSITY_SATURATION).min(1.0);
     let smell_term = weights.w_smell_density * smell_ratio;
 
     mock_only_term + patch_term + setup_term + zero_asserts_term + smell_term
@@ -175,10 +183,14 @@ mod tests {
             line: 1,
             assertion_count: 1,
             only_asserts_on_mock: false,
+            mock_assertion_count: 0,
             patch_decorator_count: 0,
+            patch_call_count: 0,
+            mock_construction_count: 0,
             stubs_count: 0,
             setup_to_assertion_ratio: 0.0,
             external_verification_count: 0,
+            helper_assertion_count: 0,
             called_names: Vec::new(),
             smell_hits: Vec::new(),
             suspicion_score: 0.0,
@@ -208,6 +220,15 @@ mod tests {
             evidence: String::new(),
         }
     }
+
+    /// Supremum of the per-test score over records the parser can emit.
+    /// `w_mock_only` and `w_zero_asserts` are mutually exclusive (the first
+    /// needs an assertion, the second none), so the ceiling is the
+    /// mock-only branch with every other term at full weight.
+    const REACHABLE_CEILING: f64 = DEFAULT.w_mock_only
+        + DEFAULT.w_patch_count
+        + DEFAULT.w_setup_ratio
+        + DEFAULT.w_smell_density;
 
     fn approx_eq(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-9
@@ -250,6 +271,43 @@ mod tests {
         let sa = score_test(&a, &DEFAULT);
         let sb = score_test(&b, &DEFAULT);
         assert!(approx_eq(sa, sb), "patch_count term must saturate at 5: {sa} vs {sb}");
+    }
+
+    #[test]
+    fn zero_asserts_term_is_off_when_a_helper_verifies() {
+        let mut t = make_test("a");
+        t.assertion_count = 0;
+        t.helper_assertion_count = 1;
+        let verified = score_test(&t, &DEFAULT);
+        t.helper_assertion_count = 0;
+        let unverified = score_test(&t, &DEFAULT);
+        assert!(approx_eq(unverified - verified, DEFAULT.w_zero_asserts));
+    }
+
+    #[test]
+    fn patch_calls_score_like_patch_decorators() {
+        // A `with patch(...)` / `mocker.patch(...)` contributes exactly what
+        // a `@patch` decorator does, and the two add up toward saturation.
+        let mut decorated = make_test("a");
+        decorated.patch_decorator_count = 2;
+        let mut called = make_test("b");
+        called.patch_call_count = 2;
+        let mut mixed = make_test("c");
+        mixed.patch_decorator_count = 1;
+        mixed.patch_call_count = 1;
+        let sd = score_test(&decorated, &DEFAULT);
+        assert!(approx_eq(sd, score_test(&called, &DEFAULT)));
+        assert!(approx_eq(sd, score_test(&mixed, &DEFAULT)));
+        let mut none = make_test("d");
+        none.patch_decorator_count = 0;
+        assert!(approx_eq(sd - score_test(&none, &DEFAULT), DEFAULT.w_patch_count * 2.0 / 5.0));
+
+        let mut saturated = make_test("e");
+        saturated.patch_decorator_count = 3;
+        saturated.patch_call_count = 7;
+        let mut five = make_test("f");
+        five.patch_decorator_count = 5;
+        assert!(approx_eq(score_test(&saturated, &DEFAULT), score_test(&five, &DEFAULT)));
     }
 
     #[test]
@@ -320,15 +378,52 @@ mod tests {
         assert!(approx_eq(s, 0.725), "expected 0.725, got {s}");
     }
 
+    /// Only two per-test smell categories exist, so a saturation point of
+    /// three left a third of `w_smell_density` unreachable. The term must
+    /// saturate at the category count: both smells give the full weight.
     #[test]
-    fn smell_density_clamps_at_three() {
-        let mut a = make_test("a");
-        a.smell_hits = vec![smell_hit(), smell_hit(), smell_hit()];
-        let mut b = make_test("b");
-        b.smell_hits = (0..10).map(|_| smell_hit()).collect();
-        let sa = score_test(&a, &DEFAULT);
-        let sb = score_test(&b, &DEFAULT);
-        assert!(approx_eq(sa, sb), "smell density must saturate at 3: {sa} vs {sb}");
+    fn smell_density_saturates_at_the_per_test_category_count() {
+        let mut none = make_test("a");
+        none.smell_hits.clear();
+        let mut one = make_test("b");
+        one.smell_hits = vec![smell_hit()];
+        let mut both = make_test("c");
+        both.smell_hits = vec![smell_hit(), smell_hit()];
+        let mut ten = make_test("d");
+        ten.smell_hits = (0..10).map(|_| smell_hit()).collect();
+        let s0 = score_test(&none, &DEFAULT);
+        assert!(approx_eq(score_test(&one, &DEFAULT) - s0, DEFAULT.w_smell_density / 2.0));
+        assert!(approx_eq(score_test(&both, &DEFAULT) - s0, DEFAULT.w_smell_density));
+        assert!(approx_eq(score_test(&ten, &DEFAULT), score_test(&both, &DEFAULT)));
+    }
+
+    /// The highest score a test can actually reach: mock-only (which needs
+    /// an assertion, so the zero-assert term is off), saturated patches,
+    /// both smells, and a setup ratio far past the inflection. The setup
+    /// sigmoid never reaches 1, so the bound is approached, not attained.
+    #[test]
+    fn reachable_ceiling_is_mock_only_branch() {
+        let mut t = make_test("a");
+        t.only_asserts_on_mock = true;
+        t.assertion_count = 1;
+        t.mock_assertion_count = 1;
+        t.patch_decorator_count = 5;
+        t.smell_hits = vec![smell_hit(), smell_hit()];
+        t.setup_to_assertion_ratio = 100.0;
+        let s = score_test(&t, &DEFAULT);
+        assert!(s < REACHABLE_CEILING, "{s}");
+        assert!(REACHABLE_CEILING - s < 1e-9, "{s}");
+        assert!(approx_eq(REACHABLE_CEILING, 0.80));
+
+        // The unverified branch tops out lower: no mock-only term, and
+        // only `mock_overuse` can fire on an assertionless test.
+        let mut u = make_test("b");
+        u.assertion_count = 0;
+        u.patch_decorator_count = 5;
+        u.smell_hits = vec![smell_hit()];
+        u.setup_to_assertion_ratio = 100.0;
+        let su = score_test(&u, &DEFAULT);
+        assert!(su < 0.60 && 0.60 - su < 1e-9, "{su}");
     }
 
     #[test]

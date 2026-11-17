@@ -29,7 +29,8 @@
 //!
 //! In the per-test `asserts` column, `2+1x` means two syntactic assertions
 //! plus one external-verification call site (a checked child process — see
-//! [`crate::verification`]). A plain number means no such call site.
+//! [`crate::verification`]), and `0+2h` means two assertion-helper calls
+//! (`helper_assertion_count`). A plain number means neither.
 //!
 //! Accepted findings (held back from the shortlist)   # omitted when empty
 //! -----------------------------------------------
@@ -241,23 +242,30 @@ fn build_test_row(nodeid: &str, t: &TestRecord) -> TestRow {
     TestRow {
         score: format!("{:.2}", t.suspicion_score),
         nodeid: nodeid.to_string(),
-        // A child-process check verifies without an `assert` node, so a
-        // bare `0` here would read as "verifies nothing". Mark those rows
-        // `<asserts>+<n>x` — the JSON carries the exact count in
-        // `external_verification_count`.
-        asserts: if t.external_verification_count > 0 {
-            format!("{}+{}x", t.assertion_count, t.external_verification_count)
-        } else {
-            t.assertion_count.to_string()
-        },
-        // Test records don't carry `mock_construction_count`; use the
-        // patch-decorator count as the per-test mock proxy (matches the
-        // mock_overuse smell logic in `smells.rs`). `stubs_count` renders
-        // in its own column.
-        mocks: t.patch_decorator_count.to_string(),
+        asserts: asserts_cell(t),
+        // The per-test `mock_overuse` numerator minus `stubs_count`, which
+        // renders in its own column.
+        mocks: t.mock_construction_count.saturating_add(t.patch_decorator_count).to_string(),
         stubs: t.stubs_count.to_string(),
         smells,
     }
+}
+
+/// The asserts cell for one test row: `assertion_count`, followed by
+/// `+<n>h` for assertion-helper calls and `+<n>x` for child-process checks.
+/// Both verify without an assertion site in the body, so a bare `0` would
+/// read as "verifies nothing"; the JSON carries the exact counts in
+/// `helper_assertion_count` and `external_verification_count`.
+fn asserts_cell(t: &TestRecord) -> String {
+    let helpers = match t.helper_assertion_count {
+        0 => String::new(),
+        n => format!("+{n}h"),
+    };
+    let external = match t.external_verification_count {
+        0 => String::new(),
+        n => format!("+{n}x"),
+    };
+    format!("{}{helpers}{external}", t.assertion_count)
 }
 
 fn join_smell_categories(hits: &[crate::SmellHit]) -> String {
@@ -496,10 +504,14 @@ mod tests {
             line: 1,
             assertion_count: asserts,
             only_asserts_on_mock: false,
+            mock_assertion_count: 0,
             patch_decorator_count: patches,
+            patch_call_count: 0,
+            mock_construction_count: 0,
             stubs_count: 0,
             setup_to_assertion_ratio: 0.0,
             external_verification_count: 0,
+            helper_assertion_count: 0,
             called_names: Vec::new(),
             smell_hits: Vec::new(),
             suspicion_score: score,
@@ -576,6 +588,36 @@ mod tests {
         );
         let plain_row = out.lines().find(|l| l.contains("test_empty")).expect("plain row rendered");
         assert!(!plain_row.contains('x'), "an unverified test keeps a bare count: {plain_row}");
+    }
+
+    #[test]
+    fn mocks_column_matches_the_mock_overuse_numerator() {
+        // `stubs_count` has its own column; `mocks` is the rest of the
+        // per-test `mock_overuse` sum.
+        let mut inv = empty_inv();
+        let mut t = make_test("tests/probe.py::test_mocky", 0.3, 1, 1);
+        t.mock_construction_count = 3;
+        inv.top_suspicious.test_functions = vec![t.nodeid.clone()];
+        inv.test_functions = vec![t];
+        let out = render(&inv, 20);
+        let row = out.lines().find(|l| l.contains("test_mocky")).expect("row rendered");
+        assert!(
+            row.split_whitespace().any(|cell| cell == "4"),
+            "3 constructions + 1 decorator: {row}"
+        );
+    }
+
+    #[test]
+    fn asserts_column_marks_helper_verification() {
+        let mut inv = empty_inv();
+        let mut helped = make_test("tests/probe.py::test_frame", 0.02, 0, 0);
+        helped.helper_assertion_count = 2;
+        helped.external_verification_count = 1;
+        inv.top_suspicious.test_functions = vec![helped.nodeid.clone()];
+        inv.test_functions = vec![helped];
+        let out = render(&inv, 20);
+        let row = out.lines().find(|l| l.contains("test_frame")).expect("row rendered");
+        assert!(row.contains("0+2h+1x"), "helper calls must not render as a bare 0: {row}");
     }
 
     #[test]

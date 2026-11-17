@@ -71,7 +71,8 @@ struct Cli {
     #[arg(short, long)]
     output: Option<PathBuf>,
 
-    /// Override the tests directory. Defaults to `<path>/tests`. Only
+    /// Override the tests directory. Defaults to every pytest `testpaths`
+    /// entry in `<path>/pyproject.toml`, else `<path>/tests`. Only
     /// meaningful when `<path>` is a directory.
     #[arg(long, value_name = "PATH")]
     tests_dir: Option<PathBuf>,

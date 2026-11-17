@@ -46,7 +46,7 @@ def test_mock_only_assertion():
     # mock_only_assertions: the sole assertion targets the Mock API.
     client = Mock()
     client.send(1)
-    assert client.send.assert_called_once_with(1)
+    client.send.assert_called_once_with(1)
 
 
 def test_clean():

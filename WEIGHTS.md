@@ -1,9 +1,9 @@
 # Suspicion-score weights
 
 `pycoati`'s `suspicion_score` blends five static heuristics into a single
-[0.0, ~0.9]-bounded number per test, plus a small `mock_construction`
-bonus per file. The values below are the v1 defaults that ship in
-`src/suspicion.rs::DEFAULT`; they are **heuristic starting points**, not
+number per test in `[0.0, 0.80)` (see [Reachable range](#reachable-range)),
+plus a small `mock_construction` bonus per file. The values below are the
+v1 defaults that ship in `src/suspicion.rs::DEFAULT`; they are **heuristic starting points**, not
 empirically tuned constants. Treat the formula as the contract and the
 numbers as defaults you may want to revise after running pycoati on a real
 project (see [How to revise](#how-to-revise)).
@@ -14,12 +14,14 @@ Per-test score:
 
 ```text
 score = w_mock_only      * (only_asserts_on_mock ? 1.0 : 0.0)
-      + w_patch_count    * min(patch_decorator_count / 5.0, 1.0)
+      + w_patch_count    * min(patches / 5.0, 1.0)
       + w_setup_ratio    * sigmoid((setup_to_assertion_ratio - 8.0) / 4.0)
       + w_zero_asserts   * (unverified ? 1.0 : 0.0)
-      + w_smell_density  * min(smell_hits.len() / 3.0, 1.0)
+      + w_smell_density  * min(smell_hits.len() / 2.0, 1.0)
 
 unverified = assertion_count == 0 && external_verification_count == 0
+             && helper_assertion_count == 0
+patches    = patch_decorator_count + patch_call_count
 ```
 
 `sigmoid(x) = 1.0 / (1.0 + e^-x)`.
@@ -29,21 +31,64 @@ unverified = assertion_count == 0 && external_verification_count == 0
 | Weight | Value | Rationale |
 |---|---|---|
 | `w_mock_only` | `0.35` | Strongest single signal — a test whose only assertions target the Mock API is exercising the test double itself, not production logic. |
-| `w_patch_count` | `0.20` | High-density `@patch` decorators flag tests where the System Under Test has been replaced wholesale; saturates at 5 to avoid runaway scores on extreme outliers. |
+| `w_patch_count` | `0.20` | High patch density flags tests where the System Under Test has been replaced wholesale; saturates at 5 to avoid runaway scores on extreme outliers. Counts every patch the test installs — `@patch` decorators, `with patch(...)` / `patch.object(...)` in the body, `mocker.patch*` — so the spelling does not change the score. |
 | `w_setup_ratio` | `0.15` | Long setup before the first assertion correlates with brittle tests that drift from their intent; sigmoid keeps the term smooth and bounded. |
-| `w_zero_asserts` | `0.20` | A test that verifies nothing cannot fail by intent — it survives only by not raising. Weight is high but slightly below `w_mock_only` because such tests are often vestigial smoke tests rather than mock-theater. The term is gated on `unverified`, not on `assertion_count` alone: a test that checks a child process's exit status does fail by intent. |
+| `w_zero_asserts` | `0.20` | A test that verifies nothing cannot fail by intent — it survives only by not raising. Weight is high but slightly below `w_mock_only` because such tests are often vestigial smoke tests rather than mock-theater. The term is gated on `unverified`, not on `assertion_count` alone: a test that checks a child process's exit status, or verifies through an assertion helper, does fail by intent. |
 | `w_smell_density` | `0.10` | Re-uses information already captured by other heuristics, so weighted lowest — but a test that trips multiple smells should rank above one that trips none. |
 
-Sum of the weight values: **1.00** — a test that fires every term and
-saturates each saturating sub-metric reaches a score of 1.0.
+Sum of the weight values: **1.00**. That sum is **not** a reachable
+score — see the next section.
+
+## Reachable range
+
+Two of the five terms can never fire together. `w_mock_only` requires
+`only_asserts_on_mock`, which requires `assertion_count > 0`; `w_zero_asserts`
+requires `assertion_count == 0`. So the highest-scoring test is one of two
+shapes:
+
+| Branch | mock-only | patch | setup | zero-asserts | smells | Supremum |
+|---|---|---|---|---|---|---|
+| Mock-only (asserts only on the double) | 0.35 | 0.20 | → 0.15 | 0 | 0.10 (both smells) | **0.80** |
+| Unverified (no verification at all) | 0 | 0.20 | → 0.15 | 0.20 | 0.05 (`mock_overuse` only) | 0.60 |
+
+The unverified branch can carry only one smell: `mock_only_assertions`
+needs an assertion. The setup term is a sigmoid, which approaches
+`w_setup_ratio` without reaching it, so both bounds are approached and never
+attained: **every test score lies in `[0.0, 0.80)`**, and in practice in
+`(0.018, 0.80)`, because the setup term is never zero either. A file score
+adds at most `0.10` to a mean of test scores, so it lies in `[0.0, 0.90)`.
+
+Changing a weight changes these bounds; recompute them from the table.
 
 ## Sub-metric definitions
 
-- `assertion_count` includes both `assert_statement` nodes and
-  `with pytest.raises(...)` / `with raises(...)` context-manager blocks.
-  A raises block is treated as one effective non-mock assertion: it
-  contributes to the count, disqualifies `only_asserts_on_mock`, and
-  participates in `setup_to_assertion_ratio` like an `assert_statement`.
+- `assertion_count` counts four kinds of assertion site, one each:
+  `assert_statement` nodes, `with pytest.raises(...)` / `with raises(...)`
+  context-manager blocks, `self.assertXxx(...)` calls inside a test class,
+  and bare Mock-API assertion calls written as their own statement
+  (`m.assert_called_once_with(1)`, any `assert_*` name in
+  `MOCK_API_ATTRIBUTES`). All four raise at the line they sit on, which is
+  what keeps the count syntactic. A raises block is always a non-mock
+  assertion: it disqualifies `only_asserts_on_mock`. A bare Mock-API
+  assertion call is always a mock assertion. Raises blocks and bare mock
+  calls participate in `setup_to_assertion_ratio` like an
+  `assert_statement`; `self.assertXxx(...)` calls do not.
+- `mock_assertion_count` is the subset of `assertion_count` that inspects
+  the test double: bare `m.assert_*(...)` calls; `assert` statements whose
+  expression reads a Mock-API attribute directly, through `not`,
+  parentheses, `len(...)`, an index or attribute hanging off it
+  (`m.call_args[0][0]`), or on either side of a comparison
+  (`m.call_count == len(items)` counts; `result == m.return_value` does
+  not, since `return_value` is not in the set); and `self.assertXxx(...)`
+  calls whose every argument is a Mock-API read, a literal, or a
+  `unittest.mock` assertion helper (`call(...)`, `ANY`), with at least one
+  Mock-API read. `only_asserts_on_mock` is exactly
+  `assertion_count > 0 && mock_assertion_count == assertion_count`, which
+  is what the `w_mock_only` term reads. `and` / `or` counts as a mock read
+  only when every operand is one; `assert m.called and result == 3` is
+  real verification. An arbitrary call wrapped around an attribute
+  (`helper(m.call_count)`) is also classified as real verification: the
+  helper may check anything, and only `len(...)` is known not to.
 - `external_verification_count` counts call sites that propagate a
   failure from outside the test process: a call resolving to
   `subprocess.check_call` / `subprocess.check_output`, a call resolving
@@ -65,12 +110,28 @@ saturates each saturating sub-metric reaches a score of 1.0.
   that has an `except`, or inside `with contextlib.suppress(...)`. Evidence the test manufactured, or that cannot
   escape, is not evidence. `from subprocess import *` is never matched
   at all, which under-counts; that is the safe direction.
+- `helper_assertion_count` counts verification delegated to a call:
+  a call canonicalizing to `numpy.testing.assert_*` /
+  `pandas.testing.assert_*` / `polars.testing.assert_*` / `pytest.fail`;
+  a `with pytest.warns(...)` / `with pytest.deprecated_call()` block; and a
+  call to a same-file helper (module-level function by bare name, or
+  `self.<method>` on the test's class) whose body holds a non-mock
+  effective assertion — one level deep, no imports, no `conftest.py`. The
+  closed lists live in `src/assertion_helpers.rs`. Like
+  `external_verification_count` it stays out of `assertion_count`; unlike
+  it, each site is a full non-mock assertion: it switches off
+  `w_zero_asserts`, disqualifies `only_asserts_on_mock` (so `w_mock_only`
+  is off), is an assertion site for `setup_to_assertion_ratio`, and counts
+  in the `mock_overuse` denominator (`asserts`, below). Sites inside a
+  nested `def` / `lambda` the test may never call are not counted, and a
+  local rebinding of a helper's name (`check = lambda x: None`) shadows it.
 - `setup_to_assertion_ratio` (locked, Run 3; extended to raises blocks
   and to external verification): when at least one effective assertion
   exists in the body, `(first_effective_line - def_line) /
   effective_count` measured in tree-sitter `start_position().row`
-  deltas, where an effective assertion is an `assert_statement` or a
-  `with pytest.raises(...)` block. When the body has no effective
+  deltas, where an effective assertion is an `assert_statement`, a
+  `with pytest.raises(...)` block, a bare Mock-API assertion call or a
+  `helper_assertion_count` site. When the body has no effective
   assertion but does carry external verification, the first verification
   call site takes the assertion's place: `(first_verification_line -
   def_line) / external_verification_count` — the body is not "setup with
@@ -79,13 +140,17 @@ saturates each saturating sub-metric reaches a score of 1.0.
   denominator is `1` — the result is the body height. This naturally
   pushes setup-heavy unverified tests up the ranking, complementing the
   `w_zero_asserts` term.
-- `patch_decorator_count` saturates at **5**: the term becomes `1.0`
-  once a test has five or more `@patch`-shaped decorators. Five is the
-  point past which incremental decorators add no new signal — the test
-  is already maximally mock-mediated.
-- `smell_hits.len()` saturates at **3**: three smell categories on a
-  single test is enough to flag it; the term is the same at three and at
-  ten.
+- `patches` saturates at **5**: the term becomes `1.0` once a test
+  installs five or more patches, by decorator or in the body. Five is the
+  point past which incremental patches add no new signal — the test is
+  already maximally mock-mediated.
+- `smell_hits.len()` saturates at **2**, the number of per-test smell
+  categories (`mock_only_assertions`, `mock_overuse`). The saturation point
+  is derived from that category list in `src/smells.rs`, so a test that
+  trips every per-test smell gets the full `w_smell_density`; a third
+  category would move it to 3 automatically. Before this was tied to the
+  category count it sat at 3 and the term could only reach two thirds of
+  its weight.
 - The setup-ratio sigmoid uses `(setup_to_assertion_ratio - 8.0) / 4.0`
   as its argument. The `-8.0` term places the **inflection point at 8
   setup lines** — the row delta at which a test is becoming suspect (eight
@@ -108,35 +173,49 @@ Its v1 thresholds:
   sum defined below.
 - Both predicates use strict `>` semantics — a 2-mock-2-assert test sits
   on the boundary and does **not** fire.
+- `asserts` is `assertion_count + helper_assertion_count` — summed over the
+  file's tests at file scope. A test that verifies through
+  `assert_frame_equal` balances its mocks exactly as one using `assert`
+  does.
 
 ### `mocks` decomposition
 
-The numerator of `mock_overuse` is a sum of three independent signals:
+The numerator of `mock_overuse` is a sum of three **disjoint** counts. The
+same sum is used at test scope and at file scope (where each count is the
+sum over the file's tests).
 
-- `mock_construction_count` — bare constructor calls to
-  `Mock` / `MagicMock` / `AsyncMock` / `create_autospec` /
-  `patch(...)`-as-context-manager inside a test body. Counted at file
-  scope only; not stored per-test.
-- `patch_decorator_count` — `@patch` / `@mock.patch` / `@patch.object`
-  / `@<x>.patch` decorators on a test function. Counted both per-test
-  (decorators belong to a specific test) and per-file (sum across tests).
-- `stubs_count` — fixture-driven patch calls whose dotted call-head
-  matches `STUB_HEADS` (`monkeypatch.setattr`, `monkeypatch.setenv`,
+- `mock_construction_count` — calls in a test body whose head resolves,
+  through the file's imports, to `Mock` / `MagicMock` / `AsyncMock` /
+  `create_autospec` / `patch` / `patch.object` / `patch.dict` /
+  `patch.multiple` in `unittest.mock` or the `mock` backport. A bare name no
+  import binds (star import, conftest) is assumed to be `unittest.mock`'s
+  when it is itself one of those names; any other unbound head
+  (`factory.Mock`, a local `mock`) is not counted.
+- `patch_decorator_count` — `@patch`-shaped decorators on the test
+  function: `@patch`, `@<x>.patch`, `@patch.<attr>`, or any decorator
+  resolving to a `patch*` variant (`@mock.patch.object`).
+- `stubs_count` — fixture-driven calls whose dotted call-head matches
+  `STUB_HEADS` (`monkeypatch.setattr`, `monkeypatch.setenv`,
   `monkeypatch.delattr`, `monkeypatch.delenv`, `monkeypatch.context`,
   `monkeypatch.syspath_prepend`, `monkeypatch.chdir`, `mocker.patch`,
   `mocker.patch.object`, `mocker.patch.dict`, `mocker.patch.multiple`,
-  `mocker.spy`, `mocker.stub`, `mocker.MagicMock`). Counted both
-  per-test and per-file. Stubs are structurally distinct from
-  `unittest.mock` constructions: they rewire the system under test from
-  the outside via pytest's `monkeypatch` / `mocker` fixtures rather
-  than instantiating a `Mock()` directly.
+  `mocker.spy`, `mocker.stub`, `mocker.Mock`, `mocker.MagicMock`,
+  `mocker.AsyncMock`, `mocker.create_autospec`). The `mocker` fixture is
+  not an import, so these are matched as written and never overlap the
+  construction count.
 
-At file scope `mock_overuse` consumes
-`mock_construction_count + patch_decorator_count + stubs_count`. At
-per-test scope it consumes `patch_decorator_count + stubs_count` only —
-body-level `Mock()` constructions are not stored on `TestRecord`, so
-the per-test predicate intentionally covers decorator-driven and
-fixture-driven patching only.
+A fourth count, `patch_call_count`, feeds the **patch term** only. It is
+the body-level patches — the `patch*` subset of `mock_construction_count`
+plus the `mocker.patch*` subset of `stubs_count` — and is never added to
+`mocks`. That gives every patch the same footprint whatever its spelling:
+
+| Spelling | Patch term input | `mocks` term |
+|---|---|---|
+| `@patch("a.b")` | `patch_decorator_count` | `patch_decorator_count` |
+| `with patch("a.b"):` / `patch.object(...)` | `patch_call_count` | `mock_construction_count` |
+| `mocker.patch("a.b")` | `patch_call_count` | `stubs_count` |
+| `Mock()` / `mock.MagicMock()` | — | `mock_construction_count` |
+| `mocker.MagicMock()` / `monkeypatch.setattr(...)` | — | `stubs_count` |
 
 ## File-level score
 

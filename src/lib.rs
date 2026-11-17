@@ -24,6 +24,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 pub mod accept;
+pub(crate) mod assertion_helpers;
 pub mod coverage;
 pub mod guide;
 pub mod mock_api;
@@ -152,13 +153,41 @@ pub struct TestRecord {
     pub nodeid: String,
     pub file: PathBuf,
     pub line: u64,
+    /// Effective assertion sites in this test body: `assert` statements,
+    /// `with pytest.raises(...)` blocks, `self.assertXxx(...)` calls, and
+    /// bare Mock-API assertion calls (`m.assert_called_once_with(1)`) — every
+    /// construct that raises `AssertionError` (or fails the test like it) at
+    /// the line it appears on.
     pub assertion_count: u64,
+    /// `true` when `assertion_count > 0` and every assertion site counted
+    /// there targets the Mock API (`mock_assertion_count == assertion_count`).
     pub only_asserts_on_mock: bool,
+    /// The subset of `assertion_count` whose sites inspect a Mock-API
+    /// attribute rather than a value the system under test produced: bare
+    /// `m.assert_*(...)` calls, `assert` statements whose expression reads
+    /// a Mock-API attribute (`assert m.called`, `assert not m.called`,
+    /// `assert m.call_count == 2`), and `self.assertXxx(...)` calls whose
+    /// every non-literal argument is one (`self.assertEqual(m.call_count, 1)`).
+    pub mock_assertion_count: u64,
     pub patch_decorator_count: u64,
+    /// Patches this test installs other than through a decorator: a call in
+    /// the body resolving to `unittest.mock.patch` / `patch.object` /
+    /// `patch.dict` / `patch.multiple` (or the `mock` backport's), typically
+    /// as a context manager, plus `mocker.patch*` fixture calls. Feeds the
+    /// patch term of `suspicion_score` beside `patch_decorator_count`, so a
+    /// patch scores the same whichever way it is spelled. Not part of the
+    /// `mock_overuse` sum: each of these sites is already counted there once,
+    /// through `mock_construction_count` or `stubs_count`.
+    pub patch_call_count: u64,
+    /// Mock-API constructions in this test's body: calls resolving, through
+    /// the file's imports, to `Mock` / `MagicMock` / `AsyncMock` /
+    /// `create_autospec` / `patch*` in `unittest.mock` or the `mock`
+    /// backport. Feeds the per-test `mock_overuse` smell.
+    pub mock_construction_count: u64,
     /// Number of fixture-driven stub-API call sites in this test's body.
     /// At per-test scope, `mock_overuse` consumes
-    /// `(patch_decorator_count + stubs_count)` — body-level Mock-API
-    /// constructions remain a file-scope signal only.
+    /// `(mock_construction_count + patch_decorator_count + stubs_count)`,
+    /// the same sum as at file scope.
     pub stubs_count: u64,
     pub setup_to_assertion_ratio: f64,
     /// Call sites in this test's body that verify an outcome the test body
@@ -175,6 +204,21 @@ pub struct TestRecord {
     /// replaced with a double, or one nested in a `def` the test may never
     /// invoke, does not count.
     pub external_verification_count: u64,
+    /// Verification delegated to a helper call rather than written as an
+    /// assertion site in the body: a known library assertion helper
+    /// (`numpy.testing.assert_*`, `pandas.testing.assert_*`,
+    /// `polars.testing.assert_*`, `pytest.fail`), a `with pytest.warns(...)`
+    /// / `with pytest.deprecated_call()` block, or a call to a same-file
+    /// helper — a module-level function, or a method of this test's class —
+    /// whose own body holds a non-mock assertion. See
+    /// `assertion_helpers.rs` for the closed lists.
+    ///
+    /// Kept separate from `assertion_count`, like
+    /// `external_verification_count`. Each site counts as an effective
+    /// non-mock assertion: it switches off the zero-assert signal,
+    /// disqualifies `only_asserts_on_mock`, and is an assertion site for
+    /// `setup_to_assertion_ratio`.
+    pub helper_assertion_count: u64,
     pub called_names: Vec<String>,
     pub smell_hits: Vec<SmellHit>,
     pub suspicion_score: f64,
@@ -204,9 +248,9 @@ impl TestRecord {
 }
 
 impl TestRecord {
-    /// True when the test verifies nothing: no `assert`-shaped construct in
-    /// its body **and** no external-verification call site, so it can only
-    /// fail by raising.
+    /// True when the test verifies nothing: no assertion site in its body,
+    /// no external-verification call site **and** no assertion-helper call,
+    /// so it can only fail by raising.
     ///
     /// The one definition of "assertionless" in the crate. Both consumers —
     /// the `w_zero_asserts` term of `suspicion_score` and the `zero_asserts`
@@ -214,7 +258,9 @@ impl TestRecord {
     /// the acceptance baseline can never disagree about which tests the
     /// signal covers.
     pub fn verifies_nothing(&self) -> bool {
-        self.assertion_count == 0 && self.external_verification_count == 0
+        self.assertion_count == 0
+            && self.external_verification_count == 0
+            && self.helper_assertion_count == 0
     }
 }
 
@@ -585,8 +631,8 @@ pub fn run_with_pytest(
         &detected
     };
     let (program, extra_python_args) = split_python_cmd(resolved_cmd);
-    let tests_dir =
-        tests_dir_override.map_or_else(|| inv.project.path.join("tests"), Path::to_path_buf);
+    // Resolved silently: the static pass above already reported problems.
+    let dirs = resolve_tests_dirs(&inv.project.path, tests_dir_override, false).existing;
     let project_root = inv.project.path.clone();
     let pkg = project_package_override.map_or_else(
         || single_project_cov_package(&inv.project.path, &inv.project.name),
@@ -598,7 +644,7 @@ pub fn run_with_pytest(
         &program,
         &extra_python_args,
         &project_root,
-        &tests_dir,
+        &dirs,
         &pkg,
         pytest_args,
         no_coverage,
@@ -623,7 +669,7 @@ fn invoke_pytest_for_inventory(
     program: &str,
     extra_python_args: &[String],
     subprocess_cwd: &Path,
-    tests_dir: &Path,
+    tests_dirs: &[PathBuf],
     project_package: &str,
     pytest_args: &[String],
     no_coverage: bool,
@@ -643,9 +689,9 @@ fn invoke_pytest_for_inventory(
     }
 
     let collection =
-        pytest::run_collection(program, extra_python_args, subprocess_cwd, tests_dir, pytest_args);
+        pytest::run_collection(program, extra_python_args, subprocess_cwd, tests_dirs, pytest_args);
     let durations =
-        pytest::run_durations(program, extra_python_args, subprocess_cwd, tests_dir, pytest_args);
+        pytest::run_durations(program, extra_python_args, subprocess_cwd, tests_dirs, pytest_args);
 
     let ran_pytest = collection.test_count.is_some()
         || !durations.slowest_tests.is_empty()
@@ -664,7 +710,7 @@ fn invoke_pytest_for_inventory(
                 program,
                 extra_python_args,
                 subprocess_cwd,
-                tests_dir,
+                tests_dirs,
                 pytest_args,
                 project_package,
             );
@@ -804,21 +850,28 @@ fn run_workspace_with_pytest(
         let mut inv = run_static_dir_with_options(member, None, None, top_n, false, accept_opts)
             .with_context(|| format!("auditing workspace member {}", member.display()))?;
 
-        // Workspace member without a `tests/` dir was skipped with a warn
-        // and a zero-test inventory. Don't fire pytest at a member that
-        // has nothing to run.
-        if !member.join("tests").is_dir() {
+        // Workspace member without a tests dir (its `testpaths`, else
+        // `tests/`) was skipped with a warn and a zero-test inventory.
+        // Don't fire pytest at a member that has nothing to run.
+        let member_dirs = resolve_tests_dirs(member, None, false).existing;
+        if member_dirs.is_empty() {
             members.push(inv);
             continue;
         }
 
         // Per-member cwd is either the workspace root (default) or the
-        // member dir, per `--member-cwd`. The tests path is rendered
+        // member dir, per `--member-cwd`. The tests paths are rendered
         // relative to whichever cwd we picked so pytest's
         // collection/durations/coverage all see the same paths.
-        let (subprocess_cwd, tests_dir) = match member_cwd {
-            MemberCwd::Root => (ws.root.clone(), member.join("tests")),
-            MemberCwd::Member => (member.clone(), PathBuf::from("tests")),
+        let (subprocess_cwd, dirs) = match member_cwd {
+            MemberCwd::Root => (ws.root.clone(), member_dirs),
+            MemberCwd::Member => (
+                member.clone(),
+                member_dirs
+                    .iter()
+                    .map(|d| d.strip_prefix(member).map_or_else(|_| d.clone(), Path::to_path_buf))
+                    .collect(),
+            ),
         };
 
         // Each member declares its own importable package via its
@@ -831,7 +884,7 @@ fn run_workspace_with_pytest(
             &program,
             &extra_python_args,
             &subprocess_cwd,
-            &tests_dir,
+            &dirs,
             &pkg,
             pytest_args,
             no_coverage,
@@ -851,6 +904,66 @@ fn run_workspace_with_pytest(
         members,
         tool: ToolInfo::with_runtime(any_ran_pytest, any_ran_coverage),
     })
+}
+
+/// Directory scanned for tests when neither `--tests-dir` nor
+/// `[tool.pytest.ini_options].testpaths` names one.
+const DEFAULT_TESTS_DIR: &str = "tests";
+
+/// Where to look for tests in a project rooted at `project_root`.
+struct TestsDirs {
+    /// Every directory that was asked for, existing or not — for messages.
+    candidates: Vec<PathBuf>,
+    /// The directories to scan: the existing candidates, or `<root>/tests`
+    /// when a `testpaths` setting names none that exists.
+    existing: Vec<PathBuf>,
+}
+
+/// Resolve the test directories for a project, in order: the `--tests-dir`
+/// override when given; else every `testpaths` entry in its
+/// `pyproject.toml` (see [`pyproject::read_testpaths`]), joined to the root;
+/// else `<root>/tests`.
+///
+/// A `testpaths` entry that does not exist is skipped. When none exists,
+/// `<root>/tests` is used if it does: a stale setting should not turn a
+/// project that worked with the default into an error. `log` controls the
+/// warnings about both, so callers that resolve twice for one project (the
+/// static pass, then pytest) report them once.
+fn resolve_tests_dirs(
+    project_root: &Path,
+    tests_dir_override: Option<&Path>,
+    log: bool,
+) -> TestsDirs {
+    let default_dir = project_root.join(DEFAULT_TESTS_DIR);
+    let (candidates, from_testpaths) =
+        match (tests_dir_override, pyproject::read_testpaths(project_root)) {
+            (Some(dir), _) => (vec![dir.to_path_buf()], false),
+            (None, Some(entries)) => (entries.iter().map(|e| project_root.join(e)).collect(), true),
+            (None, None) => (vec![default_dir.clone()], false),
+        };
+    let (existing, missing): (Vec<&PathBuf>, Vec<&PathBuf>) =
+        candidates.iter().partition(|d| d.is_dir());
+    let mut existing: Vec<PathBuf> = existing.into_iter().cloned().collect();
+    if existing.is_empty() && from_testpaths && default_dir.is_dir() {
+        if log {
+            tracing::warn!(
+                testpaths = %display_paths(&candidates),
+                fallback = %default_dir.display(),
+                "no testpaths entry exists; falling back to the default tests directory"
+            );
+        }
+        existing.push(default_dir);
+    } else if log && !existing.is_empty() {
+        for dir in missing {
+            tracing::warn!(tests_dir = %dir.display(), "tests directory not found; skipping it");
+        }
+    }
+    TestsDirs { candidates, existing }
+}
+
+/// `a, b, c` rendering of a path list for messages.
+fn display_paths(paths: &[PathBuf]) -> String {
+    paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
 }
 
 /// Pick the `--cov=<pkg>` argument for a workspace member from its
@@ -966,18 +1079,18 @@ fn run_static_dir_with_options(
     // fails fast, rather than after a full parse pass.
     let baseline = accept_opts.resolve(&inv.project.path)?;
 
-    let tests_dir =
-        tests_dir_override.map_or_else(|| inv.project.path.join("tests"), Path::to_path_buf);
+    let TestsDirs { candidates, existing } =
+        resolve_tests_dirs(&inv.project.path, tests_dir_override, true);
+    let tests_dirs_display = display_paths(&candidates);
 
-    if !tests_dir.exists() {
+    if existing.is_empty() {
         if strict_missing_tests {
             anyhow::bail!(
-                "no tests directory at {}; not a workspace either (no [tool.uv.workspace] in pyproject.toml)",
-                tests_dir.display()
+                "no tests directory at {tests_dirs_display}; not a workspace either (no [tool.uv.workspace] in pyproject.toml)",
             );
         }
         tracing::warn!(
-            tests_dir = %tests_dir.display(),
+            tests_dir = %tests_dirs_display,
             "tests directory not found; emitting empty inventory"
         );
         inv.accepted =
@@ -985,8 +1098,17 @@ fn run_static_dir_with_options(
         return Ok(inv);
     }
 
-    let files = walker::discover_test_files(&tests_dir)
-        .with_context(|| format!("failed to walk {}", tests_dir.display()))?;
+    let mut files = Vec::new();
+    for dir in &existing {
+        files.extend(
+            walker::discover_test_files(dir)
+                .with_context(|| format!("failed to walk {}", dir.display()))?,
+        );
+    }
+    // Overlapping entries (`tests` and `tests/unit`) must not parse a file
+    // twice; sorting also keeps the inventory order deterministic.
+    files.sort();
+    files.dedup();
 
     // Symmetric counterpart to the "tests directory not found" WARN above:
     // when the dir exists but the walker returns zero `test_*.py` files,
@@ -995,7 +1117,7 @@ fn run_static_dir_with_options(
     // logs an info-level breadcrumb for the same reason.
     if files.is_empty() {
         tracing::warn!(
-            tests_dir = %tests_dir.display(),
+            tests_dir = %tests_dirs_display,
             "no python test files under tests dir; emitting empty inventory"
         );
     } else {
@@ -1003,7 +1125,7 @@ fn run_static_dir_with_options(
         // the fmt subscriber renders both, so interpolating the same data
         // into the message would double-stamp it in user-visible output.
         tracing::info!(
-            tests_dir = %tests_dir.display(),
+            tests_dir = %tests_dirs_display,
             count = files.len(),
             "discovered python test files"
         );

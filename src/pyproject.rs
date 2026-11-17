@@ -26,7 +26,15 @@ struct Tool {
     hatch: Option<Hatch>,
     setuptools: Option<Setuptools>,
     uv: Option<Uv>,
+    /// `[tool.pytest]`, kept as a raw TOML value so that a pytest setting
+    /// of an unexpected type can never make the whole file unparseable for
+    /// the other readers here.
+    pytest: Option<toml::Value>,
 }
+
+/// Characters that make a `testpaths` entry a glob pattern, which pytest
+/// expands and this reader does not.
+const GLOB_CHARS: &[char] = &['*', '?', '['];
 
 /// `[tool.uv]` table. Today we only consume the optional `workspace`
 /// subtable — every other key uv supports is ignored.
@@ -203,6 +211,44 @@ pub fn read_uv_workspace_members(root: &Path) -> Option<Vec<String>> {
     Some(workspace.members.unwrap_or_default())
 }
 
+/// Read the `testpaths` pytest setting from `<root>/pyproject.toml`:
+/// `[tool.pytest.ini_options].testpaths`, else the pytest 9 native
+/// `[tool.pytest].testpaths`.
+///
+/// Accepts the list form and a single string, which is split on whitespace
+/// as pytest does. Entries are returned verbatim, relative to `root`.
+/// Entries containing a glob character are skipped with a warning: pytest
+/// expands them, this reader does not, and treating `src/*/tests` as a
+/// literal directory would only produce a missing path. Non-string list
+/// items are dropped. `None` when the file, the key, or every usable entry
+/// is missing — callers then fall back to `<root>/tests`.
+///
+/// `pytest.ini`, `tox.ini` and `setup.cfg` are not read.
+pub fn read_testpaths(root: &Path) -> Option<Vec<String>> {
+    let pytest = read_pyproject_silent(root)?.tool?.pytest?;
+    let value = pytest
+        .get("ini_options")
+        .and_then(|ini| ini.get("testpaths"))
+        .or_else(|| pytest.get("testpaths"))?;
+    let raw: Vec<&str> = match value {
+        toml::Value::String(one) => one.split_whitespace().collect(),
+        toml::Value::Array(items) => items.iter().filter_map(toml::Value::as_str).collect(),
+        _ => Vec::new(),
+    };
+    let entries: Vec<String> = raw
+        .into_iter()
+        .filter(|entry| {
+            let is_glob = entry.contains(GLOB_CHARS);
+            if is_glob {
+                tracing::warn!(entry, "glob testpaths entries are not expanded; skipping it");
+            }
+            !is_glob
+        })
+        .map(String::from)
+        .collect();
+    (!entries.is_empty()).then_some(entries)
+}
+
 /// Read + parse `pyproject.toml` without surfacing errors. Used by the
 /// `Option`-returning public helpers. Missing file is silent; every other
 /// failure logs at `warn` with enough context for a user to find the
@@ -264,6 +310,93 @@ fn package_basename(path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_pyproject(contents: &str) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("pyproject.toml"), contents).expect("write fixture");
+        tmp
+    }
+
+    #[test]
+    fn testpaths_list_is_read_in_order() {
+        let tmp = write_pyproject(
+            "[tool.pytest.ini_options]\ntestpaths = [\"tests/unit\", \"integration\"]\n",
+        );
+        assert_eq!(
+            read_testpaths(tmp.path()),
+            Some(vec!["tests/unit".to_string(), "integration".to_string()])
+        );
+    }
+
+    #[test]
+    fn testpaths_single_string_is_one_entry() {
+        let tmp = write_pyproject("[tool.pytest.ini_options]\ntestpaths = \"checks\"\n");
+        assert_eq!(read_testpaths(tmp.path()), Some(vec!["checks".to_string()]));
+    }
+
+    #[test]
+    fn testpaths_string_is_split_on_whitespace_like_pytest() {
+        let tmp =
+            write_pyproject("[tool.pytest.ini_options]\ntestpaths = \"tests  integration\"\n");
+        assert_eq!(
+            read_testpaths(tmp.path()),
+            Some(vec!["tests".to_string(), "integration".to_string()])
+        );
+    }
+
+    #[test]
+    fn glob_testpaths_entries_are_skipped() {
+        // pytest expands globs; pycoati does not, so a glob entry is
+        // dropped rather than treated as a literal directory name.
+        let tmp = write_pyproject(
+            "[tool.pytest.ini_options]\ntestpaths = [\"src/*/tests\", \"tests\", \"t[ab]\"]\n",
+        );
+        assert_eq!(read_testpaths(tmp.path()), Some(vec!["tests".to_string()]));
+        let only_globs =
+            write_pyproject("[tool.pytest.ini_options]\ntestpaths = [\"pkg?/tests\"]\n");
+        assert_eq!(read_testpaths(only_globs.path()), None);
+    }
+
+    #[test]
+    fn native_pytest_table_testpaths_is_read() {
+        // pytest 9 reads settings directly under `[tool.pytest]`.
+        let native = write_pyproject("[tool.pytest]\ntestpaths = [\"checks\"]\n");
+        assert_eq!(read_testpaths(native.path()), Some(vec!["checks".to_string()]));
+        // `ini_options` wins when both are present.
+        let both = write_pyproject(
+            "[tool.pytest]\ntestpaths = [\"native\"]\n[tool.pytest.ini_options]\ntestpaths = [\"ini\"]\n",
+        );
+        assert_eq!(read_testpaths(both.path()), Some(vec!["ini".to_string()]));
+    }
+
+    #[test]
+    fn non_table_pytest_tool_does_not_break_other_readers() {
+        let tmp = write_pyproject("[project]\nname = \"proj\"\n[tool]\npytest = 3\n");
+        assert_eq!(read_testpaths(tmp.path()), None);
+        assert_eq!(read_project_name(tmp.path()), Some("proj".to_string()));
+    }
+
+    #[test]
+    fn missing_or_empty_testpaths_is_none() {
+        assert_eq!(read_testpaths(write_pyproject("[project]\nname = \"x\"\n").path()), None);
+        let empty = write_pyproject("[tool.pytest.ini_options]\ntestpaths = []\n");
+        assert_eq!(read_testpaths(empty.path()), None);
+        let no_file = tempfile::tempdir().expect("tempdir");
+        assert_eq!(read_testpaths(no_file.path()), None);
+    }
+
+    #[test]
+    fn malformed_testpaths_does_not_break_other_readers() {
+        // A wrong type under `testpaths` must not make the whole file
+        // unparseable: the project name still reads.
+        let tmp = write_pyproject(
+            "[project]\nname = \"proj\"\n[tool.pytest.ini_options]\ntestpaths = 3\n",
+        );
+        assert_eq!(read_testpaths(tmp.path()), None);
+        assert_eq!(read_project_name(tmp.path()), Some("proj".to_string()));
+        let mixed = write_pyproject("[tool.pytest.ini_options]\ntestpaths = [\"ok\", 3]\n");
+        assert_eq!(read_testpaths(mixed.path()), Some(vec!["ok".to_string()]));
+    }
 
     #[test]
     fn reads_name_from_fixture_pyproject() {

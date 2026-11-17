@@ -95,20 +95,19 @@ opening a file at `file`:`line`.
 - `test_function_count` — number of `def test_*` functions parsed from this file
   via AST. Class-nested test methods are counted. **Parametrize is not
   expanded.**
-- `assertion_count` — effective assertions across every test body in the file.
-  An effective assertion is an `assert` statement or a `with pytest.raises(...)`
-  block; the raises block counts as one.
-- `mock_construction_count` — call sites in test bodies whose callee is `Mock`,
-  `MagicMock`, `AsyncMock`, `create_autospec`, or `patch`. `patch` is counted
-  here because `with patch(...)` is a construction at the call site. This is a
-  file-scope signal only; there is no per-test equivalent.
+- `assertion_count` — effective assertions across every test body in the file:
+  the sum of `test_functions[].assertion_count` for this file's tests, with the
+  same definition.
+- `mock_construction_count` — sum of `test_functions[].mock_construction_count`
+  for this file's tests, with the same definition.
 - `patch_decorator_count` — sum of the per-test decorator counts in this file.
 - `stubs_count` — fixture-driven patch call sites in this file. The matched set
   is closed and exact: `monkeypatch.setattr`, `monkeypatch.setenv`,
   `monkeypatch.delattr`, `monkeypatch.delenv`, `monkeypatch.context`,
   `monkeypatch.syspath_prepend`, `monkeypatch.chdir`, `mocker.patch`,
   `mocker.patch.object`, `mocker.patch.dict`, `mocker.patch.multiple`,
-  `mocker.spy`, `mocker.stub`, `mocker.MagicMock`.
+  `mocker.spy`, `mocker.stub`, `mocker.Mock`, `mocker.MagicMock`,
+  `mocker.AsyncMock`, `mocker.create_autospec`.
 - `fixture_count` — `@pytest.fixture` / `@fixture` decorators anywhere in the
   file, including on non-test functions. File scope only.
 - `smell_hits` — array of smell hits at file scope. See `smell_hits[]` below.
@@ -119,27 +118,89 @@ One record per collected test function. This is the primary array; most of your
 analysis reads from here.
 
 - `nodeid` — `<file>::<test>`, or `<file>::<Class>::<method>` for class-based
-  tests. **Parametrize is not expanded**, so there is never a `[...]` suffix.
+  tests, with one `::<Class>` segment per level for nested classes
+  (`<file>::TestOuter::TestInner::test_x`). Classes are collected when named
+  `Test*` or when they subclass `unittest.TestCase` /
+  `IsolatedAsyncioTestCase` (directly or through same-file base classes),
+  matching what pytest collects. Classes nested inside a `TestCase` subclass
+  are not collected, as pytest does not. In a `TestCase` subclass every
+  `test*` method counts, as unittest's loader does; in other classes and at
+  module level only `test_*` counts — narrower than pytest's own default,
+  which would also collect `def testfoo()`. Two known gaps: test methods
+  inherited from a same-file base class are not collected on the subclass,
+  and only `unittest`'s own base classes are recognised (a `django.test.
+  TestCase` subclass is collected only when it is named `Test*`).
+  **Parametrize is not expanded**, so there is never a `[...]` suffix.
 - `file` — path to the file containing this test. Joins to `files[].path`.
 - `line` — line of the `def`. **1-indexed**, matching what an editor shows.
-- `assertion_count` — effective assertions in this test body: `assert`
-  statements plus `with pytest.raises(...)` blocks, one each.
-- `only_asserts_on_mock` — `true` when every `assert` statement in the body
-  targets a mock-API attribute *and* the body contains no raises block. The
-  matched attribute set is exact: `called`, `call_count`, `call_args`,
-  `call_args_list`, `assert_called`, `assert_called_with`, `assert_called_once`,
-  `assert_called_once_with`, `assert_not_called`, `assert_any_call`,
-  `assert_has_calls`. **`false` when the test has zero assertions** — this flag
-  never fires on an assertionless test, so it does not overlap `dead-test`.
+- `assertion_count` — effective assertion sites in this test body, one each:
+  `assert` statements, `with pytest.raises(...)` blocks, `self.assertXxx(...)`
+  calls inside a test class, and bare mock-API assertion calls written as a
+  statement on their own (`m.assert_called_once_with(1)`). Every one of these
+  fails the test at the line it sits on. Verification that happens elsewhere
+  is counted separately — see `external_verification_count`.
+- `only_asserts_on_mock` — `true` when the test has at least one assertion and
+  every one of them targets the mock API, i.e. `mock_assertion_count ==
+  assertion_count > 0`. A raises block never targets the mock API, so one in
+  the body makes this `false`. **`false` when the test has zero assertions** —
+  this flag never fires on an assertionless test, so it does not overlap
+  `dead-test`.
+- `mock_assertion_count` — the part of `assertion_count` that inspects a test
+  double rather than a value the code under test produced. The mock-API
+  attribute set is closed and exact: `called`, `call_count`, `call_args`,
+  `call_args_list`, `assert_called`, `assert_called_with`,
+  `assert_called_once`, `assert_called_once_with`, `assert_not_called`,
+  `assert_any_call`, `assert_has_calls`. A site counts here when it is:
+  - a bare call to one of the `assert_*` names on any receiver except bare
+    `self` — `m.assert_called_once_with(1)`, `self.client.send.assert_called()`;
+  - an `assert` whose expression reads one of those attributes, directly or
+    through `not`, parentheses, `len(...)`, an indexing or attribute access
+    hanging off it (`m.call_args[0][0]`, `m.call_args.kwargs`), or either side
+    of a comparison — `assert not m.called`, `assert m.call_count == 2`,
+    `assert m.call_count == len(items)`. `assert result == m.return_value` does
+    **not** count: `return_value` is configuration, not part of the set;
+  - a `self.assertXxx(...)` call where at least one argument reads one of those
+    attributes and every other argument is a literal, a mock assertion helper
+    (`call(...)`, `call.save(...)`, `ANY`, imported from `unittest.mock` or
+    `mock`) or a container of those — `self.assertEqual(m.call_count, 1)`,
+    `self.assertFalse(m.called)`. `self.assertEqual(m.call_count, len(items))`
+    does not count, because the argument list does not say which side is the
+    value under test. A `msg=` argument is ignored.
+
+  `and` / `or` counts only when every operand reads the mock API
+  (`assert m.called and m.call_count == 1`); one real operand
+  (`assert m.called and result == 3`) makes it real verification. So does an
+  arbitrary call around the attribute (`helper(m.call_count)`).
 - `patch_decorator_count` — `@patch`, `@mock.patch`, `@patch.object`, or any
   `@<something>.patch` decorator on this test.
+- `patch_call_count` — patches this test installs *without* a decorator: calls
+  in the body resolving to `patch`, `patch.object`, `patch.dict` or
+  `patch.multiple` from `unittest.mock` or the `mock` backport (usually as
+  `with patch(...):`), plus `mocker.patch`, `mocker.patch.object`,
+  `mocker.patch.dict` and `mocker.patch.multiple`. Spelling does not matter:
+  `with mock.patch(...)` under `from unittest import mock` counts. Read it
+  beside `patch_decorator_count` — together they are every patch the test
+  installs, and the score's patch term reads their sum. **Do not add it to
+  `mock_construction_count` or `stubs_count`**: each site here is already in
+  exactly one of those.
+- `mock_construction_count` — Mock-API constructions in this test's body:
+  calls resolving to `Mock`, `MagicMock`, `AsyncMock`, `create_autospec`,
+  `patch`, `patch.object`, `patch.dict` or `patch.multiple` in `unittest.mock`
+  or the `mock` backport. Call heads are resolved through the file's imports,
+  so `mock.Mock()` under `from unittest import mock` and an aliased
+  `MagicMock as MM` both count, while `factory.Mock()` or a `Mock` imported
+  from your own package do not. A bare `Mock()` that no import binds (star
+  import, conftest) still counts. `mocker.Mock()` and friends are stubs, not
+  constructions.
 - `stubs_count` — fixture-driven patch call sites in this test's body, from the
   closed list given under `files[].stubs_count`.
 - `setup_to_assertion_ratio` — lines of setup per assertion, as a float.
   Computed as
   `(first_effective_assertion_line - def_line) / effective_assertion_count`,
-  where an effective assertion is an `assert` statement or a
-  `with pytest.raises(...)` block. `self.assertXxx(...)` calls raise
+  where an effective assertion is an `assert` statement, a
+  `with pytest.raises(...)` block, a bare mock-API assertion call
+  (`m.assert_called_once_with(1)`) or a `helper_assertion_count` site.
+  `self.assertXxx(...)` calls raise
   `assertion_count` without feeding this denominator.
   When the body has no effective assertion but does carry external
   verification, the first such call site stands in for the first assertion:
@@ -156,7 +217,7 @@ analysis reads from here.
   `<receiver>.check_returncode()`. Import aliases are resolved first, so
   `import subprocess as sp` and `from subprocess import run as r` both match.
   **This is not part of `assertion_count`**, which stays a syntactic count of
-  `assert`-shaped constructs — read the two together. A non-zero value means
+  assertion sites in the body — read the two together. A non-zero value means
   zero assertions is not the absence of verification; it does **not** mean the
   child process checks anything worth checking. See `dead-test` below.
 
@@ -170,6 +231,30 @@ analysis reads from here.
   `from subprocess import *`, which binds an unknown set of names; and every
   `check_returncode()` in a test that patched any `subprocess` name at all,
   including one on a real `CompletedProcess`.
+- `helper_assertion_count` — verification this test delegates to a call
+  rather than writing as an assertion site. Three closed sources, one each:
+  - a call resolving through the file's imports to `numpy.testing.assert_*`,
+    `pandas.testing.assert_*`, `polars.testing.assert_*` or `pytest.fail` —
+    `np.testing.assert_allclose(...)` under `import numpy as np` counts;
+  - a `with pytest.warns(...):` or `with pytest.deprecated_call():` block,
+    one per block, like a raises block;
+  - a call to a **same-file helper** whose own body holds a non-mock
+    assertion: a module-level function called by bare name (and not shadowed
+    by one of the test's parameters), or `self.<method>(...)` for a method of
+    the test's own class. One level only: a helper that verifies by calling
+    another helper does not count, nor does anything imported or defined in
+    `conftest.py`. A helper whose only assertions target the mock API does
+    not count either.
+
+  **Not part of `assertion_count`** — read the two together, like
+  `external_verification_count`. Each site counts as a non-mock assertion
+  everywhere else: it switches off `zero_asserts`, makes
+  `only_asserts_on_mock` `false`, and is an assertion site for
+  `setup_to_assertion_ratio`, and it counts as an assertion in the
+  `mock_overuse` ratio. Two shapes are never credited: a helper call inside a
+  nested `def` or `lambda` the test may never call, and a call to a name the
+  test rebinds itself (a parameter, `check = lambda x: None`, a nested `def`
+  of the same name).
 - `called_names` — sorted, deduplicated, dot-joined names of calls in this test
   body, **filtered to project-internal names only**. Calls into the standard
   library, into third-party packages, and `self.*` calls are all excluded. An
@@ -178,7 +263,8 @@ analysis reads from here.
   canonicalized: `from myproj.repo import Repository` used as `Repository.save`
   appears as `myproj.repo.Repository.save`.
 - `smell_hits` — array of smell hits at test scope. See below.
-- `suspicion_score` — float in `0.0`–`1.0`. Composite; see the formula below.
+- `suspicion_score` — float, always below `0.80`. Composite; see the formula
+  and its reachable range below.
   Higher is more suspicious. This is a ranking device, not a measurement — the
   absolute value has no meaning beyond ordering.
 - `fingerprint` — 16 hex digits identifying this test's current source,
@@ -262,9 +348,10 @@ is removed from `files`, `test_functions`, `smell_hits`, or any count.
   `mock_only_assertions`, `mock_overuse`, `zero_asserts`, `high_setup_ratio`.
   The first two mirror `smell_hits[].category`; the last two are score-bearing
   signals that produce no smell hit. `zero_asserts` fires on the same
-  condition as the score's term — `assertion_count == 0` **and**
-  `external_verification_count == 0` — so a test that checks a child process
-  never offers it, and an entry accepting it on such a test goes `stale`.
+  condition as the score's term — `assertion_count == 0`,
+  `external_verification_count == 0` **and** `helper_assertion_count == 0` —
+  so a test that checks a child process or verifies through a helper never
+  offers it, and an entry accepting it on such a test goes `stale`.
 - `reason` — the reviewer's recorded justification. Always non-empty; the file
   will not parse without it. **Quote it in your report** — it is the whole
   content of the review decision, and re-deriving it is what this block
@@ -306,28 +393,39 @@ is removed from `files`, `test_functions`, `smell_hits`, or any count.
 
 ```
 suspicion_score = 0.35 * (only_asserts_on_mock ? 1 : 0)
-                + 0.20 * min(patch_decorator_count / 5, 1)
+                + 0.20 * min((patch_decorator_count + patch_call_count) / 5, 1)
                 + 0.15 * sigmoid((setup_to_assertion_ratio - 8) / 4)
                 + 0.20 * (unverified ? 1 : 0)
-                + 0.10 * min(len(smell_hits) / 3, 1)
+                + 0.10 * min(len(smell_hits) / 2, 1)
 
 unverified = assertion_count == 0 and external_verification_count == 0
+             and helper_assertion_count == 0
 ```
 
-`sigmoid(x) = 1 / (1 + e^-x)`. Weights sum to `1.00`.
+`sigmoid(x) = 1 / (1 + e^-x)`. Weights sum to `1.00`, but no test can score
+`1.00`: the `0.35` mock-only term needs at least one assertion and the `0.20`
+zero-assert term needs none, so they never fire together.
 
 Consequences you need when reading scores:
 
 - The setup term is never zero. Even a test with a ratio of `0` contributes
   `0.15 * sigmoid(-2)` ≈ `0.018`, so scores are never exactly `0.00`.
-- `patch_decorator_count` saturates at **5** and `len(smell_hits)` at **3**. Ten
-  patches score the same as five.
+- Patches (`patch_decorator_count + patch_call_count`) saturate at **5** and
+  `len(smell_hits)` at **2** — the number of per-test smell categories, so a
+  test with both smells gets the full `0.10`. Ten patches score the same as
+  five, and a `with patch(...)` scores the same as a `@patch`.
+- **The highest reachable score is just under `0.80`**: mock-only assertions
+  (`0.35`), five or more patches (`0.20`), both smells (`0.10`) and a very long
+  setup (approaching `0.15`). A test that verifies nothing tops out just under
+  `0.60` (`0.20` zero-assert, `0.20` patches, `0.05` for its one possible
+  smell, approaching `0.15` setup). Read scores against those ceilings, not
+  against `1.0`.
 - The setup sigmoid inflects at a ratio of **8.0** with scale **4.0**: ratio 8
   contributes exactly half the setup weight.
 - File scores are the mean of their tests' scores plus a bonus that grows at
   `0.05` per unit once `mock_construction_count / max(assertion_count, 1)`
-  exceeds `1.0`, capped at `0.10`. File scores are therefore not directly
-  comparable to test scores.
+  exceeds `1.0`, capped at `0.10`, so they stay below `0.90`. File scores are
+  therefore not directly comparable to test scores.
 
 Two of the five terms fire on unverified tests (`w_zero_asserts` plus an
 inflated setup ratio), so an empty test lands between about `0.22` for a short
@@ -335,8 +433,8 @@ body and `0.35` for a long one — `0.35` is the ceiling of those two terms
 together and is approached, never reached. Do not read a score in that band as
 mock abuse.
 
-A test with `assertion_count == 0` and `external_verification_count > 0` does
-not reach that band *for those reasons*: the `w_zero_asserts` term is off, and
+A test with `assertion_count == 0` and `external_verification_count > 0` or
+`helper_assertion_count > 0` does not reach that band *for those reasons*: the `w_zero_asserts` term is off, and
 the setup ratio is measured to the first verification call site instead of the
 whole body height, so it is no longer inflated — though it still contributes,
 exactly as it does for a test with a real assertion. The mock, patch and smell
@@ -348,12 +446,17 @@ about the test being empty — read the field, not just the score.
 
 - `mock_only_assertions` fires per test when `only_asserts_on_mock` is `true`
   and `assertion_count > 0`. It fires per file when **every** test in the file
-  that has at least one assertion has `only_asserts_on_mock` true; assertionless
-  tests are excluded from that predicate.
-- `mock_overuse` fires when `mocks > max(assertion_count, 2)` **and**
-  `mocks / max(assertion_count, 1) > 2.0`. Both comparisons strict. `mocks` is
-  `patch_decorator_count + stubs_count` at test scope, and
-  `mock_construction_count + patch_decorator_count + stubs_count` at file scope.
+  that verifies (`assertion_count > 0` or `helper_assertion_count > 0`) has
+  `only_asserts_on_mock` true; tests that verify nothing are excluded from that
+  predicate.
+- `mock_overuse` fires when `mocks > max(asserts, 2)` **and**
+  `mocks / max(asserts, 1) > 2.0`, where `asserts` is
+  `assertion_count + helper_assertion_count` (summed over the file's tests at
+  file scope). Both comparisons strict. `mocks` is
+  `mock_construction_count + patch_decorator_count + stubs_count` at both test
+  and file scope. Each patch lands in exactly one of those three, whatever its
+  spelling: a decorator in `patch_decorator_count`, `with patch(...)` in
+  `mock_construction_count`, `mocker.patch(...)` in `stubs_count`.
 
 ---
 
@@ -408,7 +511,13 @@ when the underlying behaviour is broken or entirely absent.
 
 **Signals.**
 - `only_asserts_on_mock == true` and `assertion_count > 0`. This is the
-  definitive signal; the flag is computed to mean exactly this pattern.
+  definitive signal; the flag is computed to mean exactly this pattern. It
+  covers bare `m.assert_called_once_with(...)` statements, `assert
+  m.call_count == 2`, `assert not m.called` and
+  `self.assertEqual(m.call_count, 1)` alike.
+- `mock_assertion_count > 0` with `only_asserts_on_mock == false` is the
+  partial form: some assertions verify the double, some verify output. Not a
+  candidate on its own.
 - Equivalently, a `smell_hits[]` entry with `category == "mock_only_assertions"`.
 - Strength scales with `assertion_count`: a test with six mock-API assertions and
   nothing else is a stronger candidate than one with a single such assertion.
@@ -427,10 +536,12 @@ it does. It patches internal collaborators by dotted path, so any rename, move,
 or refactor breaks the test even though behaviour is unchanged.
 
 **Signals.**
-- `patch_decorator_count >= 3` on a single test.
+- `patch_decorator_count + patch_call_count >= 3` on a single test — every
+  patch, decorator or `with`.
 - `stubs_count >= 3` on a single test.
-- `patch_decorator_count + stubs_count` high relative to `assertion_count` — the
-  `mock_overuse` hit at test scope encodes exactly this ratio.
+- `mock_construction_count + patch_decorator_count + stubs_count` high relative
+  to `assertion_count` — the `mock_overuse` hit at test scope encodes exactly
+  this ratio.
 - `called_names` is short or empty while patch and stub counts are high: the
   test replaced more of your code than it calls.
 
@@ -564,12 +675,12 @@ assertions, or it exercises no project code, so it survives on the absence of an
 exception.
 
 **Signals.**
-- `assertion_count == 0` **and** `external_verification_count == 0`. Definitive
-  for the assertionless variant. Note this contributes `0.20` to the score on
+- `assertion_count == 0`, `external_verification_count == 0` **and**
+  `helper_assertion_count == 0`. Definitive for the assertionless variant. Note this contributes `0.20` to the score on
   its own and inflates `setup_to_assertion_ratio` to the full body height, so
   these tests cluster near the top of `top_suspicious.test_functions`.
-- `assertion_count == 0`, `external_verification_count == 0` **and**
-  `called_names` empty: the test neither asserts nor calls project code.
+- The same three zeros **and** `called_names` empty: the test neither asserts
+  nor calls project code.
 - The test's nodeid appears in no `sut_calls.by_name[].test_nodeids` list
   **and** `external_verification_count == 0` — a test that shells out calls no
   project code by construction, so this signal fires on it by default.
@@ -591,13 +702,20 @@ you have. A subprocess call with no `check=True` proves nothing at all and does
 not set this field: it needs its own evidence, such as an `assert
 completed.returncode == 0`, which is a normal assertion and counts as one.
 
-**Verify by reading.** Three legitimate shapes look identical here. A smoke test
-that asserts nothing but would raise on failure is doing real work — importing a
-module, constructing an object, running a migration. A test whose assertions are
-made through a helper function will show `assertion_count == 0` because pycoati
-counts `assert` statements syntactically in the test body and does not follow
-calls into helpers. And a test that verifies in a child process, as above. Check
-for all three before reporting.
+**Not this pattern: verification through a helper.** A test with
+`assertion_count == 0` and `helper_assertion_count > 0` verifies through a call
+that raises on failure — a `pandas.testing.assert_frame_equal`, a
+`pytest.warns` block, or a same-file `check_*` helper that asserts. Do not
+report it as assertionless.
+
+**Verify by reading.** Three legitimate shapes still look identical here. A
+smoke test that asserts nothing but would raise on failure is doing real work —
+importing a module, constructing an object, running a migration. A test whose
+assertions live in a helper pycoati cannot see — imported from another module,
+defined in `conftest.py`, or reached through a second helper — shows all three
+counts at zero, because helpers are followed one level deep within the file
+only. And a test that verifies in a child process the parser could not prove,
+as above. Check for all three before reporting.
 
 There is no per-test coverage in this schema, so "this test covers nothing" is
 not something the inventory can tell you. Do not claim it.
