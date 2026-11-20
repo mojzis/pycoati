@@ -31,7 +31,7 @@ fn guide_in(dir: &std::path::Path, page: Option<&str>) -> String {
     String::from_utf8(assert.get_output().stdout.clone()).expect("stdout must be valid UTF-8")
 }
 
-/// The three page bodies, as embedded in the binary.
+/// The page bodies, as embedded in the binary.
 fn setup_page() -> &'static str {
     pycoati::guide::SETUP
 }
@@ -41,15 +41,21 @@ fn analyze_page() -> &'static str {
 fn remediate_page() -> &'static str {
     pycoati::guide::REMEDIATE
 }
+fn plan_page() -> &'static str {
+    pycoati::guide::PLAN
+}
 
 // --- explicit page selection ------------------------------------------------
 
 #[test]
 fn explicit_pages_print_verbatim_and_exit_zero() {
     let dir = TempDir::new().expect("tempdir");
-    for (arg, expected) in
-        [("setup", setup_page()), ("analyze", analyze_page()), ("remediate", remediate_page())]
-    {
+    for (arg, expected) in [
+        ("setup", setup_page()),
+        ("analyze", analyze_page()),
+        ("remediate", remediate_page()),
+        ("plan", plan_page()),
+    ] {
         let out = guide_in(dir.path(), Some(arg));
         assert_eq!(out, expected, "`pycoati guide {arg}` must print the page verbatim");
     }
@@ -128,22 +134,29 @@ fn bare_guide_accepts_a_workspace_inventory() {
 }
 
 #[test]
-fn remediate_is_never_auto_selected() {
+fn remediate_and_plan_are_never_auto_selected() {
     // Whatever the filesystem says, the bare form only ever yields setup or
-    // analyze — `remediate` is reachable by breadcrumb or explicit arg only.
+    // analyze — `remediate` is reachable by breadcrumb or explicit arg only,
+    // and `plan` sits outside the audit workflow altogether.
     let dir = TempDir::new().expect("tempdir");
-    assert_ne!(guide_in(dir.path(), None), remediate_page());
-    fs::write(dir.path().join("inventory.json"), r#"{"schema_version":"2"}"#).expect("write");
-    assert_ne!(guide_in(dir.path(), None), remediate_page());
+    for state in ["empty", "with inventory"] {
+        let shown = guide_in(dir.path(), None);
+        assert_ne!(shown, remediate_page(), "{state}");
+        assert_ne!(shown, plan_page(), "{state}");
+        fs::write(dir.path().join("inventory.json"), r#"{"schema_version":"2"}"#).expect("write");
+    }
 }
 
 // --- page invariants --------------------------------------------------------
 
 #[test]
 fn every_page_ends_with_a_single_next_line() {
-    for (name, page) in
-        [("setup", setup_page()), ("analyze", analyze_page()), ("remediate", remediate_page())]
-    {
+    for (name, page) in [
+        ("setup", setup_page()),
+        ("analyze", analyze_page()),
+        ("remediate", remediate_page()),
+        ("plan", plan_page()),
+    ] {
         let trimmed = page.trim_end();
         let lines: Vec<&str> = trimmed.lines().collect();
         let breadcrumbs: Vec<usize> = lines
@@ -316,11 +329,14 @@ fn no_arguments_at_all_fails_with_a_usage_hint() {
 #[test]
 fn every_breadcrumb_points_at_a_real_page() {
     // A typo in a `pycoati guide <page>` reference ships silently and dead-ends
-    // the agent mid-workflow, so pin every target named across all three pages.
+    // the agent mid-workflow, so pin every target named across all the pages.
     let mut found = 0;
-    for (name, page) in
-        [("setup", setup_page()), ("analyze", analyze_page()), ("remediate", remediate_page())]
-    {
+    for (name, page) in [
+        ("setup", setup_page()),
+        ("analyze", analyze_page()),
+        ("remediate", remediate_page()),
+        ("plan", plan_page()),
+    ] {
         for (index, _) in page.match_indices("pycoati guide ") {
             let rest = &page[index + "pycoati guide ".len()..];
             let target: String = rest.chars().take_while(char::is_ascii_alphabetic).collect();
@@ -328,7 +344,7 @@ fn every_breadcrumb_points_at_a_real_page() {
                 continue; // a bare `pycoati guide` mention, which is valid
             }
             assert!(
-                ["setup", "analyze", "remediate"].contains(&target.as_str()),
+                ["setup", "analyze", "remediate", "plan"].contains(&target.as_str()),
                 "{name} references a page that does not exist: `pycoati guide {target}`"
             );
             found += 1;

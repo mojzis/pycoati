@@ -287,3 +287,63 @@ fn the_field_reference_scope_marker_still_exists() {
         "the field-reference slice should be narrower than the whole page"
     );
 }
+
+// --- plan payload -----------------------------------------------------------
+
+/// Heading that opens the field reference on the `plan` page, and the one
+/// that closes it. Bullets outside the pair are flags and prose.
+const PLAN_FIELDS_START: &str = "## Plan fields";
+const PLAN_FIELDS_END: &str = "## Executing a plan";
+
+/// A real plan with every collection non-empty: the partial workspace has one
+/// member with tests (so `members`, `options`, `lanes`, `runs`) and one
+/// without (so `skipped`).
+fn populated_plan() -> pycoati::plan::RunPlan {
+    let root =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/uv_workspace_partial");
+    let opts = pycoati::plan::PlanOptions {
+        members: Vec::new(),
+        max_jobs: std::num::NonZeroUsize::MIN,
+        tolerance_pct: pycoati::plan::DEFAULT_TOLERANCE_PCT,
+        startup_seconds: pycoati::plan::DEFAULT_STARTUP_SECONDS,
+        timings: Vec::new(),
+        member_cwd: pycoati::MemberCwd::Root,
+        pytest_cmd: pycoati::plan::DEFAULT_PYTEST_CMD.to_string(),
+    };
+    pycoati::plan::build_plan(&root, &opts).expect("plan the partial workspace fixture")
+}
+
+fn plan_field_reference() -> &'static str {
+    let page = pycoati::guide::PLAN;
+    let start = page.find(PLAN_FIELDS_START).expect("plan page lost its `## Plan fields` heading");
+    let end = page.find(PLAN_FIELDS_END).expect("plan page lost its `## Executing a plan` heading");
+    assert!(start < end, "the plan field reference must precede the execution section");
+    &page[start..end]
+}
+
+#[test]
+fn the_plan_page_documents_exactly_the_fields_the_plan_emits() {
+    let plan = populated_plan();
+    assert!(!plan.skipped.is_empty(), "fixture must yield a skipped member");
+    assert!(!plan.recommended.lanes[0].runs.is_empty(), "fixture must yield a run");
+
+    let mut emitted = BTreeSet::new();
+    collect_keys(&serde_json::to_value(&plan).expect("serialize plan"), &mut emitted);
+    for nested in ["cost_source", "reason", "limits_wall_time", "speedup", "command"] {
+        assert!(emitted.contains(nested), "key walk never reached nested field `{nested}`");
+    }
+
+    let documented = documented_names(plan_field_reference());
+    let missing: Vec<&String> = emitted.difference(&documented).collect();
+    assert!(
+        missing.is_empty(),
+        "docs/guide/plan.md is out of date with the plan schema.\n\
+         These serialized field names have no `- `<name>` — …` bullet under \
+         `{PLAN_FIELDS_START}`: {missing:?}"
+    );
+    let stale: Vec<&String> = documented.difference(&emitted).collect();
+    assert!(
+        stale.is_empty(),
+        "docs/guide/plan.md documents fields the plan no longer emits: {stale:?}"
+    );
+}

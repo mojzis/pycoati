@@ -80,6 +80,42 @@ report.
 
 Run `pycoati guide setup` for the full reference.
 
+### `pycoati plan <ROOT> [MEMBER]...`
+
+Plans how to run a monorepo's pytest suites in parallel: how many pytest
+processes are worth starting side by side, and which subprojects share one.
+It runs no tests — it packs the subprojects you name into lanes and reports
+the trade-off.
+
+```bash
+# Measure once (the audit records each member's suite runtime)…
+pycoati . --no-coverage --output inventory.json
+
+# …then plan the subprojects you are about to run
+pycoati plan . api core web --timings inventory.json --max-jobs 8
+
+# No timings yet: balance on test counts instead
+pycoati plan . --format pretty
+```
+
+Subprojects are the members of a uv workspace (all of them when none is
+named), or — in any other monorepo — the directories you list. Each one stays
+its own pytest invocation; a lane runs its subprojects one after another, and
+the plan's wall time is its longest lane.
+
+The recommendation is the **fewest** lanes whose wall time is within
+`--tolerance` percent (default 10) of the best packing found up to
+`--max-jobs`, so a lane that buys nothing is never suggested. The payload
+carries the data behind it: per-subproject cost and where it came from
+(`measured`, `estimated`, `test_count`), the wall time and speedup at every
+lane count, the bottleneck subproject that caps the speedup, and for each lane
+of the recommended plan the exact commands to run.
+
+Key flags: `--timings <FILE>`, `--max-jobs <N>`, `--tolerance <PCT>`,
+`--startup-seconds <SECS>`, `--member-cwd <root|member>`,
+`--pytest-cmd <CMD>`, `--format <json|pretty>`, `--output <PATH>`. Run
+`pycoati guide plan` for the field reference.
+
 ### `pycoati guide [PAGE]`
 
 Prints the workflow instructions that ship inside the binary, aimed at a coding
@@ -94,6 +130,7 @@ pycoati guide
 pycoati guide setup
 pycoati guide analyze
 pycoati guide remediate
+pycoati guide plan
 ```
 
 | Page | Contents |
@@ -101,13 +138,15 @@ pycoati guide remediate
 | `setup` | Configuration surface, how to run the scan, where `inventory.json` lands. |
 | `analyze` | Field reference for every key in the inventory, plus the anti-pattern taxonomy and its detection heuristics. |
 | `remediate` | The remedy ladder, the human-approval gate, and the "do not" list. |
+| `plan` | `pycoati plan`: its cost model, flags, the plan payload's fields, and how to execute a plan. |
 
 With no argument, the page is chosen from the current directory: `analyze` when
 an `inventory.json` is present there, otherwise `setup`. `remediate` is never
-auto-selected — reach it via the `analyze` page's breadcrumb or by name.
+auto-selected — reach it via the `analyze` page's breadcrumb or by name — and
+neither is `plan`, which sits outside the audit workflow.
 
-The subcommand shadows a directory of the same name: if you have a `./guide`
-directory to audit, write `pycoati ./guide`.
+The subcommands shadow directories of the same name: if you have a `./guide`
+or `./plan` directory to audit, write `pycoati ./guide` or `pycoati ./plan`.
 
 Each page ends with a single `next:` line, so an agent is always one command
 away from the right instructions. A `--format pretty` scan that finds candidates
@@ -115,8 +154,9 @@ ends with the same breadcrumb; JSON output never carries it.
 
 The page sources are plain markdown under [`docs/guide/`](docs/guide), embedded
 via `include_str!`. `tests/guide_schema_drift.rs` asserts that every field name
-serde emits is documented on the `analyze` page, so a schema change cannot land
-without the guide being updated alongside it.
+serde emits is documented — inventory fields on the `analyze` page, plan fields
+on the `plan` page — so a schema change cannot land without the guide being
+updated alongside it.
 
 ## Development
 

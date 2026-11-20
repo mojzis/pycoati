@@ -14,10 +14,15 @@
 //! embedded in the binary (see [`pycoati::guide`]). The audit itself keeps its
 //! bare-positional form — `pycoati <path>` is unchanged — so the subcommand is
 //! declared alongside the scan arguments rather than replacing them.
+//!
+//! `pycoati plan <ROOT> [MEMBER]...` is the second subcommand: it runs no
+//! tests and emits a [`pycoati::plan::RunPlan`] — how to spread a monorepo's
+//! pytest runs over parallel lanes.
 
 use std::fs;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
@@ -55,7 +60,9 @@ enum Format {
         mocks instead of production code. Output is JSON by default; use \
         --format pretty for an aligned terminal view.\n\n\
         `pycoati guide` prints the workflow instructions that ship with this \
-        binary; they describe the inventory schema this exact version emits."
+        binary; they describe the inventory schema this exact version emits. \
+        `pycoati plan` runs no tests: it works out how to spread a monorepo's \
+        pytest runs over parallel lanes."
 )]
 struct Cli {
     /// Subcommand. When absent, pycoati runs an audit of `<PATH>`.
@@ -169,8 +176,8 @@ struct Cli {
     include_accepted: bool,
 }
 
-/// Subcommands. Deliberately kept to one: everything else pycoati does is
-/// the bare-positional audit, and moving that behind a `scan` verb would be a
+/// Subcommands. The audit is deliberately not one of them: it stays the
+/// bare-positional form, because moving it behind a `scan` verb would be a
 /// breaking change to every existing invocation for no gain.
 #[derive(Subcommand, Debug)]
 enum Command {
@@ -186,6 +193,70 @@ enum Command {
         #[arg(value_enum)]
         page: Option<GuidePage>,
     },
+
+    /// Plan how to spread a monorepo's pytest runs over parallel lanes.
+    ///
+    /// Runs no tests. Reads the subprojects of `<ROOT>` (uv-workspace members,
+    /// or the directories you name), weighs each by measured runtime when
+    /// `--timings` supplies one and by test count otherwise, and prints the
+    /// fewest parallel pytest runs that get within `--tolerance` of the
+    /// shortest wall time, with the subprojects assigned to each.
+    Plan(PlanArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct PlanArgs {
+    /// Monorepo root: a directory whose `pyproject.toml` declares
+    /// `[tool.uv.workspace]`, or any directory when subprojects are named.
+    root: PathBuf,
+
+    /// Subprojects to run. In a uv workspace: member paths relative to the
+    /// root, directory names, or `[project].name`s; none means every member.
+    /// Outside one: directories relative to the root, at least one.
+    #[arg(value_name = "MEMBER")]
+    members: Vec<String>,
+
+    /// Upper bound on parallel pytest runs. Defaults to the number of CPUs
+    /// available to this process.
+    #[arg(long, value_name = "N")]
+    max_jobs: Option<NonZeroUsize>,
+
+    /// Percent of wall time to give up for fewer parallel runs: the plan is
+    /// the smallest run count within this much of the fastest one. `0`
+    /// insists on the fastest.
+    #[arg(long, value_name = "PCT", default_value_t = pycoati::plan::DEFAULT_TOLERANCE_PCT)]
+    tolerance: f64,
+
+    /// Seconds added to every subproject's cost for process start-up
+    /// (interpreter, pytest, plugins), which pytest's own runtime figure
+    /// leaves out. Only applies when costs are in seconds.
+    #[arg(long, value_name = "SECS", default_value_t = pycoati::plan::DEFAULT_STARTUP_SECONDS)]
+    startup_seconds: f64,
+
+    /// Inventory to read measured runtimes from (`suite.runtime_seconds`),
+    /// as written by `pycoati <ROOT> --output inventory.json`. Repeatable.
+    /// Without one the plan balances on test counts.
+    #[arg(long, value_name = "FILE")]
+    timings: Vec<PathBuf>,
+
+    /// Where the emitted commands run from: `root` addresses each
+    /// subproject's tests from the monorepo root, `member` from inside the
+    /// subproject so its own pytest configuration applies.
+    #[arg(long, value_enum, default_value_t = MemberCwd::Root, value_name = "WHERE")]
+    member_cwd: MemberCwd,
+
+    /// Command prefix for the emitted commands; the test paths are appended.
+    #[arg(long, value_name = "CMD", default_value = pycoati::plan::DEFAULT_PYTEST_CMD)]
+    pytest_cmd: String,
+
+    /// Output format. `json` (default) emits the structured plan; `pretty`
+    /// an aligned-column terminal view.
+    #[arg(long, value_enum, default_value_t = Format::Json)]
+    format: Format,
+
+    /// Write the output to this file instead of stdout.
+    #[arg(short, long)]
+    output: Option<PathBuf>,
 }
 
 /// `pycoati guide <PAGE>` selector. Mirrors `pycoati::guide::Page` one-to-one.
@@ -197,6 +268,8 @@ enum GuidePage {
     Analyze,
     /// The remedy ladder and the human-approval gate.
     Remediate,
+    /// `pycoati plan`: parallel pytest runs for a monorepo.
+    Plan,
 }
 
 impl From<GuidePage> for pycoati::guide::Page {
@@ -205,6 +278,7 @@ impl From<GuidePage> for pycoati::guide::Page {
             GuidePage::Setup => Self::Setup,
             GuidePage::Analyze => Self::Analyze,
             GuidePage::Remediate => Self::Remediate,
+            GuidePage::Plan => Self::Plan,
         }
     }
 }
@@ -252,10 +326,50 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: &Cli) -> Result<()> {
-    if let Some(Command::Guide { page }) = &cli.command {
-        return run_guide(page.map(Into::into));
+    match &cli.command {
+        Some(Command::Guide { page }) => run_guide(page.map(Into::into)),
+        Some(Command::Plan(args)) => run_plan(args),
+        None => run_audit(cli),
     }
-    run_audit(cli)
+}
+
+/// Build the run plan and write it out. No pytest subprocess is involved.
+fn run_plan(args: &PlanArgs) -> Result<()> {
+    let max_jobs = args
+        .max_jobs
+        .or_else(|| std::thread::available_parallelism().ok())
+        .unwrap_or(NonZeroUsize::MIN);
+    let opts = pycoati::plan::PlanOptions {
+        members: args.members.clone(),
+        max_jobs,
+        tolerance_pct: args.tolerance,
+        startup_seconds: args.startup_seconds,
+        timings: args.timings.clone(),
+        member_cwd: args.member_cwd.into(),
+        pytest_cmd: args.pytest_cmd.clone(),
+    };
+    let plan = pycoati::plan::build_plan(&args.root, &opts)?;
+    let payload = match args.format {
+        Format::Json => serde_json::to_string_pretty(&plan).context("failed to serialize plan")?,
+        Format::Pretty => pycoati::plan::render_pretty(&plan),
+    };
+    write_payload(&payload, args.output.as_deref())
+}
+
+/// Write a payload to `--output`, or to stdout with a trailing newline.
+///
+/// File output carries no trailing newline (the Run-2 contract — the file
+/// contents round-trip cleanly through `serde_json::from_str`).
+fn write_payload(payload: &str, output: Option<&Path>) -> Result<()> {
+    if let Some(out_path) = output {
+        fs::write(out_path, payload)
+            .with_context(|| format!("failed to write {}", out_path.display()))?;
+    } else {
+        let mut stdout = io::stdout().lock();
+        stdout.write_all(payload.as_bytes()).context("failed to write payload to stdout")?;
+        stdout.write_all(b"\n").context("failed to write trailing newline")?;
+    }
+    Ok(())
 }
 
 /// Print one guide page to stdout, verbatim and unadorned.
@@ -333,17 +447,7 @@ fn run_audit(cli: &Cli) -> Result<()> {
         payload.push_str(SCAN_FOOTER);
     }
 
-    if let Some(out_path) = cli.output.as_ref() {
-        // File output: no trailing newline (matches the Run-2 contract — the
-        // file contents round-trip cleanly through `serde_json::from_str`).
-        fs::write(out_path, &payload)
-            .with_context(|| format!("failed to write {}", out_path.display()))?;
-    } else {
-        let mut stdout = io::stdout().lock();
-        stdout.write_all(payload.as_bytes()).context("failed to write payload to stdout")?;
-        stdout.write_all(b"\n").context("failed to write trailing newline")?;
-    }
-    Ok(())
+    write_payload(&payload, cli.output.as_deref())
 }
 
 /// Breadcrumb appended to human-format output that has candidates to inspect.
