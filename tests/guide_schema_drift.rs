@@ -3,7 +3,7 @@
 //!
 //! Walks every field name serde emits for the two payload shapes — including
 //! nested structs — and asserts each one is documented as a field bullet in
-//! `docs/guide/analyze.md`. The guide ships inside the binary via
+//! `docs/src/guide/analyze.md`. The guide ships inside the binary via
 //! `include_str!`, so a schema change that skips the docs is a compile-clean
 //! but semantically stale build; this test is what catches it.
 //!
@@ -198,7 +198,7 @@ fn every_serialized_field_is_documented_in_the_analyze_page() {
 
     assert!(
         missing.is_empty(),
-        "docs/guide/analyze.md is out of date with the inventory schema.\n\
+        "docs/src/guide/analyze.md is out of date with the inventory schema.\n\
          These serialized field names have no `- `<name>` — …` bullet on the page: {missing:?}\n\
          Add one bullet per field, then re-run this test."
     );
@@ -230,7 +230,7 @@ fn the_walk_actually_reaches_nested_structs() {
         53,
         "single-project schema field count changed. If you added or removed an \
          inventory field, update this count AND the field's bullet in \
-         docs/guide/analyze.md."
+         docs/src/guide/analyze.md."
     );
 }
 
@@ -265,7 +265,7 @@ fn the_analyze_page_documents_no_field_that_the_schema_dropped() {
 
     assert!(
         stale.is_empty(),
-        "docs/guide/analyze.md documents fields the schema no longer emits: {stale:?}\n\
+        "docs/src/guide/analyze.md documents fields the schema no longer emits: {stale:?}\n\
          Remove their bullets from the Part 1 field reference."
     );
 }
@@ -278,7 +278,7 @@ fn the_field_reference_scope_marker_still_exists() {
     let page = pycoati::guide::ANALYZE;
     assert!(
         page.contains(FIELD_REFERENCE_END),
-        "docs/guide/analyze.md no longer contains the `{FIELD_REFERENCE_END}` heading that \
+        "docs/src/guide/analyze.md no longer contains the `{FIELD_REFERENCE_END}` heading that \
          bounds the field reference; update FIELD_REFERENCE_END to match."
     );
     let scoped = documented_names(page);
@@ -337,13 +337,13 @@ fn the_plan_page_documents_exactly_the_fields_the_plan_emits() {
     let missing: Vec<&String> = emitted.difference(&documented).collect();
     assert!(
         missing.is_empty(),
-        "docs/guide/plan.md is out of date with the plan schema.\n\
+        "docs/src/guide/plan.md is out of date with the plan schema.\n\
          These serialized field names have no `- `<name>` — …` bullet under \
          `{PLAN_FIELDS_START}`: {missing:?}"
     );
     let stale: Vec<&String> = documented.difference(&emitted).collect();
     assert!(
         stale.is_empty(),
-        "docs/guide/plan.md documents fields the plan no longer emits: {stale:?}"
+        "docs/src/guide/plan.md documents fields the plan no longer emits: {stale:?}"
     );
 }

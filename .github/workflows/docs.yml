@@ -1,0 +1,63 @@
+name: Deploy docs
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "docs/**"
+      - "src/**"  # rebuild when CLI changes (help text may change)
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      - name: Lint mermaid diagrams
+        run: |
+          cd docs && npm ci --silent
+          cd .. && node docs/lint-mermaid.mjs
+
+      # Versions come from docs/toolchain.sh so CI and `make docs` cannot
+      # drift onto an incompatible mdbook/mdbook-mermaid pair.
+      - name: Install mdBook and preprocessors
+        run: |
+          eval "$(bash docs/toolchain.sh --versions)"
+          mkdir -p bin
+          curl -sSL "https://github.com/rust-lang/mdBook/releases/download/v$MDBOOK_VERSION/mdbook-v$MDBOOK_VERSION-x86_64-unknown-linux-gnu.tar.gz" | tar -xz --directory=bin
+          curl -sSL "https://github.com/badboy/mdbook-mermaid/releases/download/v$MDBOOK_MERMAID_VERSION/mdbook-mermaid-v$MDBOOK_MERMAID_VERSION-x86_64-unknown-linux-gnu.tar.gz" | tar -xz --directory=bin
+          echo "$PWD/bin" >> $GITHUB_PATH
+
+      - name: Check the docs toolchain matches the pins
+        run: bash docs/toolchain.sh
+
+      - name: Sync docs version badge with Cargo.toml
+        run: bash docs/gen-version.sh
+
+      - name: Build book
+        run: mdbook build docs
+
+      - name: Generate llms.txt
+        run: bash docs/generate-llms-txt.sh
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: docs/book/html
+
+      - uses: actions/deploy-pages@v5
+        id: deployment

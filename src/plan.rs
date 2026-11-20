@@ -112,7 +112,7 @@ impl CostSource {
     }
 }
 
-/// The plan payload. `docs/guide/plan.md` (shipped as [`crate::guide::PLAN`])
+/// The plan payload. `docs/src/guide/plan.md` (shipped as [`crate::guide::PLAN`])
 /// is the field reference; `tests/guide_schema_drift.rs` keeps the two in step.
 #[derive(Debug, Clone, Serialize)]
 pub struct RunPlan {

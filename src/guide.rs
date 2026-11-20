@@ -1,7 +1,7 @@
 //! The embedded workflow guide.
 //!
 //! pycoati ships its own instructions so they cannot drift from the schema the
-//! binary emits: the pages are plain markdown under `docs/guide/`, pulled in
+//! binary emits: the pages are plain markdown under `docs/src/guide/`, pulled in
 //! with [`include_str!`] at compile time. The same bytes serve the CLI and any
 //! docs site that later renders the files from the repo.
 //!
@@ -21,17 +21,17 @@
 use std::path::Path;
 
 /// Setup page: configuration surface, scan invocation, output location.
-pub const SETUP: &str = include_str!("../docs/guide/setup.md");
+pub const SETUP: &str = include_str!("../docs/src/guide/setup.md");
 
 /// Analyze page: `inventory.json` field reference plus the anti-pattern
 /// taxonomy and its detection heuristics.
-pub const ANALYZE: &str = include_str!("../docs/guide/analyze.md");
+pub const ANALYZE: &str = include_str!("../docs/src/guide/analyze.md");
 
 /// Remediate page: the remedy ladder, the approval gate, and the "do not" list.
-pub const REMEDIATE: &str = include_str!("../docs/guide/remediate.md");
+pub const REMEDIATE: &str = include_str!("../docs/src/guide/remediate.md");
 
 /// Plan page: `pycoati plan`, its flags, and the plan payload's fields.
-pub const PLAN: &str = include_str!("../docs/guide/plan.md");
+pub const PLAN: &str = include_str!("../docs/src/guide/plan.md");
 
 /// Inventory filename the guide tells the agent to write, and the one
 /// [`detect_page`] looks for. pycoati itself has no default output path —

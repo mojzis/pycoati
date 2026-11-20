@@ -1,4 +1,4 @@
-.PHONY: review fmt-check lint test audit deny coverage mutants review-quick
+.PHONY: review fmt-check lint test audit deny coverage mutants review-quick docs docs-serve docs-toolchain
 
 # Full review — run before pushing or merging
 review: fmt-check lint test audit deny
@@ -58,3 +58,19 @@ mutants:
 	else \
 		echo "cargo-mutants not installed. Run: cargo install cargo-mutants"; \
 	fi
+
+# Check that mdbook and mdbook-mermaid are the pair CI pins. They share a
+# preprocessor protocol, and a mismatch fails without naming either version.
+docs-toolchain:
+	@bash docs/toolchain.sh
+
+# Build the mdBook site plus llms.txt into docs/book/html
+docs: docs-toolchain
+	@echo "📚 Building docs..."
+	@bash docs/gen-version.sh
+	@mdbook build docs
+	@bash docs/generate-llms-txt.sh
+
+# Serve the docs locally with live reload
+docs-serve: docs-toolchain
+	@mdbook serve docs --open

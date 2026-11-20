@@ -5,7 +5,7 @@ with tree-sitter, optionally runs `pytest` for collection, durations, and
 coverage, and emits a structured inventory: per-file and per-test counts,
 mock-API smells, and a per-test suspicion score.
 
-Part of **[aesop](https://mojzis.github.io/aesop/)**, a small menagerie of tools for agentic Python.
+📖 **[Documentation](https://mojzis.github.io/pycoati/)** · part of **[aesop](https://mojzis.github.io/aesop/)**, a small menagerie of tools for agentic Python
 
 ## Install
 
@@ -152,11 +152,27 @@ Each page ends with a single `next:` line, so an agent is always one command
 away from the right instructions. A `--format pretty` scan that finds candidates
 ends with the same breadcrumb; JSON output never carries it.
 
-The page sources are plain markdown under [`docs/guide/`](docs/guide), embedded
+The page sources are plain markdown under [`docs/src/guide/`](docs/src/guide), embedded
 via `include_str!`. `tests/guide_schema_drift.rs` asserts that every field name
 serde emits is documented — inventory fields on the `analyze` page, plan fields
 on the `plan` page — so a schema change cannot land without the guide being
 updated alongside it.
+
+## For your CLAUDE.md
+
+<!-- BEGIN SHARED:claude-snippet -->
+```markdown
+### `pycoati` — test-suite audit
+
+- Run `pycoati . --output inventory.json` now and then (not every commit), then
+  `pycoati guide analyze`: it ranks the tests most likely to be weak (mock-only
+  assertions, patch stacks, no assertions) and gives a remediation ladder.
+- Ask before changing a test it flags. Keep a legitimate one with an entry in
+  `.pycoati-accept.toml` (a `reason` is required).
+- Monorepo: `pycoati plan . --timings inventory.json` says how many pytest
+  processes to run side by side, and which subprojects go in each.
+```
+<!-- END SHARED:claude-snippet -->
 
 ## Development
 

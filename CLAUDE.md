@@ -82,3 +82,24 @@ Before marking any task as complete:
 - Tests must assert on values, not just "runs without panic"
 - Flaky tests need root-cause analysis, not looser assertions
 - No new dependencies without surfacing the choice
+
+## Docs
+
+The mdBook site under `docs/` (https://mojzis.github.io/pycoati/) deploys to
+GitHub Pages on push to `main` (`.github/workflows/docs.yml`), along with
+`llms.txt` and `llms-full.txt`. Build locally with `make docs`.
+
+- The guide pages in `docs/src/guide/` are what `pycoati guide` prints
+  (`include_str!` in `src/guide.rs`): one source for the CLI and the site.
+- `docs/src/weights.md` includes `WEIGHTS.md` from the repo root; edit the root file.
+- Shared prose lives in `docs/shared/` and is injected into `README.md` and
+  `docs/src/index.md` by `docs/inject-shared.sh`. Edit the shared file, then
+  run the script — never edit between the `<!-- BEGIN SHARED:... -->` markers.
+- `docs/custom.css`, `docs/aesop.js` and `docs/theme/head.hbs` are generated
+  by mojzis/aesop `docs-theme/sync.py`; don't edit them here.
+- `docs/gen-version.sh` syncs the docs version badge with `Cargo.toml`
+  (`cargo release` also bumps it via `release.toml`).
+- `docs/toolchain.sh` pins the `mdbook` / `mdbook-mermaid` pair used by both
+  `make docs` and the workflow.
+- Adding a page means adding it to `docs/src/SUMMARY.md`; the `llms.txt`
+  generator reads that file.
