@@ -72,3 +72,7 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
+
+# mdBook build output (docs/book.toml build-dir)
+docs/book/
+docs/node_modules/

@@ -417,7 +417,7 @@ fn every_cli_flag_is_documented_on_the_setup_page() {
 
     assert!(
         missing.is_empty(),
-        "docs/guide/setup.md is out of date with the CLI.\n\
+        "docs/src/guide/setup.md is out of date with the CLI.\n\
          These flags have no `- `<flag>` — …` bullet in its Flags section: {missing:?}\n\
          Add one bullet per flag, then re-run this test."
     );
@@ -434,7 +434,7 @@ fn the_setup_page_documents_no_flag_the_cli_dropped() {
 
     assert!(
         stale.is_empty(),
-        "docs/guide/setup.md documents flags the CLI no longer accepts: {stale:?}"
+        "docs/src/guide/setup.md documents flags the CLI no longer accepts: {stale:?}"
     );
 }
 
