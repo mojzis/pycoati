@@ -242,6 +242,10 @@ wrapped with a `workspace_root` key. Analyze each member independently — score
 and rankings are computed per member and are not comparable across members.
 `--tests-dir` and `--project-package` are rejected against a workspace root.
 
+To decide how many of the members' pytest runs to start in parallel, and which
+members share a run, see `pycoati guide plan`. It is a side trip: the audit
+does not need it.
+
 ## Verify before moving on
 
 `inventory.json` is usable when all of these hold:

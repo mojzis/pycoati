@@ -5,15 +5,18 @@
 //! with [`include_str!`] at compile time. The same bytes serve the CLI and any
 //! docs site that later renders the files from the repo.
 //!
-//! Three pages, each ending in a single `next:` breadcrumb so an agent is
+//! Four pages, each ending in a single `next:` breadcrumb so an agent is
 //! always one command away from the right instructions:
 //!
 //! - [`SETUP`] — configure and run the scan.
 //! - [`ANALYZE`] — the inventory field reference and the anti-pattern taxonomy.
 //! - [`REMEDIATE`] — the remedy ladder and the human-approval gate.
+//! - [`PLAN`] — `pycoati plan`, a side trip off the audit workflow: how to
+//!   spread a monorepo's pytest runs over parallel lanes.
 //!
 //! `tests/guide_schema_drift.rs` asserts every serialized inventory field is
-//! documented on the `analyze` page; that test is what keeps this honest.
+//! documented on the `analyze` page, and every plan field on the `plan` page;
+//! that test is what keeps this honest.
 
 use std::path::Path;
 
@@ -27,6 +30,9 @@ pub const ANALYZE: &str = include_str!("../docs/guide/analyze.md");
 /// Remediate page: the remedy ladder, the approval gate, and the "do not" list.
 pub const REMEDIATE: &str = include_str!("../docs/guide/remediate.md");
 
+/// Plan page: `pycoati plan`, its flags, and the plan payload's fields.
+pub const PLAN: &str = include_str!("../docs/guide/plan.md");
+
 /// Inventory filename the guide tells the agent to write, and the one
 /// [`detect_page`] looks for. pycoati itself has no default output path —
 /// this is the convention the `setup` page establishes.
@@ -38,6 +44,7 @@ pub enum Page {
     Setup,
     Analyze,
     Remediate,
+    Plan,
 }
 
 impl Page {
@@ -47,6 +54,7 @@ impl Page {
             Self::Setup => SETUP,
             Self::Analyze => ANALYZE,
             Self::Remediate => REMEDIATE,
+            Self::Plan => PLAN,
         }
     }
 }
@@ -60,7 +68,8 @@ impl Page {
 ///
 /// [`Page::Remediate`] is never auto-selected. Deciding from the filesystem
 /// that analysis has finished would be guesswork, so the page is reachable
-/// only via the `analyze` breadcrumb or an explicit argument.
+/// only via the `analyze` breadcrumb or an explicit argument. [`Page::Plan`]
+/// is a side trip off the audit workflow and is only ever asked for by name.
 ///
 /// Detection never fails: every error path degrades to [`Page::Setup`], which
 /// is the page that explains how to produce the missing inventory.
@@ -177,7 +186,7 @@ mod tests {
 
     #[test]
     fn each_page_text_is_distinct_and_non_empty() {
-        let pages = [Page::Setup, Page::Analyze, Page::Remediate];
+        let pages = [Page::Setup, Page::Analyze, Page::Remediate, Page::Plan];
         for page in pages {
             assert!(!page.text().is_empty(), "{page:?} page is empty");
         }

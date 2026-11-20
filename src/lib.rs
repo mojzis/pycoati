@@ -29,6 +29,7 @@ pub mod coverage;
 pub mod guide;
 pub mod mock_api;
 pub(crate) mod parser;
+pub mod plan;
 pub(crate) mod pretty;
 pub mod pyproject;
 pub mod pytest;
