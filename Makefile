@@ -68,6 +68,7 @@ docs-toolchain:
 docs: docs-toolchain
 	@echo "📚 Building docs..."
 	@bash docs/gen-version.sh
+	@uvx relnotes@latest page --out docs/src/release-notes.md
 	@mdbook build docs
 	@bash docs/generate-llms-txt.sh
 
