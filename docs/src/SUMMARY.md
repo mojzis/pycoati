@@ -2,6 +2,7 @@
 
 [Introduction](index.md)
 [Suspicion-score weights](weights.md)
+- [Release notes](release-notes.md)
 
 # Agent guide
 
